@@ -1,0 +1,33 @@
+[Unit]
+Description=PolyEdge isolated funded signer
+Wants=network-online.target polyedge-federated-token@funded-signer.service
+After=network-online.target polyedge-network.service polyedge-funded-egress.service polyedge-federated-token@funded-signer.service polyedge-oci-queue-bridge.service
+Requires=polyedge-network.service polyedge-funded-egress.service polyedge-oci-queue-bridge.service
+
+[Container]
+# Replace the all-zero digest with the reviewed ARM64 venue-probe image digest.
+Image=registry.example.invalid/polyedge-venue-probe@sha256:0000000000000000000000000000000000000000000000000000000000000000
+ContainerName=polyedge-funded-signer
+Network=polyedge.network
+IP=10.89.0.250
+User=986:982
+EnvironmentFile=/etc/polyedge/funded-signer.env
+Volume=/run/polyedge-federated-funded-signer:/run/credentials:ro,Z
+Secret=polyedge-polymarket-private-key,type=env,target=POLYMARKET_PRIVATE_KEY
+Secret=polyedge-polymarket-api-key,type=env,target=POLYMARKET_API_KEY
+Secret=polyedge-polymarket-api-secret,type=env,target=POLYMARKET_API_SECRET
+Secret=polyedge-polymarket-api-passphrase,type=env,target=POLYMARKET_API_PASSPHRASE
+Secret=polyedge-polymarket-relayer-api-key,type=env,target=POLYMARKET_RELAYER_API_KEY
+Exec=node src/funded-direct-service.mjs
+# ponytail: OCI Podman 4.9 returns EACCES for container UDP with no-new-privileges;
+# restore it after a runtime upgrade passes the funded DNS/token smoke test.
+PodmanArgs=--cpus=0.5 --memory=2g --pids-limit=512 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=64m --cap-drop=all --pull=never --log-driver=journald
+
+[Service]
+ExecStartPre=/usr/bin/bash -ec 'path=/run/polyedge-federated-funded-signer/azure-federated-token; [ ! -L "$$path" ] && [ -f "$$path" ]; set -- $$(stat -c "%%u %%g %%a %%h %%Y" "$$path"); [ "$$1:$$2:$$3:$$4" = 986:982:600:1 ]; age=$$(( $$(date -u +%%s) - $$5 )); [ "$$age" -ge 0 ] && [ "$$age" -le 240 ]'
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

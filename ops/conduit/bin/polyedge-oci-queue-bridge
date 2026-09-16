@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+MAX_BODY_BYTES = 131_072
+MESSAGE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+RECEIPT = re.compile(r"^[A-Za-z0-9_=-]{1,4096}$")
+ALLOWED_SCHEMAS = {
+    "polyedge.funded_intent_handoff.v1",
+    "polyedge.funded_market_warmup.v1",
+}
+
+
+def required(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise ValueError(f"{name} is required")
+    return value
+
+
+def read_json(handler):
+    length = int(handler.headers.get("content-length", "0"))
+    if length < 1 or length > MAX_BODY_BYTES:
+        raise ValueError("request body size is invalid")
+    value = json.loads(handler.rfile.read(length))
+    if not isinstance(value, dict):
+        raise ValueError("request body must be a JSON object")
+    return value
+
+
+def validate_message(message_id, ttl_seconds, body):
+    if not MESSAGE_ID.fullmatch(message_id):
+        raise ValueError("message id is invalid")
+    if ttl_seconds < 1 or ttl_seconds > 86_400:
+        raise ValueError("message TTL is invalid")
+    schema = body.get("schema")
+    if schema not in ALLOWED_SCHEMAS:
+        raise ValueError("message schema is unsupported")
+    if schema == "polyedge.funded_intent_handoff.v1" and body.get("decision_id") != message_id:
+        raise ValueError("funded handoff decision id does not match message id")
+    if schema == "polyedge.funded_market_warmup.v1" and not message_id.startswith("warmup-"):
+        raise ValueError("warmup message id is invalid")
+
+
+def validate_settlement(body):
+    receipt = str(body.get("receipt") or "")
+    if not RECEIPT.fullmatch(receipt):
+        raise ValueError("message receipt is invalid")
+    return receipt
+
+
+def archive_name(message_id, record):
+    safe_id = message_id if MESSAGE_ID.fullmatch(message_id) else "unknown"
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+    day = datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    return f"funded-queue-dlq/{day}/{safe_id}-{hashlib.sha256(canonical).hexdigest()}.json"
+
+
+class Backend:
+    def __init__(self):
+        import oci
+
+        self.oci = oci
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        endpoint = required("POLYEDGE_OCI_QUEUE_ENDPOINT")
+        clients = [oci.queue.QueueClient({}, signer=signer, service_endpoint=endpoint) for _ in range(3)]
+        self.put_client, self.get_client, self.settle_client = clients
+        self.object_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
+        self.queue_id = required("POLYEDGE_OCI_QUEUE_ID")
+        self.namespace = required("POLYEDGE_OCI_OBJECT_NAMESPACE")
+        self.bucket = required("POLYEDGE_OCI_DLQ_BUCKET")
+
+    def put(self, message_id, ttl_seconds, body):
+        metadata = self.oci.queue.models.MessageMetadata(
+            channel_id="funded-direct",
+            custom_properties={"messageId": message_id, "ttlSeconds": str(ttl_seconds)},
+        )
+        details = self.oci.queue.models.PutMessagesDetails(messages=[
+            self.oci.queue.models.PutMessagesDetailsEntry(
+                content=json.dumps(body, sort_keys=True, separators=(",", ":")),
+                metadata=metadata,
+            )
+        ])
+        self.put_client.put_messages(self.queue_id, details)
+
+    def get(self, timeout_seconds):
+        response = self.get_client.get_messages(
+            self.queue_id,
+            limit=1,
+            timeout_in_seconds=timeout_seconds,
+            visibility_in_seconds=300,
+            channel_filter="funded-direct",
+        )
+        messages = []
+        for message in response.data.messages:
+            custom = getattr(message.metadata, "custom_properties", None) or {}
+            try:
+                body = json.loads(message.content)
+            except json.JSONDecodeError:
+                body = message.content
+            messages.append({
+                "message_id": custom.get("messageId") or str(message.id),
+                "delivery_count": message.delivery_count,
+                "receipt": message.receipt,
+                "body": body,
+            })
+        return messages
+
+    def complete(self, receipt):
+        self.settle_client.delete_message(self.queue_id, receipt)
+
+    def abandon(self, receipt):
+        details = self.oci.queue.models.UpdateMessageDetails(visibility_in_seconds=0)
+        self.settle_client.update_message(self.queue_id, receipt, details)
+
+    def dead_letter(self, receipt, request):
+        record = {
+            "schema": "polyedge.oci_queue_dead_letter.v1",
+            "message_id": str(request.get("message_id") or ""),
+            "delivery_count": int(request.get("delivery_count") or 0),
+            "reason": str(request.get("reason") or "FundedIntentFailedClosed")[:128],
+            "description": str(request.get("description") or "")[:4000],
+            "body": request.get("body"),
+        }
+        name = archive_name(record["message_id"], record)
+        payload = json.dumps({**record, "archived_at": datetime.now(timezone.utc).isoformat()}, sort_keys=True).encode()
+        try:
+            self.object_client.put_object(
+                self.namespace,
+                self.bucket,
+                name,
+                payload,
+                content_type="application/json",
+                if_none_match="*",
+            )
+        except self.oci.exceptions.ServiceError as error:
+            if error.status != 412:
+                raise
+        self.complete(receipt)
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, backend):
+        super().__init__(address, Handler)
+        self.backend = backend
+        self.producer_ip = required("POLYEDGE_OCI_QUEUE_PRODUCER_IP")
+        self.signer_ip = required("POLYEDGE_OCI_QUEUE_SIGNER_IP")
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, pattern, *args):
+        print(json.dumps({"event": "http", "client": self.client_address[0], "message": pattern % args}), flush=True)
+
+    def send_json(self, status, value=None):
+        payload = b"" if value is None else json.dumps(value, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+
+    def authorized(self, expected_ip):
+        if self.client_address[0] == expected_ip:
+            return True
+        self.send_json(403, {"error": "forbidden"})
+        return False
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self.send_json(200, {"ok": True})
+            return
+        if parsed.path != "/v1/messages" or not self.authorized(self.server.signer_ip):
+            if parsed.path != "/v1/messages":
+                self.send_json(404, {"error": "not_found"})
+            return
+        try:
+            timeout_ms = int(parse_qs(parsed.query).get("timeout_ms", ["1000"])[0])
+            timeout_seconds = max(1, min(20, (timeout_ms + 999) // 1000))
+            self.send_json(200, {"messages": self.server.backend.get(timeout_seconds)})
+        except Exception as error:
+            self.fail(error)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path == "/v1/messages":
+                if not self.authorized(self.server.producer_ip):
+                    return
+                body = read_json(self)
+                message_id = self.headers.get("x-polyedge-message-id", "")
+                ttl_seconds = int(self.headers.get("x-polyedge-ttl-seconds", "0"))
+                validate_message(message_id, ttl_seconds, body)
+                self.server.backend.put(message_id, ttl_seconds, body)
+                self.send_json(201, {"message_id": message_id})
+                return
+            if parsed.path not in {"/v1/complete", "/v1/abandon", "/v1/dead-letter"}:
+                self.send_json(404, {"error": "not_found"})
+                return
+            if not self.authorized(self.server.signer_ip):
+                return
+            body = read_json(self)
+            receipt = validate_settlement(body)
+            if parsed.path == "/v1/complete":
+                self.server.backend.complete(receipt)
+            elif parsed.path == "/v1/abandon":
+                self.server.backend.abandon(receipt)
+            else:
+                self.server.backend.dead_letter(receipt, body)
+            self.send_json(204)
+        except (ValueError, json.JSONDecodeError) as error:
+            self.send_json(400, {"error": str(error)})
+        except Exception as error:
+            self.fail(error)
+
+    def fail(self, error):
+        print(json.dumps({
+            "event": "backend_error",
+            "type": type(error).__name__,
+            "status": getattr(error, "status", None),
+            "code": getattr(error, "code", None),
+        }), file=sys.stderr, flush=True)
+        self.send_json(502, {"error": "backend_failure"})
+
+
+def self_test():
+    handoff = {"schema": "polyedge.funded_intent_handoff.v1", "decision_id": "a" * 64}
+    validate_message("a" * 64, 3600, handoff)
+    validate_message("warmup-abc", 3600, {"schema": "polyedge.funded_market_warmup.v1"})
+    try:
+        validate_message("b" * 64, 3600, handoff)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("mismatched decision id was accepted")
+    assert archive_name("a" * 64, handoff).startswith("funded-queue-dlq/")
+    print("polyedge-oci-queue-bridge self-test: OK")
+
+
+if __name__ == "__main__":
+    if os.environ.get("POLYEDGE_OCI_QUEUE_BRIDGE_SELF_TEST") == "1":
+        self_test()
+    else:
+        host = required("POLYEDGE_OCI_QUEUE_BRIDGE_HOST")
+        port = int(required("POLYEDGE_OCI_QUEUE_BRIDGE_PORT"))
+        Server((host, port), Backend()).serve_forever()

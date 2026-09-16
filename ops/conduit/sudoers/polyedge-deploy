@@ -1,0 +1,1 @@
+polyedge-deploy ALL=(root) NOPASSWD: /usr/local/sbin/polyedge-quadlet-deploy *

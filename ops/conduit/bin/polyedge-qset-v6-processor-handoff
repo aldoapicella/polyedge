@@ -1,0 +1,415 @@
+#!/bin/sh
+set -eu
+
+[ "$#" -eq 0 ] || { echo 'usage: polyedge-qset-v6-processor-handoff' >&2; exit 64; }
+test_only=${QSET_V6_PROCESSOR_HANDOFF_TEST_ONLY:-0}
+case "$test_only" in 0|1) ;; *) echo 'QSET_V6_PROCESSOR_HANDOFF_TEST_ONLY must equal 0 or 1' >&2; exit 64 ;; esac
+if [ "$test_only" = 1 ]; then
+  for name in ENV_FILE RECEIPT_ROOT GATE_FILE PREFLIGHT DISK_GUARD SYSTEMCTL RBAC_CHECKER LOCK_FILE ROLLBACK_ROOT EXPECTED_UID EXPECTED_GID; do eval ": \${QSET_V6_PROCESSOR_HANDOFF_${name}_TEST_ONLY:?set test $name}"; done
+  env_file=$QSET_V6_PROCESSOR_HANDOFF_ENV_FILE_TEST_ONLY
+  receipt_root=$QSET_V6_PROCESSOR_HANDOFF_RECEIPT_ROOT_TEST_ONLY
+  gate_file=$QSET_V6_PROCESSOR_HANDOFF_GATE_FILE_TEST_ONLY
+  preflight=$QSET_V6_PROCESSOR_HANDOFF_PREFLIGHT_TEST_ONLY
+  disk_guard=$QSET_V6_PROCESSOR_HANDOFF_DISK_GUARD_TEST_ONLY
+  systemctl=$QSET_V6_PROCESSOR_HANDOFF_SYSTEMCTL_TEST_ONLY
+  rbac_checker=$QSET_V6_PROCESSOR_HANDOFF_RBAC_CHECKER_TEST_ONLY
+  lock_file=$QSET_V6_PROCESSOR_HANDOFF_LOCK_FILE_TEST_ONLY
+  rollback_root=$QSET_V6_PROCESSOR_HANDOFF_ROLLBACK_ROOT_TEST_ONLY
+  expected_uid=$QSET_V6_PROCESSOR_HANDOFF_EXPECTED_UID_TEST_ONLY
+  expected_gid=$QSET_V6_PROCESSOR_HANDOFF_EXPECTED_GID_TEST_ONLY
+  start_attempts=${QSET_V6_PROCESSOR_HANDOFF_START_ATTEMPTS_TEST_ONLY:-5}
+  wait_attempts=${QSET_V6_PROCESSOR_HANDOFF_WAIT_ATTEMPTS_TEST_ONLY:-5}
+else
+  [ "$(id -u)" = 0 ] || { echo 'qset-v6 processor handoff must run as root' >&2; exit 1; }
+  env_file=/etc/polyedge/jobs/qset-v6-processor.env
+  receipt_root=/srv/polyedge-ring/migration/qset-v6-seal
+  gate_file=/etc/polyedge/ENABLE_QSET_V6_PROCESSOR_MANUAL
+  preflight=/usr/local/libexec/polyedge-qset-v6-processor-preflight
+  disk_guard=/usr/local/libexec/polyedge-boot-disk-guard
+  systemctl=/usr/bin/systemctl
+  rbac_checker=/usr/local/libexec/polyedge-qset-v6-rbac-handoff
+  lock_file=/run/lock/polyedge-qset-v6-processor-handoff.lock
+  rollback_root=/srv/polyedge-ring/migration/qset-v6/processor-handoff
+  expected_uid=0
+  expected_gid=0
+  start_attempts=60
+  wait_attempts=18030
+fi
+
+service=polyedge-qset-v6-processor.service
+campaign=campaign-2026-09-01-qset-v6
+keys='POLYEDGE_QSET_V6_DAY1_RECEIPT_SHA256 POLYEDGE_QSET_V6_DAY1_INVENTORY_SHA256 POLYEDGE_QSET_V6_DAY2_RECEIPT_SHA256 POLYEDGE_QSET_V6_DAY2_INVENTORY_SHA256'
+fail() { echo "$*" >&2; exit 1; }
+safe_file() {
+  [ ! -L "$1" ] && [ -f "$1" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' "$1")" = "$expected_uid:$expected_gid:640:1" ] \
+    && [ "$(stat -c '%s' "$1")" -gt 0 ] && [ "$(stat -c '%s' "$1")" -le "$2" ]
+}
+sha256_file() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
+valid_invocation() { printf '%s' "$1" | grep -Eq '^[0-9a-f]{32}$'; }
+valid_prior_invocation() { [ -z "$1" ] || valid_invocation "$1"; }
+env_line() {
+  awk -v key="$1" '$0 ~ ("^" key "=") { count++; value=substr($0,length(key)+2) } END { if (count==1) print value; else exit 1 }' "$2"
+}
+require_blank_env() {
+  for key in $keys; do [ "$(env_line "$key" "$1")" = '' ] || return 1; done
+}
+require_bound_env() {
+  [ "$(env_line POLYEDGE_QSET_V6_DAY1_RECEIPT_SHA256 "$1")" = "$day1_receipt_sha" ] \
+    && [ "$(env_line POLYEDGE_QSET_V6_DAY1_INVENTORY_SHA256 "$1")" = "$day1_inventory_sha" ] \
+    && [ "$(env_line POLYEDGE_QSET_V6_DAY2_RECEIPT_SHA256 "$1")" = "$day2_receipt_sha" ] \
+    && [ "$(env_line POLYEDGE_QSET_V6_DAY2_INVENTORY_SHA256 "$1")" = "$day2_inventory_sha" ]
+}
+receipt_inventory() {
+  jq -er --arg date "$2" 'select(.schema=="polyedge.qset_v6_closed_day_seal.v1" and .campaign_id=="campaign-2026-09-01-qset-v6" and .date==$date)|.source_inventory_sha256|select(type=="string" and test("^sha256:[0-9a-f]{64}$"))' "$1"
+}
+show() { "$systemctl" show --property="$1" --value "$service"; }
+remove_gate() {
+  if [ -e "$gate_file" ] || [ -L "$gate_file" ]; then
+    [ ! -L "$gate_file" ] && [ -f "$gate_file" ] \
+      && [ "$(stat -c '%u:%g:%a:%h' "$gate_file")" = "$expected_uid:$expected_gid:640:1" ] || return 1
+    rm -f "$gate_file" && sync -f "$(dirname "$gate_file")"
+  fi
+}
+gate_safe_or_absent() {
+  [ ! -e "$gate_file" ] && [ ! -L "$gate_file" ] || {
+    [ ! -L "$gate_file" ] && [ -f "$gate_file" ] \
+      && [ "$(stat -c '%u:%g:%a:%h' "$gate_file")" = "$expected_uid:$expected_gid:640:1" ]
+  }
+}
+write_marker() {
+  marker=$1; shift
+  [ ! -e "$marker" ] && [ ! -L "$marker" ] || fail "qset-v6 processor marker already exists: $marker"
+  marker_tmp=$(mktemp "$rollback_root/.marker.XXXXXX")
+  jq -n "$@" >"$marker_tmp"
+  chown "$expected_uid:$expected_gid" "$marker_tmp"
+  chmod 0640 "$marker_tmp"
+  sync -f "$marker_tmp"
+  mv "$marker_tmp" "$marker"
+  marker_tmp=
+  sync -f "$marker"
+  sync -f "$rollback_root"
+}
+persist_snapshot() {
+  if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+    safe_file "$snapshot" 65536 && require_blank_env "$snapshot" && cmp -s "$snapshot" "$env_file" \
+      || fail 'qset-v6 processor existing snapshot is unsafe or inconsistent'
+    return
+  fi
+  snapshot_tmp=$(mktemp "$rollback_root/.snapshot.XXXXXX")
+  cp -p "$env_file" "$snapshot_tmp"
+  chown "$expected_uid:$expected_gid" "$snapshot_tmp"
+  chmod 0640 "$snapshot_tmp"
+  require_blank_env "$snapshot_tmp" || fail 'qset-v6 processor snapshot is not blank'
+  sync -f "$snapshot_tmp"
+  mv "$snapshot_tmp" "$snapshot"
+  snapshot_tmp=
+  sync -f "$snapshot"
+  sync -f "$rollback_root"
+  safe_file "$snapshot" 65536 || fail 'qset-v6 processor snapshot persistence failed'
+}
+render_bound_env() {
+  source_env=$1
+  destination=$2
+  require_blank_env "$source_env" || return 1
+  awk -v d1r="$day1_receipt_sha" -v d1i="$day1_inventory_sha" -v d2r="$day2_receipt_sha" -v d2i="$day2_inventory_sha" '
+    $0=="POLYEDGE_QSET_V6_DAY1_RECEIPT_SHA256="{print "POLYEDGE_QSET_V6_DAY1_RECEIPT_SHA256="d1r;next}
+    $0=="POLYEDGE_QSET_V6_DAY1_INVENTORY_SHA256="{print "POLYEDGE_QSET_V6_DAY1_INVENTORY_SHA256="d1i;next}
+    $0=="POLYEDGE_QSET_V6_DAY2_RECEIPT_SHA256="{print "POLYEDGE_QSET_V6_DAY2_RECEIPT_SHA256="d2r;next}
+    $0=="POLYEDGE_QSET_V6_DAY2_INVENTORY_SHA256="{print "POLYEDGE_QSET_V6_DAY2_INVENTORY_SHA256="d2i;next}
+    {print}
+  ' "$source_env" >"$destination"
+  chown "$expected_uid:$expected_gid" "$destination"
+  chmod 0640 "$destination"
+  require_bound_env "$destination"
+}
+install_env() {
+  source_env=$1
+  [ ! -L "$source_env" ] && [ -f "$source_env" ] && [ "$(stat -c %h "$source_env")" = 1 ] || return 1
+  sync -f "$source_env"
+  mv -f "$source_env" "$env_file"
+  sync -f "$env_file"
+  sync -f "$env_dir"
+  safe_file "$env_file" 65536
+}
+run_preflight() {
+  set -a
+  . "$1"
+  set +a
+  "$preflight"
+}
+validate_attempt() {
+  safe_file "$attempt" 65536 || fail 'qset-v6 processor attempt marker is unsafe'
+  jq -e --arg d1r "$day1_receipt_sha" --arg d1i "$day1_inventory_sha" --arg d2r "$day2_receipt_sha" --arg d2i "$day2_inventory_sha" --arg service "$service" --arg campaign "$campaign" '
+    .schema=="polyedge.qset_v6_processor_attempt.v2"
+    and (.envSha256|test("^sha256:[0-9a-f]{64}$"))
+    and (.snapshotSha256|test("^sha256:[0-9a-f]{64}$"))
+    and .day1ReceiptSha256==$d1r and .day1InventorySha256==$d1i
+    and .day2ReceiptSha256==$d2r and .day2InventorySha256==$d2i
+    and .service==$service and .campaign==$campaign
+    and (.priorInvocationId|type=="string" and test("^$|^[0-9a-f]{32}$"))
+  ' "$attempt" >/dev/null || fail 'qset-v6 processor attempt marker does not bind current inputs'
+  attempt_env_sha=$(jq -er .envSha256 "$attempt")
+  snapshot_sha=$(jq -er .snapshotSha256 "$attempt")
+  prior_invocation=$(jq -er .priorInvocationId "$attempt")
+  valid_prior_invocation "$prior_invocation" || fail 'qset-v6 processor prior invocation is invalid'
+  attempt_sha=$(sha256_file "$attempt")
+}
+validate_dispatched() {
+  safe_file "$dispatched" 65536 || fail 'qset-v6 processor dispatched marker is unsafe'
+  jq -e --arg attempt "$attempt_sha" '
+    .schema=="polyedge.qset_v6_processor_dispatched.v1"
+    and .attemptSha256==$attempt
+  ' "$dispatched" >/dev/null || fail 'qset-v6 processor dispatched marker is invalid'
+  dispatched_sha=$(sha256_file "$dispatched")
+}
+validate_snapshot() {
+  safe_file "$snapshot" 65536 || fail 'qset-v6 processor snapshot is unsafe'
+  [ "$(sha256_file "$snapshot")" = "$snapshot_sha" ] && require_blank_env "$snapshot" \
+    || fail 'qset-v6 processor snapshot differs from durable attempt'
+}
+validate_started() {
+  safe_file "$started" 65536 || fail 'qset-v6 processor started marker is unsafe'
+  jq -e --arg attempt "$attempt_sha" --arg dispatched "$dispatched_sha" '
+    .schema=="polyedge.qset_v6_processor_started.v2"
+    and .attemptSha256==$attempt and .dispatchedSha256==$dispatched
+    and (.invocationId|test("^[0-9a-f]{32}$"))
+  ' "$started" >/dev/null || fail 'qset-v6 processor started marker is invalid'
+  started_invocation=$(jq -er .invocationId "$started")
+  valid_invocation "$started_invocation" || fail 'qset-v6 processor started invocation is invalid'
+  started_sha=$(sha256_file "$started")
+}
+validate_completed() {
+  safe_file "$completed" 65536 \
+    && jq -e --arg attempt "$attempt_sha" --arg started "$started_sha" --arg invocation "$started_invocation" '
+      .schema=="polyedge.qset_v6_processor_completed.v1"
+      and .attemptSha256==$attempt and .startedSha256==$started
+      and .invocationId==$invocation and .result=="success"
+    ' "$completed" >/dev/null \
+    || fail 'qset-v6 processor completed marker is invalid'
+}
+write_started() {
+  valid_invocation "$1" || fail 'qset-v6 processor new invocation is invalid'
+  write_marker "$started" --arg attempt "$attempt_sha" --arg dispatched "$dispatched_sha" --arg invocation "$1" \
+    '{schema:"polyedge.qset_v6_processor_started.v2",attemptSha256:$attempt,dispatchedSha256:$dispatched,invocationId:$invocation}'
+  validate_started
+  remove_gate || fail 'qset-v6 processor could not consume manual gate after durable start'
+}
+finalize() {
+  current=$(show InvocationID)
+  [ "$current" = "$started_invocation" ] || fail 'qset-v6 processor invocation changed before completion'
+  [ "$(show ActiveState)" = inactive ] || fail 'qset-v6 processor invocation is still active'
+  [ "$(show Result)" = success ] || fail 'qset-v6 processor invocation did not succeed'
+  remove_gate || fail 'qset-v6 processor could not remove manual gate'
+  [ "$(show InvocationID)" = "$started_invocation" ] || fail 'qset-v6 processor invocation changed after gate removal'
+  [ "$(show ActiveState)" = inactive ] || fail 'qset-v6 processor invocation restarted after gate removal'
+  [ "$(show Result)" = success ] || fail 'qset-v6 processor result changed after gate removal'
+  "$disk_guard" --assert-headroom
+  if [ ! -e "$completed" ] && [ ! -L "$completed" ]; then
+    write_marker "$completed" --arg attempt "$attempt_sha" --arg started "$started_sha" --arg invocation "$started_invocation" \
+      '{schema:"polyedge.qset_v6_processor_completed.v1",attemptSha256:$attempt,startedSha256:$started,invocationId:$invocation,result:"success"}'
+  fi
+  validate_completed
+}
+wait_and_finalize() {
+  count=0
+  while [ "$count" -lt "$wait_attempts" ]; do
+    current=$(show InvocationID)
+    [ "$current" = "$started_invocation" ] || fail 'qset-v6 processor invocation mismatched durable start'
+    state=$(show ActiveState)
+    result=$(show Result)
+    case "$state:$result" in
+      inactive:success) finalize; return ;;
+      inactive:*|failed:*) fail 'qset-v6 processor invocation failed' ;;
+    esac
+    count=$((count + 1))
+    sleep 1
+  done
+  fail 'qset-v6 processor invocation did not finish before timeout'
+}
+require_live_rbac() {
+  if [ "$test_only" = 1 ]; then
+    "$rbac_checker" verify-live || fail 'qset-v6 live RBAC verification failed'
+  else
+    AZURE_RESOURCE_GROUP=rg-polyedge-dev AZURE_STORAGE_ACCOUNT_NAME=stpolyedge6urdjr5nmwx7w AZURE_TENANT_ID=9767f0dc-e83f-4cc1-94e1-0d5f9d287d32 \
+      "$rbac_checker" verify-live >/dev/null || fail 'qset-v6 live RBAC verification failed'
+  fi
+}
+require_ready_to_start() {
+  "$disk_guard" --assert-headroom
+  [ "$("$systemctl" is-enabled "$service" 2>/dev/null || true)" = static ] \
+    || fail 'qset-v6 processor unit must remain static'
+  [ "$(show ActiveState)" = inactive ] || fail 'qset-v6 processor service must be inactive before handoff'
+  require_live_rbac
+}
+ensure_bound_env() {
+  current_env_sha=$(sha256_file "$env_file")
+  if [ "$current_env_sha" = "$attempt_env_sha" ] && require_bound_env "$env_file"; then
+    run_preflight "$env_file" || fail 'qset-v6 processor preflight failed for durable bound environment'
+    return
+  fi
+  if [ "$current_env_sha" = "$snapshot_sha" ] && require_blank_env "$env_file" && cmp -s "$env_file" "$snapshot"; then
+    updated=$(mktemp "$env_dir/.qset-v6-processor-handoff-bound.XXXXXX")
+    render_bound_env "$snapshot" "$updated" || fail 'qset-v6 processor could not rebuild bound environment'
+    [ "$(sha256_file "$updated")" = "$attempt_env_sha" ] || fail 'qset-v6 processor rebuilt environment differs from durable attempt'
+    run_preflight "$updated" || fail 'qset-v6 processor preflight failed after durable environment recovery'
+    install_env "$updated" || fail 'qset-v6 processor could not install durable bound environment'
+    updated=
+    run_preflight "$env_file" || fail 'qset-v6 processor installed environment failed preflight'
+    return
+  fi
+  fail 'qset-v6 processor environment differs from durable attempt'
+}
+start_current_attempt() {
+  require_bound_env "$env_file" && [ "$(sha256_file "$env_file")" = "$attempt_env_sha" ] \
+    || fail 'qset-v6 processor bound environment changed before start'
+  require_ready_to_start
+  run_preflight "$env_file" || fail 'qset-v6 processor preflight failed before start'
+  gate_safe_or_absent || fail 'qset-v6 processor manual gate is unsafe'
+  remove_gate || fail 'qset-v6 processor stale manual gate could not be removed'
+  [ ! -e "$dispatched" ] && [ ! -L "$dispatched" ] || fail 'qset-v6 processor dispatch is already durable'
+  install -o "$expected_uid" -g "$expected_gid" -m 0640 /dev/null "$gate_file"
+  sync -f "$gate_file"
+  sync -f "$(dirname "$gate_file")"
+  [ -e "$attempt" ] && gate_safe_or_absent || fail 'qset-v6 processor gate exists without durable attempt'
+  write_marker "$dispatched" --arg attempt "$attempt_sha" \
+    '{schema:"polyedge.qset_v6_processor_dispatched.v1",attemptSha256:$attempt}'
+  validate_dispatched
+  set +e
+  "$systemctl" start --no-block "$service"
+  start_status=$?
+  set -e
+  count=0
+  while [ "$count" -lt "$start_attempts" ]; do
+    current=$(show InvocationID)
+    if [ "$current" != "$prior_invocation" ]; then
+      valid_invocation "$current" || fail 'qset-v6 processor start produced an invalid invocation'
+      write_started "$current"
+      wait_and_finalize
+      return
+    fi
+    count=$((count + 1))
+    sleep 1
+  done
+  fail "qset-v6 processor start did not create a new invocation (systemctl status $start_status)"
+}
+
+safe_file "$env_file" 65536 || fail "qset-v6 processor environment is missing or unsafe: $env_file"
+day1_receipt=$receipt_root/2026-09-01.json
+day2_receipt=$receipt_root/2026-09-02.json
+safe_file "$day1_receipt" 1048576 || fail "qset-v6 sealed-day receipt is missing or unsafe: $day1_receipt"
+safe_file "$day2_receipt" 1048576 || fail "qset-v6 sealed-day receipt is missing or unsafe: $day2_receipt"
+day1_receipt_sha=$(sha256_file "$day1_receipt")
+day2_receipt_sha=$(sha256_file "$day2_receipt")
+day1_inventory_sha=$(receipt_inventory "$day1_receipt" 2026-09-01) || fail 'qset-v6 August 26 sealed receipt is invalid'
+day2_inventory_sha=$(receipt_inventory "$day2_receipt" 2026-09-02) || fail 'qset-v6 August 27 sealed receipt is invalid'
+env_dir=$(dirname "$env_file")
+install -d -o "$expected_uid" -g "$expected_gid" -m 0700 "$rollback_root"
+[ ! -L "$rollback_root" ] && [ "$(stat -c '%u:%g:%a' "$rollback_root")" = "$expected_uid:$expected_gid:700" ] \
+  || fail 'qset-v6 processor rollback directory is unsafe'
+attempt=$rollback_root/attempt.json
+dispatched=$rollback_root/dispatched.json
+started=$rollback_root/started.json
+completed=$rollback_root/completed.json
+snapshot=$rollback_root/qset-v6-processor.env.before
+[ ! -L "$lock_file" ] || fail 'qset-v6 processor handoff lock is unsafe'
+umask 077
+exec 9>"$lock_file"
+flock -n 9 || fail 'qset-v6 processor handoff is already running'
+attempt_persisted=false
+updated=
+marker_tmp=
+snapshot_tmp=
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$attempt_persisted" = true ]; then
+    remove_gate || { echo 'qset-v6 processor handoff could not remove manual gate' >&2; status=1; }
+  fi
+  [ -n "${updated:-}" ] && rm -f "$updated" || true
+  [ -n "${marker_tmp:-}" ] && rm -f "$marker_tmp" || true
+  [ -n "${snapshot_tmp:-}" ] && rm -f "$snapshot_tmp" || true
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if [ -e "$attempt" ] || [ -L "$attempt" ]; then
+  validate_attempt
+  validate_snapshot
+  attempt_persisted=true
+  gate_safe_or_absent || fail 'qset-v6 processor manual gate is unsafe during recovery'
+  if [ -e "$completed" ] || [ -L "$completed" ]; then
+    ensure_bound_env
+    validate_dispatched
+    validate_started
+    validate_completed
+    remove_gate || fail 'qset-v6 processor could not remove manual gate'
+    "$disk_guard" --assert-headroom
+    trap - EXIT HUP INT TERM
+    printf '%s\n' 'qset-v6 processor handoff already completed without a repeat start'
+    exit 0
+  fi
+  ensure_bound_env
+  if [ -e "$started" ] || [ -L "$started" ]; then
+    validate_dispatched
+    validate_started
+    wait_and_finalize
+    trap - EXIT HUP INT TERM
+    printf '%s\n' 'qset-v6 processor handoff recovered durable start'
+    exit 0
+  fi
+  if [ -e "$dispatched" ] || [ -L "$dispatched" ]; then
+    validate_dispatched
+    current=$(show InvocationID)
+    state=$(show ActiveState)
+    if [ "$current" != "$prior_invocation" ]; then
+      valid_invocation "$current" || fail 'qset-v6 processor unrecorded invocation is invalid'
+      write_started "$current"
+      wait_and_finalize
+      trap - EXIT HUP INT TERM
+      printf '%s\n' 'qset-v6 processor handoff recovered unrecorded start'
+      exit 0
+    fi
+    [ "$state" = inactive ] || fail 'qset-v6 processor durable dispatch has an unknown active invocation'
+    fail 'qset-v6 processor durable dispatch outcome is unknown; automatic replay is prohibited'
+  fi
+  start_current_attempt
+  trap - EXIT HUP INT TERM
+  printf '%s\n' 'qset-v6 processor handoff resumed the same durable unstarted attempt'
+  exit 0
+fi
+
+[ ! -e "$dispatched" ] && [ ! -L "$dispatched" ] \
+  && [ ! -e "$started" ] && [ ! -L "$started" ] && [ ! -e "$completed" ] && [ ! -L "$completed" ] \
+  || fail 'qset-v6 processor has orphaned durable markers'
+require_blank_env "$env_file" || fail 'qset-v6 processor environment must contain one blank binding for each sealed day hash'
+[ ! -e "$gate_file" ] && [ ! -L "$gate_file" ] || fail 'qset-v6 processor manual gate already exists'
+require_ready_to_start
+updated=$(mktemp "$env_dir/.qset-v6-processor-handoff-bound.XXXXXX")
+render_bound_env "$env_file" "$updated" || fail 'qset-v6 processor could not render bound environment'
+run_preflight "$updated" || fail 'qset-v6 processor candidate environment failed preflight'
+persist_snapshot
+snapshot_sha=$(sha256_file "$snapshot")
+attempt_env_sha=$(sha256_file "$updated")
+prior_invocation=$(show InvocationID)
+valid_prior_invocation "$prior_invocation" || fail 'qset-v6 processor prior invocation is invalid'
+write_marker "$attempt" --arg env "$attempt_env_sha" --arg snapshot "$snapshot_sha" \
+  --arg d1r "$day1_receipt_sha" --arg d1i "$day1_inventory_sha" --arg d2r "$day2_receipt_sha" --arg d2i "$day2_inventory_sha" \
+  --arg service "$service" --arg campaign "$campaign" --arg prior "$prior_invocation" \
+  '{schema:"polyedge.qset_v6_processor_attempt.v2",envSha256:$env,snapshotSha256:$snapshot,day1ReceiptSha256:$d1r,day1InventorySha256:$d1i,day2ReceiptSha256:$d2r,day2InventorySha256:$d2i,service:$service,campaign:$campaign,priorInvocationId:$prior}'
+attempt_persisted=true
+validate_attempt
+validate_snapshot
+if [ "$test_only" = 1 ] && [ "${QSET_V6_PROCESSOR_HANDOFF_CRASH_AFTER_ATTEMPT_TEST_ONLY:-0}" = 1 ]; then
+  kill -KILL "$$"
+fi
+install_env "$updated" || fail 'qset-v6 processor could not install bound environment'
+updated=
+run_preflight "$env_file" || fail 'qset-v6 processor installed environment failed preflight'
+if [ "$test_only" = 1 ] && [ "${QSET_V6_PROCESSOR_HANDOFF_EXIT_AFTER_ENV_TEST_ONLY:-0}" = 1 ]; then
+  exit 1
+fi
+start_current_attempt
+trap - EXIT HUP INT TERM
+printf '%s\n' 'qset-v6 processor handoff completed: one durable execution started'

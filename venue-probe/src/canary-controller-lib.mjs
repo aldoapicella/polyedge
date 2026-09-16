@@ -1,4 +1,8 @@
-import { artifactLocationFromUri, sha256 } from "./canary-lib.mjs";
+import {
+  artifactLocationFromUri,
+  sha256,
+  VENUE_GTD_SECURITY_BUFFER_MS
+} from "./canary-lib.mjs";
 
 const HUMAN_GRANT_SCHEMA = "polyedge.strategy_canary_human_grant.v1";
 const INTENT_SCHEMA = "polyedge.execution_intent.v1";
@@ -113,7 +117,7 @@ export function selectFirstQualifiedIntent({ config, grant, candidates, now = ne
       && intent.order_kind === "post_only_gtd"
       && Number.isFinite(decisionMs) && decisionMs >= authorizedMs && decisionMs <= nowMs
       && Number.isFinite(validUntilMs) && validUntilMs > nowMs
-      && Number.isFinite(venueExpiryMs) && venueExpiryMs === validUntilMs + 60_000
+      && Number.isFinite(venueExpiryMs) && venueExpiryMs === validUntilMs + VENUE_GTD_SECURITY_BUFFER_MS
       && Number.isFinite(ttlMs) && ttlMs > 0 && ttlMs <= 30_000 && validUntilMs === decisionMs + ttlMs
       && Number.isFinite(notional) && notional > 0 && notional <= Number(grant.max_order_notional) && notional <= 1
       && Number.isFinite(shares) && Number.isFinite(price) && Number.isFinite(minimumOrderSize)

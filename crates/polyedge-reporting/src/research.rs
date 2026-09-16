@@ -36,6 +36,7 @@ use thiserror::Error;
 mod labs;
 mod loss_diagnostics;
 mod loss_regime_oos;
+mod normalized_snapshot;
 mod projected_cache;
 mod run_bundle;
 pub use labs::{
@@ -52,6 +53,11 @@ pub use labs::{
 };
 pub use loss_diagnostics::{run_loss_diagnostics, LossDiagnosticsOptions};
 pub use loss_regime_oos::{run_loss_regime_oos, LossRegimeOosOptions};
+pub use normalized_snapshot::{
+    publish_normalized_snapshot, restore_normalized_snapshot, NormalizedSnapshotFileV1,
+    NormalizedSnapshotManifestV1, NormalizedSnapshotPointerV1, PublishNormalizedSnapshotOptions,
+    RestoreNormalizedSnapshotOptions,
+};
 pub use projected_cache::{
     read_shadow_correction_state, read_verified_campaign_index, run_begin_shadow_correction,
     run_complete_shadow_correction, run_materialize_projected_campaign, run_publish_projected_day,
@@ -2091,15 +2097,14 @@ where
         ),
     };
     let mut blobs = client
-        .list_blobs_unfiltered(&source.prefix, source.max_blobs, source.max_bytes)
+        .list_blobs_by_suffixes(
+            &source.prefix,
+            &[".jsonl", ".jsonl.gz"],
+            source.max_blobs,
+            source.max_bytes,
+        )
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
     blobs.sort_by(|left, right| left.name.cmp(&right.name));
-    if let Some(unexpected) = blobs.iter().find(|blob| !blob.name.ends_with(".jsonl")) {
-        return Err(ResearchError::InvalidInput(format!(
-            "Azure raw-source day prefix contains unexpected non-JSONL blob {}",
-            unexpected.name
-        )));
-    }
     if blobs.windows(2).any(|pair| pair[0].name == pair[1].name) {
         return Err(ResearchError::InvalidInput(
             "Azure raw-source listing contains duplicate blob names".to_owned(),
@@ -2132,8 +2137,7 @@ where
             last_modified: prefetched.blob.last_modified.map(ts),
             sha256: sha256_prefixed(&prefetched.bytes),
         });
-        let reader =
-            BufReader::with_capacity(super::REPLAY_BUFFER_BYTES, prefetched.bytes.as_slice());
+        let reader = azure_event_reader(&prefetched.blob.name, prefetched.bytes.as_slice())?;
         let mut previous_ts = None;
         for line in reader.lines() {
             let line = line?;
@@ -2150,7 +2154,12 @@ where
         Ok(())
     })?;
     let mut final_blobs = client
-        .list_blobs_unfiltered(&source.prefix, source.max_blobs, source.max_bytes)
+        .list_blobs_by_suffixes(
+            &source.prefix,
+            &[".jsonl", ".jsonl.gz"],
+            source.max_blobs,
+            source.max_bytes,
+        )
         .map_err(|error| ResearchError::Azure(error.to_string()))?;
     final_blobs.sort_by(|left, right| left.name.cmp(&right.name));
     if final_blobs != initial_blobs {
@@ -2170,6 +2179,27 @@ where
     )?);
     finalize_stream_stats(&mut stats);
     Ok(stats)
+}
+
+fn azure_event_reader<'a>(
+    blob_name: &str,
+    bytes: &'a [u8],
+) -> Result<Box<dyn BufRead + 'a>, ResearchError> {
+    if blob_name.ends_with(".jsonl.gz") {
+        Ok(Box::new(BufReader::with_capacity(
+            super::REPLAY_BUFFER_BYTES,
+            GzDecoder::new(bytes),
+        )))
+    } else if blob_name.ends_with(".jsonl") {
+        Ok(Box::new(BufReader::with_capacity(
+            super::REPLAY_BUFFER_BYTES,
+            bytes,
+        )))
+    } else {
+        Err(ResearchError::InvalidInput(format!(
+            "Azure raw-source blob is not JSONL or JSONL.gz: {blob_name}"
+        )))
+    }
 }
 
 struct PrefetchedAzureBlob {
@@ -3803,6 +3833,12 @@ impl AuditAccumulator {
                     .and_then(Value::as_str)
                     == Some("full_decision_pipeline_recomputation")
         });
+        let decision_grade_applicable = !(self.strategy_evaluations == 0
+            && self.decision_grade_evaluations == 0
+            && !self.runtime_provenance.is_empty()
+            && self.runtime_provenance.iter().all(|(_, payload)| {
+                run_bundle::primary_runtime_provenance_errors(payload).is_empty()
+            }));
         self.finalize_settlement_journals();
         self.decision_config_sha256s
             .extend(self.runtime_provenance.iter().filter_map(|(_, payload)| {
@@ -3822,7 +3858,7 @@ impl AuditAccumulator {
         let decision_config_sha256 = (self.decision_config_sha256s.len() == 1)
             .then(|| self.decision_config_sha256s.iter().next().cloned())
             .flatten();
-        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance);
+        let runtime_provenance = summarize_runtime_provenance(&self.runtime_provenance, true);
         self.finalize_market_truth();
         self.finalize_strategy_batch_parity();
         let markets_with_start = self
@@ -3839,10 +3875,12 @@ impl AuditAccumulator {
         let settlement_rate = ratio_f64(markets_settled, self.markets.len());
         let decision_metadata_coverage =
             ratio_f64(self.decisions_with_final_metadata, self.decisions);
-        let final_decision_grade_coverage =
-            ratio_f64(self.decision_grade_decisions, self.decisions);
-        let decision_grade_coverage =
-            ratio_f64(self.decision_grade_evaluations, self.strategy_evaluations);
+        let final_decision_grade_coverage = decision_grade_applicable
+            .then(|| ratio_f64(self.decision_grade_decisions, self.decisions))
+            .flatten();
+        let decision_grade_coverage = decision_grade_applicable
+            .then(|| ratio_f64(self.decision_grade_evaluations, self.strategy_evaluations))
+            .flatten();
         let execution_field_coverage = if self.place_decisions == 0 {
             Some(1.0)
         } else {
@@ -3958,7 +3996,10 @@ impl AuditAccumulator {
                 self.decision_grade_evaluations, self.strategy_evaluations
             )));
         }
-        if self.decisions > 0 && final_decision_grade_coverage.is_none_or(|rate| rate < 0.95) {
+        if decision_grade_applicable
+            && self.decisions > 0
+            && final_decision_grade_coverage.is_none_or(|rate| rate < 0.95)
+        {
             warnings.push(json!(format!(
                 "final-decision grade coverage below 95%: {}/{}",
                 self.decision_grade_decisions, self.decisions
@@ -3970,7 +4011,7 @@ impl AuditAccumulator {
                 self.place_decisions_with_complete_execution_fields, self.place_decisions
             )));
         }
-        if self.decisions > 0 && self.strategy_evaluations == 0 {
+        if decision_grade_applicable && self.decisions > 0 && self.strategy_evaluations == 0 {
             warnings.push(json!("decision parity evidence missing"));
         } else if self.strategy_evaluation_invalid > 0
             || self.strategy_evaluation_matches != self.strategy_evaluations
@@ -4094,6 +4135,7 @@ impl AuditAccumulator {
             "decision_metadata_coverage": decision_metadata_coverage,
             "decision_grade_decisions": self.decision_grade_decisions,
             "decision_grade_by_action": self.decision_grade_by_action,
+            "decision_grade_applicable": decision_grade_applicable,
             "final_decision_grade_coverage": final_decision_grade_coverage,
             "decision_grade_evaluations": self.decision_grade_evaluations,
             "decision_grade_failure_reasons": self.decision_grade_failure_reasons,
@@ -4342,9 +4384,6 @@ fn validate_strategy_batch(
     if input.schema_version != 3 {
         return Err("pipeline_input_schema_mismatch");
     }
-    if input.settings.deploy.runtime_role != polyedge_config::RuntimeRole::ProfitabilityShadow {
-        return Err("runtime_role_not_profitability_shadow");
-    }
     if input.settings.live.execution_mode != polyedge_config::ExecutionMode::Paper {
         return Err("execution_mode_not_paper");
     }
@@ -4355,8 +4394,22 @@ fn validate_strategy_batch(
     {
         return Err("unsafe_execution_settings");
     }
-    if input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle) {
-        return Err("adaptive_mode_mismatch");
+    match input.settings.deploy.runtime_role {
+        polyedge_config::RuntimeRole::ProfitabilityShadow => {
+            if input.adaptive_mode != Some(FrozenStrategyMode::DynamicQuoteStyle) {
+                return Err("adaptive_mode_mismatch");
+            }
+        }
+        polyedge_config::RuntimeRole::Primary => {
+            if input.adaptive_mode.is_some()
+                || input.classifier_before.is_some()
+                || input.settings.strategy.adaptive_regime_enabled
+                || input.settings.strategy.adaptive_regime_mode != "paper_only"
+                || input.settings.azure.publish_strategy_canary_intents
+            {
+                return Err("primary_runtime_settings_invalid");
+            }
+        }
     }
     if input.settings.validate_runtime_role().is_err() {
         return Err("runtime_settings_invalid");
@@ -4443,7 +4496,7 @@ fn validate_strategy_batch(
     {
         return Err("batch_id_hash_mismatch");
     }
-    let expected_candidate = FrozenStrategyMode::DynamicQuoteStyle.candidate();
+    let expected_candidate = input.adaptive_mode.map(FrozenStrategyMode::candidate);
     if payload.get("candidate")
         != Some(
             &serde_json::to_value(expected_candidate).map_err(|_| "candidate_roundtrip_failed")?,
@@ -4931,7 +4984,10 @@ fn decision_grade_failure_reasons(metadata: &StrategyDecisionMetadata) -> Vec<St
     reasons
 }
 
-fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Value {
+fn summarize_runtime_provenance(
+    observations: &[(DateTime<Utc>, Value)],
+    stable_identity: bool,
+) -> Value {
     let mut valid_timestamps = Vec::new();
     let mut identities = BTreeMap::<String, Value>::new();
     let mut invalid_reasons = BTreeSet::new();
@@ -4940,8 +4996,21 @@ fn summarize_runtime_provenance(observations: &[(DateTime<Utc>, Value)]) -> Valu
         let errors = run_bundle::runtime_provenance_common_errors(payload);
         if errors.is_empty() {
             valid_timestamps.push(*timestamp);
-            let key = serde_json::to_string(payload).unwrap_or_else(|_| "invalid-json".to_owned());
-            identities.entry(key).or_insert_with(|| payload.clone());
+            let mut identity = payload.clone();
+            if stable_identity {
+                if let Some(identity) = identity.as_object_mut() {
+                    identity.remove("essential_feed_health");
+                    if let Some(routing) = identity
+                        .get_mut("event_blob_prefix_routing")
+                        .and_then(Value::as_object_mut)
+                    {
+                        routing.remove("evaluated_event_ts");
+                    }
+                }
+            }
+            let key =
+                serde_json::to_string(&identity).unwrap_or_else(|_| "invalid-json".to_owned());
+            identities.entry(key).or_insert(identity);
         } else {
             invalid_observations += 1;
             invalid_reasons.extend(errors);
@@ -11096,6 +11165,7 @@ fn envelope(
         "generated_at": now_ts(),
         "git_sha": git_sha(),
         "backend": "rust",
+        "generator_provenance": generator_provenance(),
         "data_window": data_window(&result),
         "config": {
             "adaptive_regime_enabled": false,
@@ -11195,9 +11265,35 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), ResearchError> {
         fs::create_dir_all(parent)?;
     }
     let file = File::create(path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), value)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    writer.flush()?;
+    drop(writer);
+    if let Some(attestation) = generator_attestation(value, &fs::read(path)?) {
+        let attestation_path = PathBuf::from(format!("{}.attestation.json", path.display()));
+        let file = File::create(&attestation_path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &attestation)?;
+        writer.flush()?;
+        maybe_publish_research_artifact(&attestation_path)?;
+    }
     maybe_publish_research_artifact(path)?;
     Ok(())
+}
+
+fn generator_attestation(report: &Value, bytes: &[u8]) -> Option<Value> {
+    let provenance = report.get("generator_provenance")?;
+    if provenance.get("platform")?.as_str()? != "azure_container_apps_job" {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "report_sha256": sha256_prefixed(bytes),
+        "platform": provenance["platform"],
+        "image": provenance["image"],
+        "execution_id": provenance["execution_id"],
+        "job_name": provenance["job_name"]
+    }))
 }
 
 fn write_text_file(path: &Path, text: &str) -> Result<(), ResearchError> {
@@ -11215,6 +11311,9 @@ fn write_text_file(path: &Path, text: &str) -> Result<(), ResearchError> {
 }
 
 fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
+    if research_artifact_publication_disabled() {
+        return Ok(());
+    }
     let Some(blob_name) = research_artifact_blob_name(path) else {
         return Ok(());
     };
@@ -11246,6 +11345,15 @@ fn maybe_publish_research_artifact(path: &Path) -> Result<(), ResearchError> {
             ResearchError::Azure(format!("publishing research artifact {blob_name}: {error}"))
         })?;
     Ok(())
+}
+
+pub(super) fn research_artifact_publication_disabled() -> bool {
+    let value = std::env::var("POLYEDGE_DISABLE_RESEARCH_ARTIFACT_PUBLISH").ok();
+    explicit_true(value.as_deref())
+}
+
+fn explicit_true(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn publish_promotion_transition_compare_and_swap(
@@ -11880,6 +11988,132 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_publication_is_disabled_only_by_explicit_true() {
+        assert!(explicit_true(Some("true")));
+        assert!(explicit_true(Some("TRUE")));
+        assert!(!explicit_true(Some("false")));
+        assert!(!explicit_true(None));
+    }
+
+    #[test]
+    fn local_runtime_provenance_requires_an_explicit_authoritative_recorder() {
+        let mut payload = json!({
+            "schema_version": 1,
+            "backend_impl": "rust",
+            "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+            "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+            "app_name": "polyedge",
+            "runtime_role": "primary",
+            "execution_mode": "paper",
+            "paper_maker_fill_policy": "touch_after_quote_was_live",
+            "storage_account": null,
+            "storage_container": "bot-events",
+            "event_blob_prefix": "events",
+            "shadow_only": false,
+            "allow_live": false,
+            "enable_taker_orders": false,
+            "allow_emergency_account_cancel": false,
+            "adaptive_regime_enabled": false,
+            "publish_strategy_canary_intents": false,
+            "research_only": true
+        });
+        assert_eq!(
+            run_bundle::runtime_provenance_common_errors(&payload),
+            ["/authoritative_recorder_backend must identify a local recorder when /storage_account is null"]
+        );
+        payload["authoritative_recorder_backend"] = json!("local_jsonl");
+        assert!(run_bundle::runtime_provenance_common_errors(&payload).is_empty());
+        payload["storage_account"] = json!("stpolyedgedev");
+        assert_eq!(
+            run_bundle::runtime_provenance_common_errors(&payload),
+            ["/storage_account must be null when /authoritative_recorder_backend is local_jsonl"]
+        );
+        payload["authoritative_recorder_backend"] = json!("azure_append_blob");
+        assert!(run_bundle::runtime_provenance_common_errors(&payload).is_empty());
+    }
+
+    #[test]
+    fn runtime_provenance_identity_ignores_observation_health_and_time() {
+        let first = wallet_ts("2026-07-20T12:00:00Z");
+        let mut payload = json!({
+            "schema_version": 1,
+            "backend_impl": "rust",
+            "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+            "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+            "app_name": "polyedge",
+            "runtime_role": "primary",
+            "execution_mode": "paper",
+            "paper_maker_fill_policy": "touch_after_quote_was_live",
+            "authoritative_recorder_backend": "local_jsonl",
+            "storage_account": null,
+            "storage_container": "bot-events",
+            "event_blob_prefix": "events",
+            "shadow_only": false,
+            "allow_live": false,
+            "enable_taker_orders": false,
+            "allow_emergency_account_cancel": false,
+            "adaptive_regime_enabled": false,
+            "publish_strategy_canary_intents": false,
+            "research_only": true,
+            "essential_feed_health": {"feed_status": "healthy"},
+            "event_blob_prefix_routing": {
+                "effective_prefix": "events",
+                "evaluated_event_ts": first
+            }
+        });
+        let mut later = payload.clone();
+        later["essential_feed_health"]["feed_status"] = json!("recovering");
+        later["event_blob_prefix_routing"]["evaluated_event_ts"] =
+            json!(first + Duration::minutes(1));
+
+        let summary = summarize_runtime_provenance(
+            &[
+                (first, payload.clone()),
+                (first + Duration::minutes(1), later),
+            ],
+            true,
+        );
+        assert_eq!(summary["distinct_identity_count"], 1);
+        assert!(summary["identities"][0]
+            .get("essential_feed_health")
+            .is_none());
+        assert!(summary["identities"][0]["event_blob_prefix_routing"]
+            .get("evaluated_event_ts")
+            .is_none());
+
+        payload["runtime_config_hash"] = json!(format!("sha256:{}", "b".repeat(64)));
+        let changed = summarize_runtime_provenance(
+            &[
+                (first, summary["identities"][0].clone()),
+                (first + Duration::minutes(1), payload),
+            ],
+            true,
+        );
+        assert_eq!(changed["distinct_identity_count"], 2);
+    }
+
+    #[test]
+    fn azure_event_reader_accepts_plain_and_gzip_jsonl_only() {
+        let raw = b"{\"event\":1}\n";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let plain = azure_event_reader("events/1.jsonl", raw)
+            .unwrap()
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let gzip = azure_event_reader("events/1.jsonl.gz", &compressed)
+            .unwrap()
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(plain, gzip);
+        assert!(azure_event_reader("events/1.manifest.json", raw).is_err());
+    }
 
     fn settlement_carry_fixture(
         name: &str,
@@ -14195,7 +14429,7 @@ mod tests {
         .into_iter()
         .map(|decision| polyedge_storage::wire_normalized_json(&decision).unwrap())
         .collect::<Vec<_>>();
-        if !input.kill_switch_enabled {
+        if !input.kill_switch_enabled && input.adaptive_mode.is_some() {
             assert!(decisions
                 .iter()
                 .any(|decision| decision.get("strategy_metadata").is_some()));
@@ -14218,7 +14452,7 @@ mod tests {
             "batch_id": batch_id,
             "market_id": input.market.market_id,
             "decision_ts": input.decision_ts,
-            "candidate": FrozenStrategyMode::DynamicQuoteStyle.candidate(),
+            "candidate": input.adaptive_mode.map(FrozenStrategyMode::candidate),
             "decision_config_schema": "polyedge.decision_config.v1",
             "decision_config_sha256": decision_config_sha256(input).unwrap(),
             "market_start_evidence_sha256": start_sha256,
@@ -14364,6 +14598,79 @@ mod tests {
         assert!(result["decision_config_sha256"]
             .as_str()
             .is_some_and(valid_prefixed_sha256));
+    }
+
+    #[test]
+    fn audit_recomputes_primary_paper_batch() {
+        let now = wallet_ts("2026-07-20T12:00:00Z");
+        let mut input = decision_pipeline_v3_input(now);
+        input.settings.deploy.runtime_role = polyedge_config::RuntimeRole::Primary;
+        input.settings.paper.maker_fill_policy = "touch_after_quote_was_live".to_owned();
+        input.settings.strategy.adaptive_regime_enabled = false;
+        input.settings.strategy.adaptive_regime_mode = "paper_only".to_owned();
+        input.settings.azure.publish_strategy_canary_intents = false;
+        input.settings.azure.storage_container_name = "bot-events".to_owned();
+        input.settings.azure.event_blob_prefix = "events".to_owned();
+        input.adaptive_mode = None;
+        input.classifier_before = None;
+        assert!(input.settings.validate_runtime_role().is_ok());
+
+        let (batch, decisions) = decision_pipeline_v4_evidence(&input);
+        assert!(batch["candidate"].is_null());
+        let mut audit = AuditAccumulator::default();
+        audit.observe(&EventLine {
+            event_type: "runtime_provenance".to_owned(),
+            recorded_ts: now,
+            payload: json!({
+                "schema_version": 1,
+                "backend_impl": "rust",
+                "git_sha": "c40d9093783808b010eabd9c43697e9dcceb667b",
+                "runtime_config_hash": format!("sha256:{}", "a".repeat(64)),
+                "app_name": "polyedge",
+                "runtime_role": "primary",
+                "shadow_only": false,
+                "execution_mode": "paper",
+                "allow_live": false,
+                "enable_taker_orders": false,
+                "allow_emergency_account_cancel": false,
+                "paper_maker_fill_policy": "touch_after_quote_was_live",
+                "adaptive_regime_enabled": false,
+                "adaptive_regime_mode": "paper_only",
+                "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
+                "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
+                "decision_config_schema": "polyedge.decision_config.v1",
+                "decision_config_sha256": batch["decision_config_sha256"],
+                "candidate": null,
+                "authoritative_recorder_backend": "local_jsonl",
+                "storage_account": null,
+                "storage_container": "bot-events",
+                "event_blob_prefix": "events",
+                "publish_strategy_canary_intents": false,
+                "research_only": true
+            }),
+            raw: Value::Null,
+        });
+        observe_v3_evidence(&mut audit, now, batch);
+        for decision in decisions {
+            observe_bound_v3_decision(&mut audit, now, decision);
+        }
+        let result = audit.finish();
+        assert_eq!(result["strategy_batches"], 1);
+        assert_eq!(result["strategy_batch_replayed"], 1);
+        assert_eq!(result["strategy_batch_matches"], 1);
+        assert_eq!(result["strategy_batch_invalid"], 0);
+        assert_eq!(result["strategy_batch_contract_invalid"], 0);
+        assert_eq!(result["decision_pipeline_replay_rate"], 1.0);
+        assert_eq!(result["decision_output_binding_rate"], 1.0);
+        assert_eq!(result["decision_parity_rate"], 1.0);
+        assert_eq!(result["decision_grade_applicable"], false);
+        assert!(result["decision_grade_coverage"].is_null());
+        assert!(result["final_decision_grade_coverage"].is_null());
+        assert!(!result["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning == "decision parity evidence missing"));
     }
 
     #[test]
@@ -15263,4 +15570,113 @@ mod tests {
         assert_eq!(state.version, 1);
         assert_eq!(state.immutable.len(), 1);
     }
+    #[test]
+    fn generator_provenance_requires_exact_platform_image_and_execution() {
+        let image = format!(
+            "registry.example.invalid/research@sha256:{}",
+            "a".repeat(64)
+        );
+        let azure = strict_generator_provenance(
+            "azure_container_apps_job",
+            &image,
+            "polyedge-hourly-quality-job-fixture",
+            Some("polyedge-hourly-quality-job"),
+        )
+        .unwrap();
+        assert_eq!(azure["image"], image);
+        assert!(strict_generator_provenance(
+            "azure_container_apps_job",
+            "research:latest",
+            "exec",
+            Some("job")
+        )
+        .is_none());
+        assert!(strict_generator_provenance("oci_podman", &image, "../copied", None).is_none());
+        assert!(strict_generator_provenance("oci_podman", &image, "exec", Some("job")).is_none());
+    }
+
+    #[test]
+    fn azure_generator_attestation_binds_exact_report_bytes() {
+        let provenance = strict_generator_provenance(
+            "azure_container_apps_job",
+            &format!(
+                "registry.example.invalid/research@sha256:{}",
+                "b".repeat(64)
+            ),
+            "polyedge-hourly-quality-job-fixture",
+            Some("polyedge-hourly-quality-job"),
+        )
+        .unwrap();
+        let report = json!({"generator_provenance": provenance});
+        let attestation = generator_attestation(&report, b"exact report").unwrap();
+        assert_eq!(
+            attestation["report_sha256"],
+            sha256_prefixed(b"exact report")
+        );
+        assert_eq!(
+            attestation["execution_id"],
+            "polyedge-hourly-quality-job-fixture"
+        );
+    }
+}
+fn generator_provenance() -> Value {
+    let platform = std::env::var("POLYEDGE_GENERATOR_PLATFORM").unwrap_or_default();
+    let image = std::env::var("POLYEDGE_GENERATOR_IMAGE").unwrap_or_default();
+    let (execution_id, job_name) = if platform == "azure_container_apps_job" {
+        (
+            std::env::var("CONTAINER_APP_JOB_EXECUTION_NAME").unwrap_or_default(),
+            std::env::var("CONTAINER_APP_JOB_NAME").ok(),
+        )
+    } else {
+        (
+            std::env::var("POLYEDGE_GENERATOR_EXECUTION_ID").unwrap_or_default(),
+            None,
+        )
+    };
+    strict_generator_provenance(&platform, &image, &execution_id, job_name.as_deref())
+        .unwrap_or(Value::Null)
+}
+
+fn strict_generator_provenance(
+    platform: &str,
+    image: &str,
+    execution_id: &str,
+    job_name: Option<&str>,
+) -> Option<Value> {
+    if !matches!(platform, "azure_container_apps_job" | "oci_podman")
+        || !valid_immutable_image(image)
+        || !valid_execution_name(execution_id)
+        || (platform == "azure_container_apps_job" && !job_name.is_some_and(valid_execution_name))
+        || (platform == "oci_podman" && job_name.is_some())
+    {
+        return None;
+    }
+    Some(json!({
+        "schema_version": 1,
+        "platform": platform,
+        "image": image,
+        "execution_id": execution_id,
+        "job_name": job_name
+    }))
+}
+
+fn valid_immutable_image(value: &str) -> bool {
+    let Some((name, digest)) = value.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !name.is_empty()
+        && name.contains('/')
+        && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_execution_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }

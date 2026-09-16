@@ -834,6 +834,80 @@ fn empty_daily_manifest_with_zero_decision_denominator_fails_cleanly() {
 }
 
 #[test]
+fn primary_adaptive_off_marks_decision_grade_not_applicable() {
+    let root = test_dir("publish_primary_decision_grade_na");
+    let source = root.join("generated");
+    fs::create_dir_all(&source).unwrap();
+    for name in ["baseline.json", "regimes.json", "final_report.json"] {
+        fs::write(source.join(name), format!(r#"{{"artifact":"{name}"}}"#)).unwrap();
+    }
+    fs::write(
+        source.join("execution_quality.json"),
+        complete_execution_quality(),
+    )
+    .unwrap();
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();
+    audit["result"]["decision_grade_applicable"] = serde_json::json!(false);
+    audit["result"]["decision_grade_coverage"] = serde_json::Value::Null;
+    audit["result"]["decision_grade_evaluations"] = serde_json::json!(0);
+    audit["result"]["strategy_evaluations"] = serde_json::json!(0);
+    audit["result"]["final_decision_grade_coverage"] = serde_json::Value::Null;
+    audit["result"]["runtime_provenance"]["identities"] =
+        serde_json::json!([valid_primary_runtime_provenance_identity(&current_git_sha())]);
+    let (audit_path, input_sha256) = write_bound_daily_audit(&source, &mut audit);
+
+    let quality = publish_daily_directory(
+        NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+        "primary-2026-07-19-decision-grade-na",
+        input_sha256,
+        polyedge_config::RuntimeRole::Primary,
+        &source,
+        &root.join("reports/research/daily"),
+        &audit_path,
+    )
+    .unwrap()
+    .manifest
+    .data_quality;
+
+    assert_eq!(quality.decision_grade_coverage, Decimal::ZERO);
+    assert_eq!(
+        quality.coverage_breakdown.decision_grade_applicable,
+        Some(false)
+    );
+    assert_eq!(quality.coverage_breakdown.decision_grade_coverage, None);
+    assert_eq!(
+        quality.coverage_breakdown.final_decision_grade_coverage,
+        None
+    );
+    assert!(quality.promotion_allowed());
+}
+
+#[test]
+fn shadow_cannot_claim_primary_decision_grade_not_applicable() {
+    let mut audit: serde_json::Value =
+        serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();
+    audit["result"]["decision_grade_applicable"] = serde_json::json!(false);
+    audit["result"]["decision_grade_coverage"] = serde_json::Value::Null;
+    audit["result"]["decision_grade_evaluations"] = serde_json::json!(0);
+    audit["result"]["strategy_evaluations"] = serde_json::json!(0);
+    audit["result"]["final_decision_grade_coverage"] = serde_json::Value::Null;
+
+    let quality = publish_quality_fixture(
+        "publish_shadow_false_decision_grade_na",
+        "shadow-2026-07-19-false-decision-grade-na",
+        audit,
+    );
+
+    assert_eq!(quality.coverage_breakdown.decision_grade_applicable, None);
+    assert!(quality.warnings.iter().any(|warning| {
+        warning.rule_id == "decision_grade_applicability_invalid"
+            && warning.severity == WarningSeverity::Blocking
+    }));
+    assert!(!quality.promotion_allowed());
+}
+
+#[test]
 fn daily_manifest_rejects_inconsistent_decision_grade_ratio() {
     let mut audit: serde_json::Value =
         serde_json::from_slice(&complete_daily_audit("2026-07-19", 1.0)).unwrap();
@@ -1592,6 +1666,7 @@ fn measured_quality(
         exact_reference_hour_coverage: Some(coverage),
         decision_metadata_coverage: Some(coverage),
         decision_grade_coverage: Some(coverage),
+        decision_grade_applicable: Some(true),
         final_decision_grade_coverage: Some(coverage),
         execution_field_coverage: Some(coverage),
         decision_parity_rate: Some(Decimal::ONE),
@@ -3249,6 +3324,10 @@ fn valid_primary_runtime_provenance_identity(git_sha: &str) -> serde_json::Value
         "paper_maker_fill_policy": "touch_after_quote_was_live",
         "adaptive_regime_enabled": false,
         "adaptive_regime_mode": "paper_only",
+        "decision_pipeline_schema": "polyedge.strategy_decision_batch.v4",
+        "decision_pipeline_parity_scope": "full_decision_pipeline_recomputation",
+        "decision_config_schema": "polyedge.decision_config.v1",
+        "decision_config_sha256": format!("sha256:{}", "d".repeat(64)),
         "candidate": null,
         "storage_account": "stpolyedgedev",
         "storage_container": "bot-events",

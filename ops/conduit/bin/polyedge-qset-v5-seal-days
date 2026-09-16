@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+validate_campaign_date() {
+  date=$1
+  case "$date" in
+    2026-08-2[4-9]|2026-08-3[01]|2026-09-0[1-9]|2026-09-[12][0-9]|2026-09-30|2026-10-0[1-9]|2026-10-1[0-9]|2026-10-2[0-2]) ;;
+    2026-10-2[3-9]|2026-10-3[01]) echo 'qset-v5 refuses date after terminal 2026-10-24' >&2; exit 64 ;;
+    *) echo 'qset-v5 refuses date outside the 2026-08-26 through 2026-10-24 campaign' >&2; exit 64 ;;
+  esac
+}
+if [ "${QSET_V5_DATE_VALIDATION_ONLY:-false}" = true ]; then [ "$#" = 1 ] || exit 64; validate_campaign_date "$1"; exit 0; fi
+
+env_file=/etc/polyedge/qset-v5-sealer.env
+[ ! -L "$env_file" ] && [ -f "$env_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$env_file")" = 0:0:640:1 ] || { echo 'qset-v5 sealer environment is missing or unsafe' >&2; exit 64; }
+set -a; . "$env_file"; set +a
+for name in POLYEDGE_QSET_V5_SEAL_IMAGE POLYEDGE_QSET_V5_SEAL_GIT_SHA POLYEDGE_QSET_V5_WRITER_IMAGE POLYEDGE_QSET_V5_WRITER_GIT_SHA SHADOW_CODE_FREEZE_SHA256 SHADOW_CODE_FREEZE_MANIFEST EXECUTION_FREEZE_ARTIFACT_PATH EXECUTION_FREEZE_SHA256 AZURE_STORAGE_ACCOUNT_NAME AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_FEDERATED_TOKEN_FILE; do eval "value=\${$name:-}"; [ -n "$value" ] || { echo "qset-v5 requires $name" >&2; exit 64; }; done
+[ "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-08-26-qset-v5 ] || { echo 'qset-v5 campaign is inexact' >&2; exit 64; }
+[ "${SHADOW_CODE_FREEZE_FINALIZED:-}" = true ] || { echo 'qset-v5 source freeze is not finalized' >&2; exit 64; }
+[ "$SHADOW_CODE_FREEZE_SHA256" = "$EXECUTION_FREEZE_SHA256" ] || { echo 'qset-v5 writer and sealer freeze hashes differ' >&2; exit 64; }
+case "$EXECUTION_FREEZE_ARTIFACT_PATH" in reports/research/shadow/campaigns/campaign-2026-08-26-qset-v5/control/code-freeze/source-${EXECUTION_FREEZE_SHA256#sha256:}.json) ;; *) echo 'qset-v5 execution freeze path is inexact' >&2; exit 64 ;; esac
+[ "$SHADOW_CODE_FREEZE_MANIFEST" = "azure://$AZURE_STORAGE_ACCOUNT_NAME/polyedge-qset-v5-control/$EXECUTION_FREEZE_ARTIFACT_PATH" ] || { echo 'qset-v5 source freeze manifest is inexact' >&2; exit 64; }
+[ "$AZURE_FEDERATED_TOKEN_FILE" = /run/credentials/azure-federated-token ] || { echo 'qset-v5 federated token path is inexact' >&2; exit 64; }
+[ "${AZURE_STORAGE_CONTAINER_NAME:-}" = polyedge-shadow-qset-v5-events ] && [ "${AZURE_RESEARCH_STORAGE_CONTAINER_NAME:-}" = polyedge-research-qset-v5 ] && [ "${POLYEDGE_QSET_V5_CONTROL_CONTAINER_NAME:-}" = polyedge-qset-v5-control ] || { echo 'qset-v5 containers are inexact' >&2; exit 64; }
+[ "${AZURE_STORAGE_TABLE_NAME:-}" = ShadowQsetV5EventIndex ] && [ "${AZURE_CHART_TABLE_NAME:-}" = ShadowQsetV5ChartSeries ] && [ "${AZURE_MARKET_TABLE_NAME:-}" = ShadowQsetV5MarketCatalog ] || { echo 'qset-v5 tables are inexact' >&2; exit 64; }
+
+digest=${EXECUTION_FREEZE_SHA256#sha256:}
+freeze_receipt=/srv/polyedge-ring/migration/qset-v5/source-freeze/source-$digest.json
+[ ! -L "$freeze_receipt" ] && [ -f "$freeze_receipt" ] && [ "$(stat -c '%u:%g:%a:%h' "$freeze_receipt")" = 0:0:640:1 ] && [ "$(stat -c '%s' "$freeze_receipt")" -le 1048576 ] || { echo 'qset-v5 hash-selected freeze receipt is missing or unsafe' >&2; exit 64; }
+jq -e --arg uri "$SHADOW_CODE_FREEZE_MANIFEST" --arg hash "$EXECUTION_FREEZE_SHA256" --arg sealImage "$POLYEDGE_QSET_V5_SEAL_IMAGE" --arg writerImage "$POLYEDGE_QSET_V5_WRITER_IMAGE" --arg sealCommit "$POLYEDGE_QSET_V5_SEAL_GIT_SHA" --arg writerCommit "$POLYEDGE_QSET_V5_WRITER_GIT_SHA" '
+  .schema=="polyedge.qset_v5_source_freeze_upload_receipt.v2" and .manifest.uri==$uri and .manifest.sha256==$hash and
+  .researchImage==$sealImage and .researchImage==$writerImage and .sourceCommit==$sealCommit and .sourceCommit==$writerCommit and
+  (.gitTree|test("^[0-9a-f]{40}$")) and .immutabilityPolicy.state=="Locked" and .immutabilityPolicy.days>=90
+' "$freeze_receipt" >/dev/null
+
+credential_dir=/run/polyedge-federated-shadow-qset-v5-writer
+token_file=$credential_dir/azure-federated-token
+[ ! -L "$token_file" ] && [ -f "$token_file" ] && [ "$(stat -c '%u:%g:%a:%h' "$token_file")" = 976:976:600:1 ] || { echo 'qset-v5 writer federated token is missing or unsafe' >&2; exit 1; }
+/usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
+mountpoint -q /srv/polyedge-ring || { echo '/srv/polyedge-ring is not a mount point' >&2; exit 1; }
+for image_revision in "$POLYEDGE_QSET_V5_SEAL_IMAGE:$POLYEDGE_QSET_V5_SEAL_GIT_SHA" "$POLYEDGE_QSET_V5_WRITER_IMAGE:$POLYEDGE_QSET_V5_WRITER_GIT_SHA"; do
+  image=${image_revision%:*}; revision=${image_revision##*:}
+  [ "$(podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$image")" = "linux/arm64|$revision" ] || { echo "qset-v5 image/revision mismatch: $image" >&2; exit 1; }
+done
+
+writer=polyedge-shadow-qset-v5.service; container=polyedge-shadow-qset-v5
+systemctl is-active --quiet "$writer" || { echo 'qset-v5 writer must be active before closed-day sealing' >&2; exit 1; }
+[ "$(podman inspect --format '{{.Config.Image}}' "$container")" = "$POLYEDGE_QSET_V5_WRITER_IMAGE" ] || { echo 'qset-v5 writer image is not the frozen research image' >&2; exit 1; }
+podman healthcheck run "$container" >/dev/null
+container_freeze_is() { timeout 20 podman inspect "$container" --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -Fx -- "$1" >/dev/null; }
+container_freeze_is "SHADOW_CODE_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; container_freeze_is "EXECUTION_FREEZE_SHA256=$EXECUTION_FREEZE_SHA256"; container_freeze_is "EXECUTION_FREEZE_ARTIFACT_PATH=$EXECUTION_FREEZE_ARTIFACT_PATH"
+
+receipt_root=/srv/polyedge-ring/migration/qset-v5-seal; install -d -m 0750 "$receipt_root"
+run_sealer() {
+  date=$1; validate_campaign_date "$date"; shift
+  podman run --rm --pull=never --log-driver=journald --name "polyedge-qset-v5-seal-$date" --network polyedge --user 976:976 --cpus 0.5 --memory 1g --pids-limit 256 --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=32m --cap-drop=all --env-file "$env_file" -v "$credential_dir:/run/credentials:ro,Z" "$POLYEDGE_QSET_V5_SEAL_IMAGE" polyedge-rs seal-qset-v5-day --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" --date "$date" --source-freeze-blob "$EXECUTION_FREEZE_ARTIFACT_PATH" --source-freeze-sha256 "$EXECUTION_FREEZE_SHA256" "$@"
+}
+validate_receipt() {
+  jq -e --arg date "$2" --arg schema "$3" --arg freeze "$EXECUTION_FREEZE_SHA256" --arg freeze_blob "$EXECUTION_FREEZE_ARTIFACT_PATH" '.schema==$schema and .campaign_id=="campaign-2026-08-26-qset-v5" and .date==$date and .container=="polyedge-shadow-qset-v5-events" and .blob_count==1440 and .total_bytes>0 and .source_freeze=={container:"polyedge-qset-v5-control",blob:$freeze_blob,sha256:$freeze,verified:true} and (has("generated_ts")|not) and (has("sealed_at")|not)' "$1" >/dev/null
+}
+
+for date in 2026-08-26 2026-08-27; do temporary=$(mktemp "$receipt_root/.validate-$date.XXXXXX"); run_sealer "$date" --validate-only >"$temporary"; validate_receipt "$temporary" "$date" polyedge.qset_v5_closed_day_validation.v1; rm -f "$temporary"; done
+writer_stopped=false; temporary=
+restore_writer() { rm -f "${temporary:-}"; [ "$writer_stopped" = true ] && systemctl start "$writer" || true; }
+trap restore_writer EXIT HUP INT TERM
+systemctl stop "$writer"; writer_stopped=true
+if systemctl is-active --quiet "$writer" || podman inspect --format '{{.State.Running}}' "$container" 2>/dev/null | grep -qx true; then echo 'qset-v5 writer did not fence cleanly' >&2; exit 1; fi
+for date in 2026-08-26 2026-08-27; do
+  temporary=$(mktemp "$receipt_root/.seal-$date.XXXXXX"); run_sealer "$date" >"$temporary"; validate_receipt "$temporary" "$date" polyedge.qset_v5_closed_day_seal.v1
+  stable=$(mktemp "$receipt_root/.seal-$date.XXXXXX"); jq --arg image "$POLYEDGE_QSET_V5_SEAL_IMAGE" --arg git "$POLYEDGE_QSET_V5_SEAL_GIT_SHA" --arg writer_image "$POLYEDGE_QSET_V5_WRITER_IMAGE" --arg writer_git "$POLYEDGE_QSET_V5_WRITER_GIT_SHA" '.+{sealer_image:$image,sealer_git_sha:$git,writer_image:$writer_image,writer_git_sha:$writer_git}' "$temporary" >"$stable"; rm -f "$temporary"; temporary=$stable; chmod 0640 "$temporary"; chown 0:0 "$temporary"; final=$receipt_root/$date.json
+  if [ -e "$final" ]; then cmp -s "$temporary" "$final" || { echo "qset-v5 date already has a conflicting deterministic receipt: $date" >&2; exit 1; }; rm -f "$temporary"; else sync -f "$temporary"; mv "$temporary" "$final"; fi
+  temporary=; logger -p daemon.info -t polyedge-qset-v5-seal-days "sealed qset-v5 date=$date receipt=$final sha256=$(sha256sum "$final"|awk '{print $1}')"
+done
+sync -f "$receipt_root"
+systemctl start "$writer"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  if systemctl is-active --quiet "$writer" && podman healthcheck run "$container" >/dev/null 2>&1; then
+    container_freeze_is "SHADOW_CODE_FREEZE_SHA256=$SHADOW_CODE_FREEZE_SHA256"; container_freeze_is "EXECUTION_FREEZE_SHA256=$EXECUTION_FREEZE_SHA256"; container_freeze_is "EXECUTION_FREEZE_ARTIFACT_PATH=$EXECUTION_FREEZE_ARTIFACT_PATH"
+    writer_stopped=false; trap - EXIT HUP INT TERM; exit 0
+  fi
+  sleep 5
+done
+echo 'qset-v5 writer did not recover healthy after sealing' >&2; exit 1

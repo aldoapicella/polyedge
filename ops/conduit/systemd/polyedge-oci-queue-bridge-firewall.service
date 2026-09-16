@@ -1,0 +1,18 @@
+[Unit]
+Description=Allow only funded containers to reach the OCI Queue bridge
+After=polyedge-network.service
+Requires=polyedge-network.service
+Before=polyedge-oci-queue-bridge.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/iptables -D INPUT -i podman1 -s 10.89.0.248/32 -d 10.89.0.1/32 -p tcp --dport 8182 -m comment --comment polyedge-oci-queue-producer -j ACCEPT
+ExecStartPre=-/usr/sbin/iptables -D INPUT -i podman1 -s 10.89.0.250/32 -d 10.89.0.1/32 -p tcp --dport 8182 -m comment --comment polyedge-oci-queue-signer -j ACCEPT
+ExecStart=/usr/sbin/iptables -I INPUT 1 -i podman1 -s 10.89.0.248/32 -d 10.89.0.1/32 -p tcp --dport 8182 -m comment --comment polyedge-oci-queue-producer -j ACCEPT
+ExecStart=/usr/sbin/iptables -I INPUT 1 -i podman1 -s 10.89.0.250/32 -d 10.89.0.1/32 -p tcp --dport 8182 -m comment --comment polyedge-oci-queue-signer -j ACCEPT
+ExecStop=-/usr/sbin/iptables -D INPUT -i podman1 -s 10.89.0.248/32 -d 10.89.0.1/32 -p tcp --dport 8182 -m comment --comment polyedge-oci-queue-producer -j ACCEPT
+ExecStop=-/usr/sbin/iptables -D INPUT -i podman1 -s 10.89.0.250/32 -d 10.89.0.1/32 -p tcp --dport 8182 -m comment --comment polyedge-oci-queue-signer -j ACCEPT
+
+[Install]
+WantedBy=multi-user.target

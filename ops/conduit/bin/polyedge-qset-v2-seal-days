@@ -1,0 +1,156 @@
+#!/bin/sh
+set -eu
+
+env_file=/etc/polyedge/qset-v2-sealer.env
+[ ! -L "$env_file" ] && [ -f "$env_file" ]   && [ "$(stat -c '%u:%g:%a:%h' "$env_file")" = 0:0:640:1 ] || {
+  echo "qset-v2 sealer environment is missing or unsafe" >&2
+  exit 64
+}
+set -a
+. "$env_file"
+set +a
+
+: "${POLYEDGE_QSET_SEAL_IMAGE:?set a separately pinned qset-v2 sealer image}"
+: "${POLYEDGE_QSET_SEAL_GIT_SHA:?set the reviewed qset-v2 sealer source revision}"
+: "${AZURE_STORAGE_ACCOUNT_NAME:?set the qset storage account}"
+: "${AZURE_TENANT_ID:?set the qset tenant ID}"
+: "${AZURE_CLIENT_ID:?set the qset UAMI client ID}"
+: "${AZURE_FEDERATED_TOKEN_FILE:?set the qset federated token path}"
+printf '%s' "$POLYEDGE_QSET_SEAL_IMAGE"   | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' || {
+  echo "qset-v2 sealer image must be an immutable GHCR backend digest" >&2
+  exit 64
+}
+printf '%s' "$POLYEDGE_QSET_SEAL_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
+  echo "qset-v2 sealer source revision must be a full Git SHA" >&2
+  exit 64
+}
+frozen_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:5112050b9d04db9ecdf6063f52e89af19cbd99a181359fd95b9d98b8d1716bdd
+[ "$POLYEDGE_QSET_SEAL_IMAGE" != "$frozen_image" ] || {
+  echo "frozen qset image does not contain the required seal operation" >&2
+  exit 64
+}
+
+credential_dir=/run/polyedge-federated-shadow-qset
+token_file=$credential_dir/azure-federated-token
+[ ! -L "$token_file" ] && [ -f "$token_file" ]   && [ "$(stat -c '%u:%g:%a:%h' "$token_file")" = 987:983:600:1 ] || {
+  echo "qset-v2 federated token is missing or unsafe" >&2
+  exit 1
+}
+[ "$AZURE_FEDERATED_TOKEN_FILE" = /run/credentials/azure-federated-token ] || {
+  echo "qset-v2 federated token path is inexact" >&2
+  exit 64
+}
+
+/usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
+[ "$(podman image inspect --format '{{.Os}}/{{.Architecture}}' "$POLYEDGE_QSET_SEAL_IMAGE")" = linux/arm64 ] || {
+  echo "qset-v2 sealer image is not present as linux/arm64" >&2
+  exit 1
+}
+image_revision=$(podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$POLYEDGE_QSET_SEAL_IMAGE")
+[ "$image_revision" = "$POLYEDGE_QSET_SEAL_GIT_SHA" ] || {
+  echo "qset-v2 sealer image revision does not match its reviewed source" >&2
+  exit 1
+}
+mountpoint -q /srv/polyedge-ring || {
+  echo "/srv/polyedge-ring is not a mount point" >&2
+  exit 1
+}
+receipt_root=/srv/polyedge-ring/migration/qset-v2-seal
+install -d -m 0750 "$receipt_root"
+
+run_sealer() {
+  date=$1
+  shift
+  podman run --rm --pull=never --log-driver=journald \
+    --name "polyedge-qset-v2-seal-$date" --network polyedge \
+    --user 987:983 --cpus 0.5 --memory 1g --pids-limit 256 \
+    --read-only --tmpfs=/tmp:rw,noexec,nosuid,size=32m --cap-drop=all \
+    --env-file "$env_file" -v "$credential_dir:/run/credentials:ro,Z" \
+    "$POLYEDGE_QSET_SEAL_IMAGE" seal-qset-v2-day \
+    --account "$AZURE_STORAGE_ACCOUNT_NAME" --client-id "$AZURE_CLIENT_ID" \
+    --date "$date" "$@"
+}
+
+writer=polyedge-shadow-qset.service
+systemctl is-active --quiet "$writer" || {
+  echo "qset-v2 writer must be active before closed-day sealing" >&2
+  exit 1
+}
+podman healthcheck run polyedge-shadow-qset >/dev/null
+if systemctl is-active --quiet polyedge-job@shadow-qset.service; then
+  echo "qset-v2 daily job must be inactive while its writer is fenced" >&2
+  exit 1
+fi
+for date in 2026-08-22 2026-08-23; do
+  run_sealer "$date" --validate-only | jq -e --arg date "$date" '.schema == "polyedge.qset_v2_closed_day_validation.v1" and .campaign_id == "campaign-2026-08-22-qset-v2" and .date == $date and .container == "polyedge-shadow-qset-events" and .blob_count == 1440 and .total_bytes > 0 and .source_freeze.verified == true and .source_freeze.sha256 == "sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1"' >/dev/null
+done
+writer_stopped=false
+temporary=
+restore_writer() {
+  rm -f "${temporary:-}"
+  if [ "$writer_stopped" = true ]; then
+    systemctl start "$writer" || true
+  fi
+}
+trap restore_writer EXIT HUP INT TERM
+systemctl stop "$writer"
+writer_stopped=true
+if systemctl is-active --quiet "$writer"; then
+  echo "qset-v2 writer unit remained active after its drain stop" >&2
+  exit 1
+fi
+if podman inspect --format '{{.State.Running}}' polyedge-shadow-qset 2>/dev/null | grep -qx true; then
+  echo "qset-v2 writer container remained running after its drain stop" >&2
+  exit 1
+fi
+
+for date in 2026-08-22 2026-08-23; do
+  temporary=$(mktemp "$receipt_root/.seal-$date.XXXXXX")
+  run_sealer "$date" >"$temporary"
+  jq -e --arg date "$date" '
+    .schema == "polyedge.qset_v2_closed_day_seal.v1"
+    and .campaign_id == "campaign-2026-08-22-qset-v2"
+    and .date == $date
+    and .container == "polyedge-shadow-qset-events"
+    and .blob_count == 1440 and .sealed_blob_count == 1440
+    and .total_bytes > 0
+    and .all_sealed == true
+    and .source_freeze.verified == true
+    and .source_freeze.sha256 == "sha256:8017ed1d036ba502ae0596376e54d781af350307d71cb174e24e3f2fa16fd3e1"
+  ' "$temporary" >/dev/null
+  with_image=$(mktemp "$receipt_root/.seal-$date.XXXXXX")
+  jq --arg image "$POLYEDGE_QSET_SEAL_IMAGE" --arg git "$POLYEDGE_QSET_SEAL_GIT_SHA" \
+    '. + {sealer_image:$image,sealer_git_sha:$git}' "$temporary" >"$with_image"
+  rm -f "$temporary"
+  temporary=$with_image
+  chmod 0640 "$temporary"
+  chown 0:0 "$temporary"
+  receipt_sha=$(sha256sum "$temporary" | awk '{print $1}')
+  final="$receipt_root/$date.json"
+  if [ -e "$final" ]; then
+    cmp -s "$temporary" "$final" || {
+      echo "qset-v2 date already has a conflicting seal receipt" >&2
+      exit 1
+    }
+    rm -f "$temporary"
+  else
+    sync -f "$temporary"
+    mv "$temporary" "$final"
+  fi
+  temporary=
+  logger -p daemon.info -t polyedge-qset-v2-seal-days \
+    "sealed qset-v2 date=$date receipt=$final sha256=$receipt_sha"
+done
+
+systemctl start "$writer"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  if systemctl is-active --quiet "$writer" \
+    && podman healthcheck run polyedge-shadow-qset >/dev/null 2>&1; then
+    writer_stopped=false
+    trap - EXIT HUP INT TERM
+    exit 0
+  fi
+  sleep 5
+done
+echo "qset-v2 writer did not recover healthy after sealing" >&2
+exit 1

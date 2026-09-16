@@ -1,0 +1,11 @@
+[Unit]
+Description=Schedule exact qset-v8 report and carry-day sealing
+
+[Timer]
+OnCalendar=2026-09-11 02:15:00 UTC
+AccuracySec=1s
+Persistent=true
+Unit=polyedge-qset-v8-seal-days.service
+
+[Install]
+WantedBy=timers.target

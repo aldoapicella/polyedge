@@ -1,0 +1,45 @@
+{
+  "schema_version": "polyedge.operator_funded_session.v1",
+  "session_id": "dynamic-quote-funded-2026-07-28-v3",
+  "authorization_mode": "operator_direct",
+  "authorized_by_user_reference": "Codex task 2026-07-27 funded Dynamic Quote",
+  "source_simulated_pnl": 379.19,
+  "research_promotion_bypassed": true,
+  "research_lane_isolated": true,
+  "maker_only": true,
+  "no_deposits": true,
+  "allow_automatic_replenishment": false,
+  "allow_compounding": false,
+  "external_cash_flows": [],
+  "max_open_orders": 1,
+  "target_order_notional": 10.5,
+  "max_order_notional": 10.5,
+  "max_account_loss": 11.09862,
+  "starting_collateral": 11.09862,
+  "max_reconciliation_discrepancy": 0.01,
+  "evidence_trust_boundary_ready": false,
+  "execution_window_seconds_to_expiry": {
+    "minimum": 360,
+    "maximum": 900
+  },
+  "shadow_validation": {
+    "required": true,
+    "mode": "isolated_paper_shadow",
+    "split": "time_ordered_70_30",
+    "eligible_transitions": 100,
+    "minimum_distinct_markets": 20,
+    "maximum_listed_failures": 0
+  },
+  "candidate": {
+    "name": "dynamic_quote_style",
+    "candidate_version": "dynamic_quote_style@2026-06-14",
+    "config_hash": "sha256:e76b8b54f52f79de91c43e007c45f347226d5b9e2e562f2bc40c3586855b0a0c"
+  },
+  "execution_model": {
+    "model_version": "conservative-execution-prior-v1",
+    "blob_uri": "azure://stpolyedge6urdjr5nmwx7w/polyedge-research/reports/research/venue-probe/models/conservative-execution-prior-v1-91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4.json",
+    "sha256": "sha256:91f29155d09f1a51f3354132befcbbb25d3f96b88c9a8a819f2304f4a7a28ed4"
+  },
+  "created_at": "2026-07-28T22:00:00Z",
+  "expires_at": "2026-08-28T22:00:00Z"
+}

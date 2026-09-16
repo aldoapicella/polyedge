@@ -1,0 +1,11 @@
+[Unit]
+Description=Check PolyEdge boot-disk headroom every five minutes
+
+[Timer]
+OnCalendar=*-*-* *:02/5:00 UTC
+Persistent=true
+RandomizedDelaySec=30
+Unit=polyedge-boot-disk-guard.service
+
+[Install]
+WantedBy=timers.target

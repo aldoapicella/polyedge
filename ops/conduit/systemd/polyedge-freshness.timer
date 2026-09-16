@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PolyEdge freshness check every five minutes (UTC)
+
+[Timer]
+OnCalendar=*-*-* *:03/5:00 UTC
+Persistent=true
+Unit=polyedge-job@freshness.service
+
+[Install]
+WantedBy=timers.target

@@ -674,6 +674,24 @@ impl OrderManager {
         condition_id: Option<ConditionId>,
         now: DateTime<Utc>,
     ) -> Vec<TradeDecision> {
+        let expired_other_markets = self
+            .quotes
+            .values()
+            .filter(|quote| &quote.key.market_id != market_id && quote_is_expired(quote, now))
+            .map(|quote| quote.key.market_id.clone())
+            .collect::<BTreeSet<_>>();
+        if !expired_other_markets.is_empty() {
+            return expired_other_markets
+                .into_iter()
+                .map(|expired_market_id| {
+                    cancel_all_decision(
+                        &expired_market_id,
+                        "expired maker quote from a prior market",
+                        None,
+                    )
+                })
+                .collect();
+        }
         if decisions
             .iter()
             .any(|decision| decision.action == polyedge_domain::DecisionAction::CancelAll)
@@ -996,7 +1014,7 @@ pub fn final_decision_evidence_v1(
                         })
                         .map(|(index, _)| index)
                         .collect::<Vec<_>>();
-                    (candidates.len() == 1).then_some(candidates[0])
+                    (candidates.len() == 1).then(|| candidates[0])
                 })
                 .flatten();
             let matched = exact.or(risk_adjusted);

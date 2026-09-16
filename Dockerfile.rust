@@ -27,4 +27,7 @@ ENV EXECUTION_MODE=paper
 ENV ALLOW_LIVE=false
 EXPOSE 8081
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/usr/bin/bash", "-ec", "exec 3<>/dev/tcp/127.0.0.1/8081; printf 'GET /health HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3; IFS= read -r status <&3; [[ \"$status\" == *' 200 '* ]]"]
+
 CMD ["polyedge-rs", "api", "--bind", "0.0.0.0:8081"]

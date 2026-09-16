@@ -1,0 +1,367 @@
+{
+  "schemaVersion": 1,
+  "status": "applied-live-verified",
+  "proof": "identity-rbac-proof.json",
+  "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
+  "resourceGroup": "rg-polyedge-dev",
+  "roles": {
+    "blobContributor": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+    "blobReader": "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1",
+    "tableContributor": "0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3",
+    "serviceBusSender": "69a216fc-b8fb-44d8-bc22-1f3c2cd27a39",
+    "serviceBusReceiver": "4f6d3b9b-027b-4f4c-9142-0e5a2a2247e0",
+    "acrPull": "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+    "keyVaultSecretsUser": "4633458b-17de-408a-b874-0445c86b69e6",
+    "acaJobExecutionReader": "a6f3874a-dc9c-4880-8039-ed1a4e57e4ea"
+  },
+  "scopePrefixes": {
+    "storage": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/",
+    "serviceBus": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ServiceBus/namespaces/",
+    "containerRegistry": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/",
+    "keyVault": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.KeyVault/vaults/"
+  },
+  "lanes": {
+    "api": {
+      "identity": "id-polyedge-conduit-api",
+      "subject": "spiffe://polyedge.local/conduit/api",
+      "assignments": [
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotEventIndex"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotChartSeries"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/BotMarketCatalog"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeDataFreshness"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeResearchRuns"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeProspectiveResults"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeExclusionWindows"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeResearchArtifacts"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/PolyEdgeJobStatus"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v3"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v4"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset-v5"
+        }
+      ],
+      "negativeAssertions": [
+        "no subscription, resource-group, storage-account, Key Vault, or Service Bus role",
+        "no qset raw/control writer or ShadowQset table role; qset-v3/v4/v5 research outputs are exact-container readers only",
+        "no funded-evidence write role"
+      ]
+    },
+    "research": {
+      "identity": "id-polyedge-conduit-research",
+      "subject": "spiffe://polyedge.local/conduit/research",
+      "assignments": [
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events"
+        },
+        {
+          "role": "acaJobExecutionReader",
+          "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.App/jobs/polyedge-hourly-quality-job",
+          "id": "324fb8fa-c71c-4cdf-a22a-391d290feaa0"
+        }
+      ],
+      "negativeAssertions": [
+        "no table, Service Bus, qset, funded-evidence, storage-account, resource-group, subscription, or broad Microsoft.App jobs role"
+      ]
+    },
+    "shadow-qset": {
+      "identity": "id-polyedge-conduit-shadow-qset",
+      "subject": "spiffe://polyedge.local/conduit/shadow-qset",
+      "assignments": [
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events",
+          "id": "d6a6e447-5da3-4d73-889a-a3b7a020df0f"
+        },
+        {
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset",
+          "id": "33d54aba-4eb3-4b9e-9d85-214580a08440"
+        },
+        {
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control",
+          "id": "0458fb58-08c4-48dc-9ca3-492d33a61113"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetEventIndex",
+          "id": "42456de0-61e8-4229-8526-ce7e6f6b7f9e"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetChartSeries",
+          "id": "c90132b3-5a28-4548-ae9e-2a64ce52efb6"
+        },
+        {
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowQsetMarketCatalog",
+          "id": "3dd2c5e2-10d2-4967-88fd-4d9559cd99bc"
+        }
+      ],
+      "negativeAssertions": [
+        "no primary, funded, control writer, non-qset table, Service Bus, storage-account, resource-group, or subscription role; qset-control is exact-container reader only"
+      ]
+    },
+    "funded-signer": {
+      "identity": "id-polyedge-conduit-funded-signer",
+      "subject": "spiffe://polyedge.local/conduit/funded-signer",
+      "assignments": [
+        {
+          "id": "5d3e8e9b-2d87-4455-9751-b2f5e76f46dc",
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence"
+        },
+        {
+          "id": "fcb56a4f-ebd6-4735-b248-8ea164e0f2df",
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events"
+        },
+        {
+          "id": "bd77814b-525e-4522-adac-92784228bd06",
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research"
+        },
+        {
+          "id": "58cb8856-1069-4ebc-8dc6-6418e2a004e5",
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models"
+        },
+        {
+          "id": "fa593ab9-fa6a-58d8-b1ca-696b38843edf",
+          "role": "serviceBusReceiver",
+          "scope": "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+        },
+        {
+          "id": "7e0c070f-beda-5845-a895-2b3efcef5063",
+          "role": "keyVaultSecretsUser",
+          "scope": "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-private-key"
+        },
+        {
+          "id": "0965ea81-a451-5029-8070-6e319b3c233d",
+          "role": "keyVaultSecretsUser",
+          "scope": "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-key"
+        },
+        {
+          "id": "8ae6d49a-402d-5431-a82d-e95c64c9d61a",
+          "role": "keyVaultSecretsUser",
+          "scope": "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-secret"
+        },
+        {
+          "id": "eb9e7b65-1391-5237-95d4-ffc77078b42d",
+          "role": "keyVaultSecretsUser",
+          "scope": "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-api-passphrase"
+        },
+        {
+          "id": "0fc8d996-6b8e-5b19-98e8-b9ba72f0108a",
+          "role": "keyVaultSecretsUser",
+          "scope": "keyVault/kvpolyedge6urdjr5nmwx7w/secrets/polymarket-relayer-api-key"
+        }
+      ],
+      "negativeAssertions": [
+        "no Service Bus sender, qset, bot-events, table, storage-account, Service Bus namespace, Key Vault vault-level or non-approved-secret, resource-group, or subscription role"
+      ]
+    },
+    "funded-intent-producer": {
+      "identity": "id-polyedge-conduit-funded-intent-producer",
+      "subject": "spiffe://polyedge.local/conduit/funded-intent-producer",
+      "assignments": [
+        {
+          "id": "dc8946a7-2595-463e-9dda-e35450192738",
+          "role": "blobContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events"
+        },
+        {
+          "id": "890332ac-305f-44b2-a303-77060e4fcc96",
+          "role": "acrPull",
+          "scope": "containerRegistry/crpolyedge6urdjr5nmwx7w"
+        },
+        {
+          "id": "7e0b5049-1365-40d9-b3a1-7cdb5c2fb959",
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence"
+        },
+        {
+          "id": "0536e6e3-0a19-40ce-ae8e-b5014d5692a8",
+          "role": "blobReader",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-models"
+        },
+        {
+          "id": "7425aad5-8b3f-49e1-bbc2-ea25554a0425",
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotMarketCatalog"
+        },
+        {
+          "id": "1b7ad7ef-6ac2-46f8-b20a-995354b86fe9",
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotEventIndex"
+        },
+        {
+          "id": "a6e2317e-5ced-44fc-b127-b4682413daee",
+          "role": "tableContributor",
+          "scope": "storage/stpolyedge6urdjr5nmwx7w/tableServices/default/tables/ShadowBotChartSeries"
+        },
+        {
+          "id": "0824ea09-0692-4455-8ee0-6179aa0d12db",
+          "role": "serviceBusSender",
+          "scope": "serviceBus/sb-polyedge-funded-cl-6urdjr5nmwx7w/queues/funded-dynamic-quote-intents"
+        }
+      ],
+      "negativeAssertions": [
+        "no Service Bus receiver, Key Vault, qset, or bot-events role",
+        "no non-approved blob or table, storage-account, Service Bus namespace, resource-group, subscription, or other broad role",
+        "AcrPull is registry scoped and grants no AcrPush"
+      ]
+    }
+  },
+  "arc": {
+    "identity": "conduit-dev system-assigned",
+    "unchanged": true,
+    "role": "PolyEdge OCI Blob Writer",
+    "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events",
+    "negativeAssertions": [
+      "no reuse by api, research, shadow-qset, or funded-signer",
+      "no reuse by funded-intent-producer"
+    ]
+  },
+  "githubDeployment": {
+    "identity": "id-github-polyedge-dev",
+    "clientId": "cdd9f62c-bbdf-4d4b-80a9-9514b76ca1e8",
+    "principalId": "0c41f66d-fe14-42e1-b6c1-643d7fc2a2a3",
+    "assignment": {
+      "id": "839dda8c-f69d-4f3c-8fb5-052ddcaaa9fd",
+      "role": "blobReader",
+      "scope": "storage/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-events"
+    },
+    "purpose": "read-only current-funded-intent pointer proof",
+    "controlPlaneRoles": "preexisting resource-group Contributor and User Access Administrator are out of this migration data-plane proof",
+    "negativeAssertions": [
+      "the new shadow-events pointer assignment grants no blob write",
+      "the new shadow-events pointer assignment is container scoped, not storage-account scoped",
+      "the new shadow-events pointer assignment grants no storage account keys or SAS"
+    ],
+    "scopeOfThisDataPlaneProof": "only the new Storage Blob Data Reader assignment on polyedge-shadow-events",
+    "legacyDeploymentPlaneExceptions": [
+      {
+        "assignmentId": "e6152393-352d-40de-b869-8d340099b44e",
+        "role": "Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "95398a59-3179-4e58-b405-6f252bf0f1c2",
+        "role": "User Access Administrator",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "0a94d279-4bdd-44e8-92de-888809e040a4",
+        "role": "AcrPush",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourceGroups/rg-polyedge-dev/providers/Microsoft.ContainerRegistry/registries/crpolyedge6urdjr5nmwx7w",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "b123dbdd-9610-5448-9a7c-317d691ab9b6",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-funded-evidence",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "0f4009ea-b3ae-59d0-9c42-8dc8bc6eac42",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "9ada4ddb-6d77-5699-905b-6c3a2c60b4b0",
+        "role": "Storage Blob Data Reader",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/bot-events",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "dd25ddf8-3283-5d7f-8be0-b3f3b943944a",
+        "role": "Storage Blob Data Reader",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-validation",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "b5d447b9-ad93-5524-8291-d13430228ab0",
+        "role": "Storage Blob Data Reader",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-shadow-qset-events",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "d0d6c86a-8603-590f-9250-bd82a3dda3e1",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-research-qset",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      },
+      {
+        "assignmentId": "2eac4dd1-7c7b-5d55-8a5f-7a2f12056fbc",
+        "role": "Storage Blob Data Contributor",
+        "scope": "/subscriptions/73783c0c-5a53-4f9b-b244-6f64e813814c/resourcegroups/rg-polyedge-dev/providers/Microsoft.Storage/storageAccounts/stpolyedge6urdjr5nmwx7w/blobServices/default/containers/polyedge-qset-control",
+        "preexisting": true,
+        "outsideFiveWorkloadUamiProof": true
+      }
+    ]
+  }
+}

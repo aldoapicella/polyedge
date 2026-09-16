@@ -17,15 +17,19 @@ on:
           - none
           - frontend-only
           - monitoring-only
+          - cost-governance-only
           - build-only
+          - polyedge-data-freshness-job
+          - polyedge-hourly-quality-job
           - polyedge-daily-research-job
+          - polyedge-replay-index-job
           - polyedge-shadow-daily-neu-job
           - polyedge-backfill-job
           - polyedge-prospective-job
           - polyedge-chart-backfill-job
 
 concurrency:
-  group: ${{ (inputs.research_job_target == 'none' || inputs.research_job_target == 'monitoring-only') && 'polyedge-azure-control-plane' || inputs.research_job_target == 'frontend-only' && 'polyedge-frontend-deploy-caller' || 'polyedge-research-deploy-caller' }}
+  group: ${{ (inputs.research_job_target == 'none' || inputs.research_job_target == 'monitoring-only' || inputs.research_job_target == 'cost-governance-only') && 'polyedge-azure-control-plane' || inputs.research_job_target == 'frontend-only' && 'polyedge-frontend-deploy-caller' || 'polyedge-research-deploy-caller' }}
   cancel-in-progress: false
 
 permissions:
@@ -40,7 +44,7 @@ env:
 
 jobs:
   research-job-deploy:
-    if: inputs.research_job_target != 'none' && inputs.research_job_target != 'frontend-only' && inputs.research_job_target != 'monitoring-only'
+    if: inputs.research_job_target != 'none' && inputs.research_job_target != 'frontend-only' && inputs.research_job_target != 'monitoring-only' && inputs.research_job_target != 'cost-governance-only'
     uses: ./.github/workflows/deploy-polyedge-research-jobs.yml
     with:
       target_job: ${{ inputs.research_job_target }}
@@ -50,6 +54,82 @@ jobs:
     if: inputs.research_job_target == 'frontend-only'
     uses: ./.github/workflows/deploy-polyedge-frontend-only.yml
     secrets: inherit
+
+  cost-governance-only-deploy:
+    if: inputs.research_job_target == 'cost-governance-only'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate budget-only template
+        env:
+          EXPECTED_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          test "$(az account show --query id -o tsv)" = "$EXPECTED_SUBSCRIPTION_ID"
+          az bicep build --file infra/cost-governance.bicep --outfile cost-governance.json
+          test "$(jq '[.resources[] | select(.type != "Microsoft.Consumption/budgets")] | length' cost-governance.json)" = "0"
+          test "$(jq '[.resources[] | select(.type == "Microsoft.Consumption/budgets")] | length' cost-governance.json)" = "2"
+
+      - name: Prove and deploy budget-only plan
+        run: |
+          set -euo pipefail
+          budget_start=$(date -u +%Y-%m-01T00:00:00Z)
+          az deployment sub what-if \
+            --name "$APP_NAME-cost-governance" \
+            --location "$AZURE_LOCATION" \
+            --template-file infra/cost-governance.bicep \
+            --parameters budgetStartDate="$budget_start" \
+            --result-format ResourceIdOnly \
+            --no-pretty-print \
+            --output json > cost-what-if.json
+          jq -e '
+            [ .changes[]
+              | select(.changeType != "Ignore")
+              | select((.resourceId | ascii_downcase | contains("/microsoft.consumption/budgets/")) | not)
+            ] | length == 0
+          ' cost-what-if.json
+          az deployment sub create \
+            --name "$APP_NAME-cost-governance" \
+            --location "$AZURE_LOCATION" \
+            --template-file infra/cost-governance.bicep \
+            --parameters budgetStartDate="$budget_start" \
+            --output none
+
+      - name: Verify budget guardrails
+        run: |
+          set -euo pipefail
+          subscription_id=$(az account show --query id -o tsv)
+          for budget in polyedge-monthly-budget polyedge-subscription-monthly-budget; do
+            az rest \
+              --method get \
+              --url "https://management.azure.com/subscriptions/$subscription_id/providers/Microsoft.Consumption/budgets/$budget?api-version=2023-11-01" \
+              --output json > "$budget.json"
+            test "$(jq -r '.properties.category' "$budget.json")" = "Cost"
+            test "$(jq -r '.properties.timeGrain' "$budget.json")" = "Monthly"
+            jq -e '
+              [.properties.notifications.actual75, .properties.notifications.actual90, .properties.notifications.actual100]
+                | all(.enabled == true and .thresholdType == "Actual")
+            ' "$budget.json"
+            jq -e '.properties.notifications.forecast100.enabled == true and .properties.notifications.forecast100.thresholdType == "Forecasted"' "$budget.json"
+          done
+          jq -e '
+            .properties.amount == 275
+            and (.properties.filter.dimensions.values | sort) == ([
+              "rg-polyedge-dev",
+              "ME_polyedge-venue-neu-env_rg-polyedge-dev_northeurope",
+              "ME_polyedge-execution-cl-env_rg-polyedge-dev_chilecentral"
+            ] | sort)
+          ' polyedge-monthly-budget.json
+          jq -e '.properties.amount == 350 and (.properties.filter == null or .properties.filter == {})' polyedge-subscription-monthly-budget.json
 
   monitoring-only-deploy:
     if: inputs.research_job_target == 'monitoring-only'
@@ -72,9 +152,10 @@ jobs:
           test "$(jq '[.resources[] | select(.type != "Microsoft.Insights/scheduledQueryRules")] | length' monitoring-alerts.json)" = "0"
           test "$(jq '[.resources[] | select(.type == "Microsoft.Insights/scheduledQueryRules")] | length' monitoring-alerts.json)" = "1"
           test "$(jq -r '.resources[0].copy.count' monitoring-alerts.json)" = "[length(variables('recorderAlerts'))]"
-          test "$(jq '.variables.recorderAlerts | length' monitoring-alerts.json)" = "5"
-          test "$(jq '[.variables.recorderAlerts[] | select(.name != "shadow-runtime-health-missing") | select(.query | contains("ContainerAppName_s in") and contains("variables(\u0027containerAppName\u0027)") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "4"
+          test "$(jq '.variables.recorderAlerts | length' monitoring-alerts.json)" = "6"
+          test "$(jq '[.variables.recorderAlerts[] | select(.name != "shadow-runtime-health-missing" and .name != "job-failed") | select(.query | contains("ContainerAppName_s in") and contains("variables(\u0027containerAppName\u0027)") and contains("variables(\u0027apiContainerAppName\u0027)") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "4"
           test "$(jq '[.variables.recorderAlerts[] | select(.name == "shadow-runtime-health-missing") | select(.query | contains("runtime_health") and contains("heartbeat_count == 0") and contains("parameters(\u0027shadowContainerAppName\u0027)"))] | length' monitoring-alerts.json)" = "1"
+          test "$(jq '[.variables.recorderAlerts[] | select(.name == "job-failed") | select(.query | contains("ContainerJobName_s") and contains("JobName_s") and contains("BackoffLimitExceeded") and contains("ErrImagePull") and contains("panicked") and contains("child command failed with status exit status:") and contains("status"))] | length' monitoring-alerts.json)" = "1"
           test "$(jq -r '.parameters.shadowContainerAppName.defaultValue' monitoring-alerts.json)" = "polyedge-shadow-neu"
 
       - name: Snapshot protected runtime state
@@ -87,11 +168,15 @@ jobs:
           expected_client_id=$(az identity show --resource-group "$AZURE_RESOURCE_GROUP" --name "$GITHUB_DEPLOY_IDENTITY_NAME" --query clientId -o tsv)
           authenticated_client_id=$(az account show --query user.name -o tsv)
           test "$(echo "$authenticated_client_id" | tr 'A-F' 'a-f')" = "$(echo "$expected_client_id" | tr 'A-F' 'a-f')"
-          for app in polyedge-dev polyedge-shadow-neu; do
+          printf '%s\n' polyedge-dev polyedge-shadow-neu > protected-apps.txt
+          if az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name polyedge-dev-api -o none 2>/dev/null; then
+            printf '%s\n' polyedge-dev-api >> protected-apps.txt
+          fi
+          while IFS= read -r app; do
             az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
               | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
               > "before-$app.json"
-          done
+          done < protected-apps.txt
           for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
             az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$job" -o json \
               | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template}' \
@@ -122,7 +207,8 @@ jobs:
                   "polyedge-dev-recorder-dropped-count-gt-0",
                   "polyedge-dev-recorder-queue-over-1000",
                   "polyedge-dev-runtime-container-restarted",
-                  "polyedge-dev-shadow-runtime-health-missing"
+                  "polyedge-dev-shadow-runtime-health-missing",
+                  "polyedge-dev-job-failed"
                 ] | index($name) | not)
             ] | length == 0
           ' monitoring-what-if.json
@@ -138,7 +224,7 @@ jobs:
       - name: Verify alerts and unchanged runtimes
         run: |
           set -euo pipefail
-          for app in polyedge-dev polyedge-shadow-neu; do
+          while IFS= read -r app; do
             az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json \
               | jq -S '{id,identity,configuration:(.properties.configuration | .secrets = [(.secrets[]? | {name})]),template:.properties.template,latestRevisionName:.properties.latestRevisionName}' \
               > "after-$app.json"
@@ -146,17 +232,27 @@ jobs:
               echo "Protected Container App definition changed: $app" >&2
               exit 1
             }
-          done
-          for suffix in recorder-failed-total-gt-0 recorder-dropped-count-gt-0 recorder-queue-over-1000 runtime-container-restarted shadow-runtime-health-missing; do
+          done < protected-apps.txt
+          for suffix in recorder-failed-total-gt-0 recorder-dropped-count-gt-0 recorder-queue-over-1000 runtime-container-restarted shadow-runtime-health-missing job-failed; do
             rule="$APP_NAME-dev-$suffix"
             az monitor scheduled-query show --resource-group "$AZURE_RESOURCE_GROUP" --name "$rule" -o json > "rule-$suffix.json"
             test "$(jq -r '.enabled' "rule-$suffix.json")" = "true"
             test "$(jq -r '.evaluationFrequency' "rule-$suffix.json")" = "0:05:00"
             test "$(jq -r '.windowSize' "rule-$suffix.json")" = "0:10:00"
             query=$(jq -r '.criteria.allOf[0].query' "rule-$suffix.json")
-            grep -Fq 'polyedge-shadow-neu' <<< "$query"
-            if [ "$suffix" != "shadow-runtime-health-missing" ]; then
-              grep -Fq 'polyedge-dev' <<< "$query"
+            if [ "$suffix" = "job-failed" ]; then
+              grep -Fq 'ContainerJobName_s' <<< "$query"
+              grep -Fq 'JobName_s' <<< "$query"
+              grep -Fq 'BackoffLimitExceeded' <<< "$query"
+              grep -Fq 'ErrImagePull' <<< "$query"
+              grep -Fq 'panicked' <<< "$query"
+              grep -Fq 'child command failed with status exit status:' <<< "$query"
+              grep -Fq '"status":"failed"' <<< "$query"
+            else
+              grep -Fq 'polyedge-shadow-neu' <<< "$query"
+            fi
+            if [ "$suffix" != "shadow-runtime-health-missing" ] && [ "$suffix" != "job-failed" ]; then
+              grep -Fq 'polyedge-dev-api' <<< "$query"
             fi
           done
           for job in polyedge-venue-probe-neu-job polyedge-redeem-neu-job polyedge-strategy-canary-neu-job polyedge-funded-ladder-neu-job polyedge-promotion-neu-job polyedge-venue-model-job; do
@@ -209,16 +305,26 @@ jobs:
           cargo test --workspace --all-features
           cargo build --release -p polyedge-cli
           sh research/test_run_shadow_daily.sh
+          sh research/test_primary_daily_jobs.sh
           grep -Fq -- '--expected-runtime-role profitability_shadow' research/run_shadow_daily.sh
-          grep -Fq -- '--expected-runtime-role primary' infra/main.bicep
+          grep -Fq -- '--expected-runtime-role primary' research/run_primary_daily.sh
+          grep -Fq -- '/app/research/run_compact_report_job.sh' infra/main.bicep
+          grep -Fq -- '/app/research/run_primary_daily.sh' infra/main.bicep
+          grep -Fq -- '/app/research/run_replay_index.sh' infra/main.bicep
+          sh research/test_compact_report_job.sh
+          test "$(grep -Fc -- 'daily-replay.lock' infra/main.bicep)" -eq 2
           grep -Fq -- "name: 'POLYEDGE_RESEARCH_REORDER_BUFFER_EVENTS'" infra/main.bicep
           grep -Fq -- "value: '64'" infra/main.bicep
+          grep -Fxq -- "param fundedDirectServiceBusEnabled = true" infra/parameters/polyedge-active.bicepparam
+          grep -Fxq -- "param fundedDirectServiceBusNamespace = 'sb-polyedge-funded-cl-6urdjr5nmwx7w'" infra/parameters/polyedge-active.bicepparam
+          grep -Fxq -- "param fundedDirectServiceBusQueue = 'funded-dynamic-quote-intents'" infra/parameters/polyedge-active.bicepparam
           grep -Fq -- 'TARGET=$(date -u -d "1 hour ago" +%Y/%m/%d/%H)' infra/main.bicep
           ! grep -Fq -- 'HOUR=$(date -u -d "10 minutes ago" +%H)' infra/main.bicep
-          test "$(grep -Fc -- 'validate-prospective --since "2026-07-13T00:00:00Z"' infra/main.bicep)" -eq 2
+          test "$(( $(grep -Fc -- 'validate-prospective --since "2026-07-13T00:00:00Z"' infra/main.bicep) + $(grep -Fc -- 'validate-prospective' research/run_primary_daily.sh) ))" -eq 2
           test "$(date -u -d '2026-07-20 19:10 UTC - 1 hour' +%Y/%m/%d/%H)" = "2026/07/20/18"
           test "$(date -u -d '2026-07-21 00:10 UTC - 1 hour' +%Y/%m/%d/%H)" = "2026/07/20/23"
           az bicep build --file infra/main.bicep --outfile /tmp/polyedge-main.json
+          az bicep build --file infra/cost-governance.bicep --outfile /tmp/polyedge-cost-governance.json
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -272,13 +378,22 @@ jobs:
       - name: Resolve current images
         id: current_images
         run: |
+          set -euo pipefail
           app="$APP_NAME-dev"
-          if az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json > current_containerapp.json 2>/dev/null; then
-            backend_image=$(jq -r ".properties.template.containers[]? | select(.name == \"bot\") | .image // empty" current_containerapp.json)
-            frontend_image=$(jq -r ".properties.template.containers[]? | select(.name == \"frontend\") | .image // empty" current_containerapp.json)
-          else
+          api_app="$app-api"
+          backend_image=""
+          frontend_image=""
+          if az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$api_app" -o json > current_api_containerapp.json 2>/dev/null; then
+            backend_image=$(jq -r '.properties.template.containers[]? | select(.name == "bot") | .image // empty' current_api_containerapp.json)
+          fi
+          if az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" -o json > current_frontend_containerapp.json 2>/dev/null; then
+            frontend_image=$(jq -r '.properties.template.containers[]? | select(.name == "frontend") | .image // empty' current_frontend_containerapp.json)
+            if [ -z "$backend_image" ]; then
+              backend_image=$(jq -r '.properties.template.containers[]? | select(.name == "bot") | .image // empty' current_frontend_containerapp.json)
+            fi
+          fi
+          if [ -z "$backend_image" ]; then
             backend_image="mcr.microsoft.com/azuredocs/containerapps-helloworld:latest"
-            frontend_image=""
           fi
           echo "backend_image=$backend_image" >> "$GITHUB_OUTPUT"
           echo "frontend_image=$frontend_image" >> "$GITHUB_OUTPUT"
@@ -307,6 +422,8 @@ jobs:
           echo "acr_login_server=$(echo "$outputs" | jq -r '.acrLoginServer.value')" >> "$GITHUB_OUTPUT"
           echo "container_app_name=$(echo "$outputs" | jq -r '.containerAppName.value')" >> "$GITHUB_OUTPUT"
           echo "container_app_fqdn=$(echo "$outputs" | jq -r '.containerAppFqdn.value')" >> "$GITHUB_OUTPUT"
+          echo "api_container_app_name=$(echo "$outputs" | jq -r '.apiContainerAppName.value')" >> "$GITHUB_OUTPUT"
+          echo "api_container_app_fqdn=$(echo "$outputs" | jq -r '.apiContainerAppFqdn.value')" >> "$GITHUB_OUTPUT"
 
       - name: Grant workflow ACR push
         run: |
@@ -445,34 +562,55 @@ jobs:
 
       - name: Verify active writer configuration
         run: |
-          app="${{ steps.deploy_outputs.outputs.container_app_name }}"
+          app="$APP_NAME-dev"
+          api_app="$app-api"
+          api_fqdn=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$api_app" --query properties.configuration.ingress.fqdn -o tsv)
           az containerapp show \
             --resource-group "$AZURE_RESOURCE_GROUP" \
             --name "$app" \
-            -o json > containerapp.json
-          run_on_startup=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "RUN_BOT_ON_STARTUP") | .value' containerapp.json)
-          azure_client_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_CLIENT_ID") | .value' containerapp.json)
-          backend_base=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' containerapp.json)
-          dashboard_secret=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "DASHBOARD_SESSION_SECRET") | .secretRef' containerapp.json)
-          research_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_RESEARCH_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
-          funded_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_FUNDED_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
-          model_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value' containerapp.json)
-          shadow_campaign_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' containerapp.json)
-          shadow_correction_root=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value' containerapp.json)
-          event_index_types=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value' containerapp.json)
+            -o json > frontend-containerapp.json
+          az containerapp show \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --name "$api_app" \
+            -o json > api-containerapp.json
+          run_on_startup=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "RUN_BOT_ON_STARTUP") | .value' api-containerapp.json)
+          operator_direct=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "STRATEGY_INTENT_OPERATOR_DIRECT") | .value' api-containerapp.json)
+          funded_bus_enabled=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_ENABLED") | .value' api-containerapp.json)
+          funded_bus_namespace=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_NAMESPACE") | .value' api-containerapp.json)
+          funded_bus_queue=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "FUNDED_DIRECT_SERVICE_BUS_QUEUE") | .value' api-containerapp.json)
+          azure_client_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_CLIENT_ID") | .value' api-containerapp.json)
+          backend_base=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_API_BASE_URL") | .value' frontend-containerapp.json)
+          backend_ws=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "BACKEND_WS_URL") | .value' frontend-containerapp.json)
+          dashboard_secret=$(jq -r '.properties.template.containers[] | select(.name == "frontend") | .env[] | select(.name == "DASHBOARD_SESSION_SECRET") | .secretRef' frontend-containerapp.json)
+          research_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_RESEARCH_STORAGE_CONTAINER_NAME") | .value' api-containerapp.json)
+          funded_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_FUNDED_STORAGE_CONTAINER_NAME") | .value' api-containerapp.json)
+          model_container=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_MODEL_STORAGE_CONTAINER_NAME") | .value' api-containerapp.json)
+          shadow_campaign_id=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CAMPAIGN_ID") | .value' api-containerapp.json)
+          shadow_correction_root=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "SHADOW_CORRECTION_ROOT") | .value' api-containerapp.json)
+          event_index_types=$(jq -r '.properties.template.containers[] | select(.name == "bot") | .env[] | select(.name == "AZURE_EVENT_INDEX_TYPES") | .value' api-containerapp.json)
           test "$run_on_startup" = "true"
+          test "$operator_direct" = "true"
+          test "$funded_bus_enabled" = "true"
+          test "$funded_bus_namespace" = "sb-polyedge-funded-cl-6urdjr5nmwx7w"
+          test "$funded_bus_queue" = "funded-dynamic-quote-intents"
           test -n "$azure_client_id"
-          test "$backend_base" = "http://127.0.0.1:8081/api/v1"
+          test "$backend_base" = "https://$api_fqdn/api/v1"
+          test "$backend_ws" = "wss://$api_fqdn/api/v1/ws/live"
           test "$dashboard_secret" = "dashboard-session-secret"
+          test "$(jq -r '.properties.configuration.ingress.external' api-containerapp.json)" = "false"
+          test "$(jq -r '.properties.template.scale.minReplicas' api-containerapp.json)" = "1"
+          test "$(jq -r '.properties.template.scale.minReplicas' frontend-containerapp.json)" = "0"
+          test "$(jq -r '[.properties.template.containers[] | select(.name == "frontend")] | length' frontend-containerapp.json)" = "1"
+          test "$(jq -r '[.properties.template.containers[] | select(.name == "bot")] | length' frontend-containerapp.json)" = "0"
           test "$research_container" = "polyedge-research"
           test "$funded_container" = "polyedge-funded-evidence"
           test "$model_container" = "polyedge-models"
-          test "$shadow_campaign_id" = "campaign-2026-07-23"
-          test "$shadow_correction_root" = "reports/research/shadow/campaigns/campaign-2026-07-23/corrections"
+          test "$shadow_campaign_id" = "campaign-2026-07-28-qset-v1"
+          test "$shadow_correction_root" = "reports/research/shadow/campaigns/campaign-2026-07-28-qset-v1/corrections"
           test "$(echo "$event_index_types" | grep -c 'runtime_provenance')" = "1"
-          test "$(jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length' containerapp.json)" = "0"
-          test "$(jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length' containerapp.json)" = "0"
-          for research_job_name in polyedge-data-freshness-job polyedge-hourly-quality-job polyedge-daily-research-job polyedge-prospective-job polyedge-replay-index-job polyedge-chart-backfill-job polyedge-adx-ingestion-job polyedge-backfill-job; do
+          test "$(jq -s '[.[].properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length' frontend-containerapp.json api-containerapp.json)" = "0"
+          test "$(jq -s '[.[].properties.configuration.secrets[]? | select(.name == "storage-account-key")] | length' frontend-containerapp.json api-containerapp.json)" = "0"
+          for research_job_name in polyedge-data-freshness-job polyedge-hourly-quality-job polyedge-daily-research-job polyedge-prospective-job polyedge-replay-index-job polyedge-chart-backfill-job polyedge-backfill-job; do
             research_job=$(az containerapp job show --resource-group "$AZURE_RESOURCE_GROUP" --name "$research_job_name" -o json)
             test "$(echo "$research_job" | jq -r '[.properties.template.containers[] | .env[]? | select(.name == "AZURE_STORAGE_ACCOUNT_KEY")] | length')" = "0"
             test "$(echo "$research_job" | jq -r '[(.properties.configuration.secrets // [])[] | select(.name == "storage-account-key")] | length')" = "0"
@@ -517,7 +655,10 @@ jobs:
           test "$(echo "$funded_ladder_job" | jq -r '.properties.configuration.triggerType')" = "Manual"
           test "$(echo "$funded_ladder_job" | jq -r '.properties.configuration.replicaRetryLimit')" = "0"
           test "$(echo "$funded_ladder_job" | jq -r '.properties.configuration.scheduleTriggerConfig == null')" = "true"
-          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "node src/funded-ladder-controller.mjs"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].command | join(" ")')" = "node src/funded-direct-worker.mjs"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_WORKER_ENABLED") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_FUNDED_DIRECT") | .value')" = "false"
+          test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_DIRECT_DRY_RUN") | .value')" = "true"
           test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_LADDER_CONTROLLER_ENABLED") | .value')" = "false"
           test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "ALLOW_FUNDED_LADDER") | .value')" = "false"
           test "$(echo "$funded_ladder_job" | jq -r '.properties.template.containers[0].env[] | select(.name == "FUNDED_LADDER_DRY_RUN") | .value')" = "true"
@@ -754,8 +895,9 @@ jobs:
           DASHBOARD_AUTH_PASSWORD: ${{ secrets.DASHBOARD_AUTH_PASSWORD }}
         run: |
           set -euo pipefail
-          app="${{ steps.deploy_outputs.outputs.container_app_name }}"
-          fqdn="${{ steps.deploy_outputs.outputs.container_app_fqdn }}"
+          app="$APP_NAME-dev"
+          api_app="$app-api"
+          fqdn=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --query properties.configuration.ingress.fqdn -o tsv)
           login_body=$(jq -nc --arg password "$DASHBOARD_AUTH_PASSWORD" '{password:$password}')
           ready=false
           for attempt in $(seq 1 30); do
@@ -794,9 +936,13 @@ jobs:
           jq -e '.status == "pass" and .venue_contacted == false and .live_order_placed == false and .markout_1s == 2 and .markout_5s == 2 and .markout_30s == 2' probe.json
           jq -e --arg expected_sha "${{ github.sha }}" '.git_sha == $expected_sha' smoke-status.json
           revision=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --query properties.latestReadyRevisionName -o tsv)
-          az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --revision "$revision" -o json > replicas.json
-          jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' replicas.json
+          api_revision=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$api_app" --query properties.latestReadyRevisionName -o tsv)
+          az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$app" --revision "$revision" -o json > frontend-replicas.json
+          az containerapp replica list --resource-group "$AZURE_RESOURCE_GROUP" --name "$api_app" --revision "$api_revision" -o json > api-replicas.json
+          jq -e 'length > 0 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' frontend-replicas.json
+          jq -e 'length == 1 and all(.[]; all(.properties.containers[]; (.restartCount // 0) == 0))' api-replicas.json
 
       - name: Print endpoint
         run: |
-          echo "https://${{ steps.deploy_outputs.outputs.container_app_fqdn }}"
+          fqdn=$(az containerapp show --resource-group "$AZURE_RESOURCE_GROUP" --name "$APP_NAME-dev" --query properties.configuration.ingress.fqdn -o tsv)
+          echo "https://$fqdn"

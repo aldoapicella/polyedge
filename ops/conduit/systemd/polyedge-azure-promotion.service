@@ -1,0 +1,43 @@
+[Unit]
+Description=Run the fail-closed PolyEdge Azure image promotion controller
+Wants=network-online.target
+After=network-online.target spire-agent.service
+Requires=spire-agent.service
+ConditionPathExists=/etc/polyedge/promotion-controller.env
+ConditionPathExists=/etc/polyedge/ENABLE_AZURE_PROMOTION_CONTROLLER
+StartLimitIntervalSec=15min
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+Environment=PATH=/usr/local/bin:/usr/bin
+Environment=AZURE_TOKEN_CREDENTIALS=WorkloadIdentityCredential
+EnvironmentFile=/etc/polyedge/promotion-controller.env
+LoadCredential=azure-federated-token:/run/polyedge-federated-promotion/azure-federated-token
+Environment=AZURE_FEDERATED_TOKEN_FILE=%d/azure-federated-token
+ExecStart=/opt/polyedge-node/bin/node /srv/polyedge/venue-probe/src/azure-promotion-controller.mjs
+TimeoutStartSec=75min
+Restart=on-failure
+RestartPreventExitStatus=64 78
+RestartSec=30s
+StateDirectory=polyedge/azure-promotion
+StateDirectoryMode=0700
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/run/polyedge-federated-promotion
+ReadOnlyPaths=/srv/polyedge/venue-probe
+
+[Install]
+WantedBy=multi-user.target

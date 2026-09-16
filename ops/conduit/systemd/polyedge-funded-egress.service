@@ -1,0 +1,13 @@
+[Unit]
+Description=Pin PolyEdge funded signer to the reserved OCI egress IP
+Wants=network-online.target
+After=network-online.target polyedge-network.service
+Requires=polyedge-network.service
+Before=polyedge-funded-signer.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-/usr/sbin/iptables -t nat -D POSTROUTING -s 10.89.0.250/32 ! -d 10.89.0.0/24 -m comment --comment polyedge-funded-egress -j SNAT --to-source 10.0.0.81
+ExecStart=/usr/sbin/iptables -t nat -I POSTROUTING 1 -s 10.89.0.250/32 ! -d 10.89.0.0/24 -m comment --comment polyedge-funded-egress -j SNAT --to-source 10.0.0.81
+ExecStop=-/usr/sbin/iptables -t nat -D POSTROUTING -s 10.89.0.250/32 ! -d 10.89.0.0/24 -m comment --comment polyedge-funded-egress -j SNAT --to-source 10.0.0.81

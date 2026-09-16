@@ -16,6 +16,7 @@ test "$(date -u -d "$DATE" +%Y-%m-%d 2>/dev/null || true)" = "$DATE"
 : "${QSET_CONTROL_CONTAINER:?QSET_CONTROL_CONTAINER is required}"
 : "${CAMPAIGN_ID:?CAMPAIGN_ID is required}"
 : "${SOURCE_FREEZE_SHA256:?SOURCE_FREEZE_SHA256 is required}"
+: "${EVIDENCE_VERSION:?EVIDENCE_VERSION is required}"
 : "${SOURCE_FREEZE_PATH:?SOURCE_FREEZE_PATH is required}"
 : "${SOURCE_FREEZE_FILE:=source-freeze.json}"
 
@@ -159,12 +160,13 @@ done
 test -f "$WORK/code-freeze-binding.json"
 jq -e \
   --arg campaign_id "$CAMPAIGN_ID" \
+  --arg evidence_version "$EVIDENCE_VERSION" \
   --arg sha "$SOURCE_FREEZE_SHA256" \
   --arg uri "azure://$STORAGE_ACCOUNT/$QSET_CONTROL_CONTAINER/$SOURCE_FREEZE_PATH" \
   '
     .schema == "polyedge.shadow_code_freeze_binding.v1"
     and .campaign_id == $campaign_id
-    and .evidence_version == "protocol-v3-qset-v1"
+    and .evidence_version == $evidence_version
     and .manifest_sha256 == $sha
     and .manifest_path == $uri
   ' "$WORK/code-freeze-binding.json" >/dev/null

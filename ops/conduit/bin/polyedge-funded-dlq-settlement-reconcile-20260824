@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+die() { echo "polyedge-funded-dlq-settlement-reconcile-20260824: $*" >&2; exit 1; }
+sha() { /usr/bin/sha256sum "$1" | /usr/bin/cut -d' ' -f1; }
+
+readonly expected_dlq=1311
+readonly signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:212a34d97075ff74b57681aff65e49913431e6caf2f7c015104102c62837e6f3
+readonly expected_evidence='[
+  {
+    "message":{"messageId":"5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","decisionId":"5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","schema":"polyedge.funded_intent_handoff.v1","deliveryCount":1,"deadLetterReason":"FundedIntentFailedClosed","bodySha256":"sha256:fe1f957365fbbdf49eac276e8b0c252c9f0ab2f83b03c0c8a7e9228b69f0d25d"},
+    "authorization":{"blob":"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/authorizations/5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c.json","sha256":"sha256:fbd880fcb69295a8e968354a9694d5c90db35af271f0605b23402341f3192fb4","schema":"polyedge.operator_funded_intent_authorization.v1","sessionId":"dynamic-quote-funded-2026-08-13-v10","decisionId":"5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","childRunId":"funded-direct-20260824054548836-d41332c5","singleUse":true},
+    "completion":{"blob":"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/completed/5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c.json","sha256":"sha256:5ffd77dd11d5545e122cc8640f8549b52ba8f386f82d4989362b0dc9819def4c","schema":"polyedge.operator_funded_intent_completion.v1","sessionId":"dynamic-quote-funded-2026-08-13-v10","decisionId":"5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","childRunId":"funded-direct-20260824054548836-d41332c5","status":"child_completed","orderSubmissionAttempted":true,"authorizationConsumed":true,"riskReservationCreated":true},
+    "reservation":{"blob":"reports/research/venue-probe/risk-reservations/2026-08-24/funded-direct-5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c.json","sha256":"sha256:93112f738868b381159737f3aeecd9a47ab5542343836daa9460fd1c20f5a3cb","schemaVersion":1,"state":"finalized_no_fill","campaignId":"dynamic-quote-funded-2026-08-13-v10","probeId":"funded-direct-5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","runId":"funded-direct-20260824054548836-d41332c5","orderId":"0xbcdf3a4bd0e6c1d8cf61aca501c86ca0ed8d557547929bdb87326c6133ad99d9","reconciliationComplete":true,"zeroOpenOrdersConfirmed":true,"matchedNotional":0},
+    "summary":{"blob":"reports/research/venue-probe/runs/2026-08-24/funded-direct-20260824054548836-d41332c5/summary.json","sha256":"sha256:cf6438c6dbf6302af30b6dca0676e7f33f08a48056ae3f4ed07b80b7d8d7def7","schemaVersion":3,"status":"completed","runId":"funded-direct-20260824054548836-d41332c5","decisionId":"5d778fdd0a99ca1cc499f426c55979ac3e4df24b74bce4c4a2b813239893661c","orderId":"0xbcdf3a4bd0e6c1d8cf61aca501c86ca0ed8d557547929bdb87326c6133ad99d9","orderSubmissionAttempted":true,"orderSubmitted":true,"reconciliationComplete":true,"zeroOpenOrdersConfirmed":true}
+  },
+  {
+    "message":{"messageId":"d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","decisionId":"d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","schema":"polyedge.funded_intent_handoff.v1","deliveryCount":1,"deadLetterReason":"FundedIntentFailedClosed","bodySha256":"sha256:adda5c26a592f6032758358285849a6a0d09817c4ac325b71cbc72052fdf75c7"},
+    "authorization":{"blob":"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/authorizations/d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f.json","sha256":"sha256:f2e7667ac6ff79935cb95f6a6bef7c061c15da65d6c6b062eb0f8f3360819426","schema":"polyedge.operator_funded_intent_authorization.v1","sessionId":"dynamic-quote-funded-2026-08-13-v10","decisionId":"d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","childRunId":"funded-direct-20260824055218367-07b96e6b","singleUse":true},
+    "completion":{"blob":"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/completed/d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f.json","sha256":"sha256:4ef318ea6be16ac7b5ba3cf6c1dfdba5a823b6cd31f96b0e6207d2464d981fb0","schema":"polyedge.operator_funded_intent_completion.v1","sessionId":"dynamic-quote-funded-2026-08-13-v10","decisionId":"d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","childRunId":"funded-direct-20260824055218367-07b96e6b","status":"child_completed","orderSubmissionAttempted":true,"authorizationConsumed":true,"riskReservationCreated":true},
+    "reservation":{"blob":"reports/research/venue-probe/risk-reservations/2026-08-24/funded-direct-d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f.json","sha256":"sha256:dee63b1a1ff19912e9e33c7571aaa735d67d2a08924a0a5ecaf2cdf32cd64b8e","schemaVersion":1,"state":"finalized_no_fill","campaignId":"dynamic-quote-funded-2026-08-13-v10","probeId":"funded-direct-d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","runId":"funded-direct-20260824055218367-07b96e6b","orderId":"0xc655d44197be86d5013939e9366c223076915c80b5df10b3982be77632ecef68","reconciliationComplete":true,"zeroOpenOrdersConfirmed":true,"matchedNotional":0},
+    "summary":{"blob":"reports/research/venue-probe/runs/2026-08-24/funded-direct-20260824055218367-07b96e6b/summary.json","sha256":"sha256:24c417aa5345cf72e93a29e221a617c92f6542c69f0f528c511d795cecfbc2b4","schemaVersion":3,"status":"completed","runId":"funded-direct-20260824055218367-07b96e6b","decisionId":"d9f6065521ea9156fd8bbff4273796113c6344f9b8da082355a5a99f0cf2378f","orderId":"0xc655d44197be86d5013939e9366c223076915c80b5df10b3982be77632ecef68","orderSubmissionAttempted":true,"orderSubmitted":true,"reconciliationComplete":true,"zeroOpenOrdersConfirmed":true}
+  },
+  {
+    "message":{"messageId":"6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759","decisionId":"6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759","schema":"polyedge.funded_intent_handoff.v1","deliveryCount":1,"deadLetterReason":"FundedIntentFailedClosed","bodySha256":"sha256:de4ef054c693a8fee90b1ea322ed92c21826eb478f2798b603d5027d89ff8553"},
+    "authorization":{"blob":"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/authorizations/6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759.json","sha256":"sha256:65a37b4bb885ab43354c9d17eb9fdb800f0cbaadf0b543e0e50473fde9d27d03","schema":"polyedge.operator_funded_intent_authorization.v1","sessionId":"dynamic-quote-funded-2026-08-13-v10","decisionId":"6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759","childRunId":"funded-direct-20260824060435144-dc1fa489","singleUse":true},
+    "completion":{"blob":"reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/completed/6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759.json","sha256":"sha256:a05187933090dd9e88c7e941baa3a76e2ede80dabea3ec7564b0da66c348cd64","schema":"polyedge.operator_funded_intent_completion.v1","sessionId":"dynamic-quote-funded-2026-08-13-v10","decisionId":"6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759","childRunId":"funded-direct-20260824060435144-dc1fa489","status":"child_completed","orderSubmissionAttempted":true,"authorizationConsumed":true,"riskReservationCreated":true},
+    "reservation":{"blob":"reports/research/venue-probe/risk-reservations/2026-08-24/funded-direct-6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759.json","sha256":"sha256:613a56439c867611a58f3fb95f357d3bbe792f94080c8432c8b06117e326afe7","schemaVersion":1,"state":"finalized_no_fill","campaignId":"dynamic-quote-funded-2026-08-13-v10","probeId":"funded-direct-6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759","runId":"funded-direct-20260824060435144-dc1fa489","orderId":"0x8a022015f95b2ec94f09865feaa05d7e95c34176e76299c8208f216d8c0ba5da","reconciliationComplete":true,"zeroOpenOrdersConfirmed":true,"matchedNotional":0},
+    "summary":{"blob":"reports/research/venue-probe/runs/2026-08-24/funded-direct-20260824060435144-dc1fa489/summary.json","sha256":"sha256:62a89ed69b39c83efb64159de2356ae10b85b0bfb64865174f9ecb4c1dca09c8","schemaVersion":3,"status":"completed","runId":"funded-direct-20260824060435144-dc1fa489","decisionId":"6b8be1369f157f12e2f97bc0cbe28197f64e9437fe723bf76b134d8242618759","orderId":"0x8a022015f95b2ec94f09865feaa05d7e95c34176e76299c8208f216d8c0ba5da","orderSubmissionAttempted":true,"orderSubmitted":true,"reconciliationComplete":true,"zeroOpenOrdersConfirmed":true}
+  }
+]'
+readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+readonly resource_group=rg-polyedge-dev
+readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+readonly queue=funded-dynamic-quote-intents
+
+receipt_root=/srv/polyedge-ring/parity/funded-recovery
+receipt=$receipt_root/20260824T060435Z-settlement-loss-dlq-1311.json
+lock_file=/run/polyedge/utility.lock
+runtime_dir=/run/polyedge
+podman=/usr/bin/podman
+systemctl=/usr/bin/systemctl
+journalctl=/usr/bin/journalctl
+runuser=/usr/sbin/runuser
+az=/usr/bin/az
+disk_guard=/usr/local/libexec/polyedge-boot-disk-guard
+expected_uid=0
+expected_gid=0
+
+if [ "${POLYEDGE_TEST_ALLOW_UNPRIVILEGED:-}" = 1 ]; then
+  receipt_root=${POLYEDGE_TEST_RECEIPT_ROOT:?}; receipt=${POLYEDGE_TEST_RECEIPT:?}
+  lock_file=${POLYEDGE_TEST_LOCK_FILE:?}; runtime_dir=${POLYEDGE_TEST_RUNTIME_DIR:?}
+  podman=${POLYEDGE_TEST_PODMAN:?}; systemctl=${POLYEDGE_TEST_SYSTEMCTL:?}
+  journalctl=${POLYEDGE_TEST_JOURNALCTL:?}; runuser=${POLYEDGE_TEST_RUNUSER:?}
+  az=${POLYEDGE_TEST_AZ:?}; disk_guard=${POLYEDGE_TEST_DISK_GUARD:?}
+  expected_uid=${POLYEDGE_TEST_UID:?}; expected_gid=${POLYEDGE_TEST_GID:?}
+else
+  [ "$(/usr/bin/id -u)" -eq 0 ] || die 'must run as root'
+fi
+
+secure_dir() {
+  local path=$1 mode=$2 uid gid actual
+  [ ! -L "$path" ] && [ -d "$path" ] || return 1
+  read -r uid gid actual < <(/usr/bin/stat -c '%u %g %a' "$path")
+  [ "$uid:$gid:$actual" = "$expected_uid:$expected_gid:$mode" ]
+}
+
+secure_file() {
+  local path=$1 mode=$2 max=$3 uid gid actual links size
+  [ ! -L "$path" ] && [ -f "$path" ] || return 1
+  read -r uid gid actual links size < <(/usr/bin/stat -c '%u %g %a %h %s' "$path")
+  [ "$uid:$gid:$actual:$links" = "$expected_uid:$expected_gid:$mode:1" ] &&
+    [ "$size" -gt 0 ] && [ "$size" -le "$max" ]
+}
+
+queue_snapshot() {
+  "$runuser" -u ubuntu -- "$az" servicebus queue show --subscription "$subscription" \
+    --resource-group "$resource_group" --namespace-name "$namespace" --name "$queue" \
+    --only-show-errors -o json | /usr/bin/jq -ce --argjson expected "$expected_dlq" '
+      if .status == "Active" and .countDetails.activeMessageCount == 0 and
+         .countDetails.scheduledMessageCount == 0 and .countDetails.deadLetterMessageCount == $expected
+      then {status:.status,activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$expected}
+      else error("queue differs from the exact settlement-loss baseline") end'
+}
+
+heartbeat_snapshot() {
+  local invocation=$1 container=$2 now
+  now=$(/usr/bin/date -u +%s)
+  "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager | /usr/bin/jq -Rse \
+    --arg invocation "$invocation" --arg container "$container" --argjson now "$now" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
+        {timestamp:(($record.__REALTIME_TIMESTAMP | tonumber) / 1000000),
+         invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] |
+      [.[] | select(.invocation == $invocation and .container == $container and
+        .event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_service_heartbeat")] |
+      sort_by(.timestamp) | last |
+      if . != null and .timestamp <= $now and .timestamp >= ($now - 75) and .event.executor.busy == false and
+         .event.executor.safety_snapshot_cache_ready == true and
+         (.event.executor.safety_snapshot_cache_age_ms | type == "number" and . >= 0 and . <= 650) and
+         .event.executor.safety_snapshot_open_order_count == 0 and
+         .event.executor.safety_snapshot_unresolved_position_count == 0 and
+         .event.executor.safety_snapshot_unresolved_risk_reservation_count == 0 and
+         .event.executor.safety_snapshot_cache_error == null and .event.executor.risk_reservation_index_ready == true
+      then {capturedAtEpoch:.timestamp,invocationId:.invocation,containerId:.container,openOrders:0,
+        unresolvedPositions:0,unresolvedRiskReservations:0,
+        safetySnapshotCacheAgeMs:.event.executor.safety_snapshot_cache_age_ms}
+      else error("current funded heartbeat does not prove zero exposure") end'
+}
+
+incident_snapshot() {
+  "$journalctl" -u polyedge-funded-signer.service --since '2026-08-24 05:40:00 UTC' -o json --no-pager |
+    /usr/bin/jq -Rse --argjson expected "$expected_evidence" '
+      [split("\n")[] | fromjson? | select(type == "object") | . as $record |
+        ($record.MESSAGE | fromjson?) as $event | select($event | type == "object") |
+        {invocation:($record._SYSTEMD_INVOCATION_ID // ""),container:($record.CONTAINER_ID_FULL // ""),event:$event}] as $events |
+      [$expected[] as $x |
+        [$events[] | select(.event.message_id == $x.message.messageId and
+          .event.schema == "polyedge.funded_direct_service.v2" and
+          .event.status == "persistent_message_settlement_lost_after_durable_completion" and
+          .event.delivery_count == 0 and .event.worker_status == "persistent_intent_completed" and
+          .event.order_submission_attempted == true and .event.broker_redelivery_expected == true)] as $lost |
+        [$events[] | select(.event.message_id == $x.message.messageId and
+          .event.schema == "polyedge.funded_direct_service.v2" and
+          .event.status == "persistent_message_failed_closed" and .event.delivery_count == 1 and
+          .event.error == "fail closed: funded intent handoff has insufficient remaining TTL" and
+          .event.terminal_failure == true and .event.settlement_action == "dead_lettered" and
+          .event.settlement_succeeded == true and .event.broker_redelivery_expected == false)] as $dead |
+        if ($lost|length) == 1 and ($dead|length) == 1 and
+           $lost[0].invocation == $dead[0].invocation and $lost[0].container == $dead[0].container and
+           ($lost[0].invocation | test("^[0-9a-f]{32}$")) and ($lost[0].container | test("^[0-9a-f]{64}$"))
+        then {messageId:$x.message.messageId,settlementLossEvents:1,terminalDeadLetterEvents:1,
+          invocationId:$lost[0].invocation,containerId:$lost[0].container,
+          workerStatus:"persistent_intent_completed",orderSubmissionAttempted:true,
+          initialDeliveryCount:0,redeliveryCount:1,terminalSettlement:"dead_lettered"}
+        else error("journal lacks an exact settlement-loss/redelivery pair for " + $x.message.messageId) end]'
+}
+
+validate_probe() {
+  /usr/bin/jq -e --argjson expected "$expected_evidence" --argjson dlq "$expected_dlq" '
+    type == "object" and keys == ["brokerOperations","distinctOrderIds","dlq","evidence",
+      "executionEvidenceCount","mutationOperations","orderLifecycleMatches","riskIndexUnresolvedCount"] and
+    .brokerOperations == ["peekMessages"] and .mutationOperations == [] and
+    .dlq == {scanned:$dlq,matchingMessages:3} and .evidence == $expected and
+    .riskIndexUnresolvedCount == 0 and .executionEvidenceCount == 3 and
+    .orderLifecycleMatches == 3 and .distinctOrderIds == 3' "$1" >/dev/null
+}
+
+validate_receipt() {
+  /usr/bin/jq -e --arg helper "sha256:$(sha "$0")" --argjson expected "$expected_evidence" --argjson dlq "$expected_dlq" '
+    .schema == "polyedge.funded_dlq_settlement_reconciliation.v1" and
+    .status == "attested_durable_completion_no_duplicate_execution" and
+    (.generatedAtUtc | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+    .helperSha256 == $helper and .messageIds == [$expected[].message.messageId] and
+    .durableEvidence == $expected and .queueBefore == {status:"Active",activeMessageCount:0,
+      scheduledMessageCount:0,deadLetterMessageCount:$dlq} and .queueAfter == .queueBefore and
+    .authorizedDeadLetterBaseline == $dlq and (.incidents|length) == 3 and
+    all(.incidents[]; .settlementLossEvents == 1 and .terminalDeadLetterEvents == 1 and
+      .workerStatus == "persistent_intent_completed" and .orderSubmissionAttempted == true) and
+    .safety.openOrders == 0 and .safety.unresolvedPositions == 0 and
+    .safety.unresolvedRiskReservations == 0 and .safety.durableRiskIndexUnresolvedReservations == 0 and
+    .duplicateExecutionEvidence == {matchingDlqMessages:3,immutableAuthorizations:3,
+      immutableCompletions:3,terminalReservations:3,orderLifecycles:3,distinctOrderIds:3} and
+    .brokerOperations == ["peekMessages"] and .mutationOperations == [] and
+    .remoteStateMutationPerformed == false and .parityTimerRemainsPaused == true and
+    .azureDeletionAllowed == false' "$1" >/dev/null
+}
+
+exec 9>"$lock_file"
+/usr/bin/flock -n 9 || die 'another PolyEdge utility is active'
+secure_file "$0" 755 131072 || die 'helper owner, mode, link count, or size is unsafe'
+secure_dir "$receipt_root" 750 || die 'receipt directory is unsafe'
+"$disk_guard" --assert-headroom
+"$systemctl" is-active --quiet polyedge-funded-signer.service || die 'funded signer is not active'
+! "$systemctl" is-active --quiet polyedge-parity-hourly.timer || die 'parity timer must remain paused'
+
+identity=$("$podman" inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}|{{.Id}}' polyedge-funded-signer)
+IFS='|' read -r image user state container <<EOF
+$identity
+EOF
+[ "$image|$user|$state" = "$signer_image|986:982|running" ] || die 'funded signer identity differs from the incident runtime'
+printf '%s' "$container" | /usr/bin/grep -Eq '^[0-9a-f]{64}$' || die 'funded signer container ID is malformed'
+invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)
+printf '%s' "$invocation" | /usr/bin/grep -Eq '^[0-9a-f]{32}$' || die 'funded signer invocation ID is malformed'
+heartbeat=$(heartbeat_snapshot "$invocation" "$container")
+before=$(queue_snapshot)
+
+if [ -e "$receipt" ]; then
+  secure_file "$receipt" 640 131072 || die 'existing receipt is unsafe'
+  validate_receipt "$receipt" || die 'existing receipt is invalid'
+  [ "$(queue_snapshot)" = "$before" ] || die 'queue changed while validating the receipt'
+  printf 'funded DLQ settlement reconciliation already attested sha256:%s\n' "$(sha "$receipt")"
+  exit 0
+fi
+
+temporary=()
+cleanup() { /usr/bin/rm -f -- "${temporary[@]}"; }
+trap cleanup EXIT HUP INT TERM
+probe_file=$(/usr/bin/mktemp "$runtime_dir/funded-dlq-probe.XXXXXX")
+incident_file=$(/usr/bin/mktemp "$runtime_dir/funded-dlq-incident.XXXXXX")
+receipt_tmp=$(/usr/bin/mktemp "$receipt_root/.settlement-loss.XXXXXX")
+temporary=("$probe_file" "$incident_file" "$receipt_tmp")
+/usr/bin/chmod 0600 "$probe_file" "$incident_file" "$receipt_tmp"
+
+node_program=$(/usr/bin/cat <<'NODE'
+import { createHash } from "node:crypto";
+import { DefaultAzureCredential } from "@azure/identity";
+import { ServiceBusClient } from "@azure/service-bus";
+import { loadCampaignUnresolvedRiskReservationRecords, storageContainer } from "./src/lib.mjs";
+const expected = JSON.parse(process.argv[1]);
+const expectedDlq = Number(process.argv[2]);
+const digest = (bytes) => `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+const parseBody = (value) => value && typeof value === "object" && !Buffer.isBuffer(value)
+  ? value : JSON.parse(Buffer.isBuffer(value) ? value.toString("utf8") : String(value));
+const nextSequence = (value) => typeof value === "bigint" ? value + 1n
+  : typeof value?.add === "function" ? value.add(1) : Number(value) + 1;
+const readJson = async (container, blob) => {
+  const response = await container.getBlobClient(blob).download();
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.readableStreamBody) {
+    size += chunk.length;
+    if (size > 1_048_576) throw new Error("attestation blob exceeds bounded size");
+    chunks.push(chunk);
+  }
+  const bytes = Buffer.concat(chunks);
+  return { value: JSON.parse(bytes.toString("utf8")), sha256: digest(bytes) };
+};
+
+const ids = new Set(expected.map((row) => row.message.messageId));
+const credential = new DefaultAzureCredential({ managedIdentityClientId: process.env.AZURE_CLIENT_ID });
+const bus = new ServiceBusClient(`${process.env.FUNDED_DIRECT_SERVICE_BUS_NAMESPACE}.servicebus.windows.net`, credential);
+const receiver = bus.createReceiver(process.env.FUNDED_DIRECT_SERVICE_BUS_QUEUE, { subQueueType: "deadLetter" });
+let from;
+let scanned = 0;
+const messages = new Map();
+try {
+  for (let batch = 0; batch < 16; batch += 1) {
+    const rows = await receiver.peekMessages(250, from === undefined ? {} : { fromSequenceNumber: from });
+    scanned += rows.length;
+    for (const row of rows) {
+      if (!ids.has(row.messageId)) continue;
+      if (messages.has(row.messageId)) throw new Error("duplicate exact DLQ message ID");
+      const body = parseBody(row.body);
+      messages.set(row.messageId, { messageId: row.messageId, decisionId: body?.decision_id,
+        schema: body?.schema, deliveryCount: Number(row.deliveryCount),
+        deadLetterReason: row.deadLetterReason || null, bodySha256: digest(Buffer.from(JSON.stringify(body))) });
+    }
+    if (rows.length < 250) break;
+    from = nextSequence(rows.at(-1).sequenceNumber);
+  }
+} finally {
+  await receiver.close();
+  await bus.close();
+}
+if (scanned !== expectedDlq || messages.size !== expected.length) throw new Error("exact DLQ inventory is not stable");
+
+const control = storageContainer({ storageAccount: process.env.AZURE_STORAGE_ACCOUNT_NAME,
+  storageContainer: process.env.AZURE_STORAGE_CONTAINER_NAME, azureClientId: process.env.AZURE_CLIENT_ID });
+if (!control) throw new Error("funded control storage is unavailable");
+const evidence = [];
+for (const binding of expected) {
+  const [authorization, completion, reservation, summary] = await Promise.all([
+    readJson(control, binding.authorization.blob), readJson(control, binding.completion.blob),
+    readJson(control, binding.reservation.blob), readJson(control, binding.summary.blob)
+  ]);
+  const a = authorization.value, c = completion.value, r = reservation.value, s = summary.value;
+  const actual = {
+    message: messages.get(binding.message.messageId),
+    authorization: { blob: binding.authorization.blob, sha256: authorization.sha256, schema: a.schema,
+      sessionId: a.session_id, decisionId: a.decision_id, childRunId: a.child_run_id, singleUse: a.single_use },
+    completion: { blob: binding.completion.blob, sha256: completion.sha256, schema: c.schema,
+      sessionId: c.session_id, decisionId: c.decision_id, childRunId: c.child_run_id, status: c.status,
+      orderSubmissionAttempted: c.order_submission_attempted, authorizationConsumed: c.authorization_consumed,
+      riskReservationCreated: c.risk_reservation_created },
+    reservation: { blob: binding.reservation.blob, sha256: reservation.sha256, schemaVersion: r.schema_version,
+      state: r.state, campaignId: r.campaign_id, probeId: r.probe_id, runId: r.run_id, orderId: r.order_id,
+      reconciliationComplete: r.reconciliation_complete, zeroOpenOrdersConfirmed: r.zero_open_orders_confirmed,
+      matchedNotional: Number(r.matched_notional) },
+    summary: { blob: binding.summary.blob, sha256: summary.sha256, schemaVersion: s.schema_version,
+      status: s.status, runId: s.run_id, decisionId: s.provenance?.decision_id, orderId: s.lifecycle?.order_id,
+      orderSubmissionAttempted: s.order_submission_attempted, orderSubmitted: s.order_submitted,
+      reconciliationComplete: s.lifecycle?.reconciliation_complete,
+      zeroOpenOrdersConfirmed: s.lifecycle?.zero_open_orders_confirmed }
+  };
+  if (JSON.stringify(actual) !== JSON.stringify(binding) ||
+      c.authorization_blob_name !== binding.authorization.blob || c.authorization_sha256 !== binding.authorization.sha256 ||
+      s.provenance?.authorization_blob_name !== binding.authorization.blob ||
+      s.provenance?.authorization_sha256 !== binding.authorization.sha256) throw new Error("durable execution binding is invalid");
+  evidence.push(actual);
+}
+const unresolved = await loadCampaignUnresolvedRiskReservationRecords({
+  campaignId: "dynamic-quote-funded-2026-08-13-v10", operatorDirect: true, dryRun: false,
+  storageAccount: process.env.AZURE_STORAGE_ACCOUNT_NAME, storageContainer: process.env.AZURE_STORAGE_CONTAINER_NAME,
+  azureClientId: process.env.AZURE_CLIENT_ID }, { container: control });
+const distinctOrderIds = new Set(evidence.map((row) => row.summary.orderId)).size;
+if (unresolved.length !== 0 || distinctOrderIds !== evidence.length) throw new Error("exposure or duplicate order evidence remains");
+console.log(JSON.stringify({ brokerOperations:["peekMessages"], distinctOrderIds,
+  dlq:{scanned,matchingMessages:messages.size}, evidence, executionEvidenceCount:evidence.length,
+  mutationOperations:[], orderLifecycleMatches:evidence.length, riskIndexUnresolvedCount:unresolved.length }));
+NODE
+)
+! printf '%s' "$node_program" | /usr/bin/grep -Eq '\.(receiveMessages|completeMessage|abandonMessage|deadLetterMessage|sendMessages|scheduleMessages|deleteBlob|uploadData)\(' \
+  || die 'embedded probe contains a prohibited mutation API'
+"$podman" exec polyedge-funded-signer node --input-type=module -e "$node_program" "$expected_evidence" "$expected_dlq" >"$probe_file"
+secure_file "$probe_file" 600 131072 || die 'probe output is unsafe'
+validate_probe "$probe_file" || die 'read-only DLQ and durable evidence probe failed validation'
+incident_snapshot >"$incident_file"
+secure_file "$incident_file" 600 65536 || die 'incident snapshot is unsafe'
+after=$(queue_snapshot)
+[ "$after" = "$before" ] || die 'queue changed during the read-only attestation'
+
+/usr/bin/jq -n --arg generated "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg helper "sha256:$(sha "$0")" --argjson expected "$expected_evidence" --argjson dlq "$expected_dlq" \
+  --argjson before "$before" --argjson after "$after" --argjson heartbeat "$heartbeat" \
+  --slurpfile probe "$probe_file" --slurpfile incidents "$incident_file" '
+    {schema:"polyedge.funded_dlq_settlement_reconciliation.v1",
+     status:"attested_durable_completion_no_duplicate_execution",generatedAtUtc:$generated,
+     helperSha256:$helper,messageIds:[$expected[].message.messageId],queueBefore:$before,queueAfter:$after,
+     authorizedDeadLetterBaseline:$dlq,incidents:$incidents[0],durableEvidence:$probe[0].evidence,
+     safety:{openOrders:$heartbeat.openOrders,unresolvedPositions:$heartbeat.unresolvedPositions,
+       unresolvedRiskReservations:$heartbeat.unresolvedRiskReservations,
+       durableRiskIndexUnresolvedReservations:$probe[0].riskIndexUnresolvedCount,
+       heartbeatInvocationId:$heartbeat.invocationId,heartbeatContainerId:$heartbeat.containerId,
+       heartbeatCapturedAtEpoch:$heartbeat.capturedAtEpoch,safetySnapshotCacheAgeMs:$heartbeat.safetySnapshotCacheAgeMs},
+     duplicateExecutionEvidence:{matchingDlqMessages:$probe[0].dlq.matchingMessages,immutableAuthorizations:3,
+       immutableCompletions:3,terminalReservations:3,orderLifecycles:$probe[0].orderLifecycleMatches,
+       distinctOrderIds:$probe[0].distinctOrderIds},brokerOperations:$probe[0].brokerOperations,
+     mutationOperations:$probe[0].mutationOperations,remoteStateMutationPerformed:false,
+     parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$receipt_tmp"
+/usr/bin/chown "$expected_uid:$expected_gid" "$receipt_tmp"
+/usr/bin/chmod 0640 "$receipt_tmp"
+validate_receipt "$receipt_tmp" || die 'candidate receipt failed validation'
+[ ! -e "$receipt" ] || die 'receipt appeared concurrently'
+/usr/bin/sync -f "$receipt_tmp"
+/usr/bin/ln "$receipt_tmp" "$receipt"
+/usr/bin/sync -f "$receipt"
+/usr/bin/sync -d "$receipt_root"
+/usr/bin/rm -f "$receipt_tmp"
+temporary=("$probe_file" "$incident_file")
+secure_file "$receipt" 640 131072 || die 'committed receipt is unsafe'
+validate_receipt "$receipt" || die 'committed receipt failed validation'
+printf 'funded DLQ settlement reconciliation attested sha256:%s\n' "$(sha "$receipt")"

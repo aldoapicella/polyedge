@@ -1,0 +1,12 @@
+[Unit]
+Description=Seal the exact closed qset-v3 report and carry days
+Wants=network-online.target polyedge-federated-token@shadow-qset-v3-writer.service polyedge-shadow-qset-v3.service
+After=network-online.target polyedge-network.service polyedge-federated-token@shadow-qset-v3-writer.service polyedge-shadow-qset-v3.service
+Requires=polyedge-network.service
+RequiresMountsFor=/srv/polyedge-ring /run/polyedge-federated-shadow-qset-v3-writer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock -w 300 /run/polyedge/research.lock /usr/local/libexec/polyedge-qset-v3-seal-days
+TimeoutStartSec=2h
+UMask=0027

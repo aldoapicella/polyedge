@@ -5,8 +5,6 @@ use serde_json::{json, Map, Value};
 use std::thread;
 use tracing::warn;
 
-const CHART_PERSIST_INTERVAL_MS: i64 = 1_000;
-
 #[derive(Clone)]
 pub(super) struct ChartPersistenceSample {
     market: MarketSpec,
@@ -24,8 +22,12 @@ impl ChartPersistenceSample {
     }
 }
 
-pub(super) fn should_persist(last_bucket_ms: Option<i64>, bucket_ms: i64) -> bool {
-    last_bucket_ms.is_none_or(|last| bucket_ms.saturating_sub(last) >= CHART_PERSIST_INTERVAL_MS)
+pub(super) fn should_persist(
+    last_bucket_ms: Option<i64>,
+    bucket_ms: i64,
+    interval_ms: i64,
+) -> bool {
+    last_bucket_ms.is_none_or(|last| bucket_ms.saturating_sub(last) >= interval_ms)
 }
 
 pub(super) fn spawn_persist(settings: RuntimeSettings, sample: ChartPersistenceSample) {
@@ -218,9 +220,9 @@ mod tests {
     }
 
     #[test]
-    fn persistence_throttle_keeps_one_second_spacing() {
-        assert!(should_persist(None, 1_000));
-        assert!(!should_persist(Some(1_000), 1_999));
-        assert!(should_persist(Some(1_000), 2_000));
+    fn persistence_throttle_uses_the_configured_spacing() {
+        assert!(should_persist(None, 1_000, 10_000));
+        assert!(!should_persist(Some(1_000), 10_999, 10_000));
+        assert!(should_persist(Some(1_000), 11_000, 10_000));
     }
 }

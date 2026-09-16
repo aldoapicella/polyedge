@@ -6,15 +6,20 @@ import {
 import {
   createPublicClient,
   createWalletClient,
+  decodeEventLog,
+  fallback,
   formatUnits,
   http
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
+import { pathToFileURL } from "node:url";
 import {
   EventLedger,
   acquireCampaignLease,
   assertEligibleOrigin,
+  loadCampaignRiskReservationRecords,
+  loadCampaignUnresolvedRiskReservationRecords,
   sanitize,
   settleProbeRiskReservations,
   storageContainer,
@@ -30,58 +35,113 @@ import {
   depositWalletTypedData,
   deriveLegacyUupsDepositWallet,
   loadRedemptionConfig,
+  hasPayoutCap,
   selectRedeemableConditions,
   summarizeRecentRedemptions
 } from "./redemption.mjs";
+import {
+  discoverVerifiedAutomaticInternalSettlements,
+  loadDurableInternalSettlements,
+  putVerifiedInternalSettlement
+} from "./compounding-risk.mjs";
+import { decodeSettlementReceiptEvidence } from "./canary.mjs";
+import { tradeFillsFromRest } from "./canary-lifecycle-lib.mjs";
+import { sha256 } from "./canary-lib.mjs";
 
-const config = loadRedemptionConfig();
-const runId = `venue-redemption-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
-const ledger = new EventLedger(runId);
+let config;
+let runId;
+let ledger;
 let lease;
-let summary;
+let redemptionRunning = false;
+let canonicalRecoveryOwnsEvidence = false;
+export const RELAYER_DEADLINE_BUFFER_SECONDS = 600;
+const APPROVAL_FOR_ALL_TOPIC =
+  "0x17307eab39ab6107e8899845ad3d59bd9653f200f220920489ca2b5937696c31";
+const APPROVAL_FOR_ALL_EVENT = [{
+  type: "event",
+  name: "ApprovalForAll",
+  anonymous: false,
+  inputs: [
+    { name: "account", type: "address", indexed: true },
+    { name: "operator", type: "address", indexed: true },
+    { name: "approved", type: "bool", indexed: false }
+  ]
+}];
 
-try {
-  summary = await run();
-} catch (error) {
-  ledger.record("venue_redemption_failed", { message: error.message });
-  summary = {
-    schema_version: 1,
-    run_id: runId,
-    status: "failed_closed",
-    finished_ts: new Date().toISOString(),
-    error: error.message,
-    redemption_submitted: ledger.events.some((event) => event.type === "venue_redemption_send"),
-    research_only: true,
-    live_strategy_enabled: false
-  };
-  process.exitCode = 1;
-}
-
-try {
-  await uploadRedemptionEvidence(summary);
-  console.log(JSON.stringify(sanitize(summary)));
-} catch (error) {
-  process.exitCode = 1;
-  console.error(JSON.stringify({ status: "failed_closed", error: `redemption evidence upload failed: ${error.message}` }));
-}
-
-if (lease) {
+export async function runVenueRedemption({
+  env = process.env,
+  inheritedLease = null,
+  logger = (value) => console.log(JSON.stringify(sanitize(value)))
+} = {}) {
+  if (redemptionRunning) throw new Error("fail closed: a venue redemption is already running");
+  redemptionRunning = true;
+  canonicalRecoveryOwnsEvidence = false;
   try {
-    await lease.release();
-  } catch (error) {
-    process.exitCode = 1;
-    console.error(JSON.stringify({ status: "failed_closed", error: `redemption lease release failed: ${error.message}` }));
+    config = loadRedemptionConfig(env);
+    runId = `venue-redemption-${new Date().toISOString().replace(/[-:.TZ]/g, "")}-${crypto.randomUUID().slice(0, 8)}`;
+    ledger = new EventLedger(runId);
+    lease = inheritedLease;
+    let summary;
+    let failure = null;
+    try {
+      summary = await run();
+    } catch (error) {
+      failure = error;
+      ledger.record("venue_redemption_failed", { message: error.message });
+      summary = {
+        schema_version: 1,
+        run_id: runId,
+        status: "failed_closed",
+        finished_ts: new Date().toISOString(),
+        error: error.message,
+        redemption_submitted: ledger.events.some((event) => event.type === "venue_redemption_send"),
+        research_only: !config.fundedServiceManaged,
+        live_strategy_enabled: config.fundedServiceManaged
+      };
+    }
+
+    if (shouldUploadRedemptionEvidence(
+      summary,
+      canonicalRecoveryOwnsEvidence
+    )) {
+      try {
+        await uploadRedemptionEvidence(summary);
+      } catch (error) {
+        failure ||= new Error(`redemption evidence upload failed: ${error.message}`);
+      }
+    }
+
+    try {
+      if (lease && !inheritedLease) await lease.release();
+    } catch (error) {
+      failure ||= new Error(`redemption lease release failed: ${error.message}`);
+    }
+    logger(sanitize(summary));
+    if (failure) throw failure;
+    return summary;
+  } finally {
+    lease = null;
+    ledger = null;
+    config = null;
+    runId = null;
+    redemptionRunning = false;
   }
 }
 
+export function shouldUploadRedemptionEvidence(summary, recoveryOwnsEvidence) {
+  return recoveryOwnsEvidence !== true &&
+    summary?.status !== "recovered_confirmed_and_verified";
+}
+
 async function run() {
-  lease = await acquireCampaignLease(config, runId);
+  lease ||= await acquireCampaignLease(config, runId);
   ledger.record("venue_redemption_started", {
     dry_run: config.dryRun,
     enabled: config.enabled,
     max_payout: config.maxPayout,
     max_conditions: config.maxConditions,
-    execution_origin: "azure_north_europe_static_egress"
+    execution_origin: config.executionOrigin,
+    funded_service_managed: config.fundedServiceManaged
   });
 
   const geoblock = await checkOrigin("startup");
@@ -90,7 +150,10 @@ async function run() {
   if (derivedWallet.toLowerCase() !== config.funderAddress.toLowerCase()) {
     throw new Error("fail closed: signer does not derive the configured legacy UUPS deposit wallet");
   }
-  const transport = http(config.rpcUrl, { timeout: 15_000, retryCount: 2 });
+  const transports = config.rpcUrls.map((url) => http(url, { timeout: 15_000, retryCount: 2 }));
+  const transport = transports.length === 1
+    ? transports[0]
+    : fallback(transports, { retryCount: 2 });
   const publicClient = createPublicClient({ chain: polygon, transport });
   const walletClient = createWalletClient({ account, chain: polygon, transport });
   const deployedCode = await publicClient.getCode({ address: config.funderAddress });
@@ -110,20 +173,52 @@ async function run() {
   if (!Array.isArray(openOrders)) throw new Error("fail closed: CLOB open-order response is not an array");
   if (openOrders.length) throw new Error(`fail closed: account has ${openOrders.length} open order(s)`);
 
-  const [positions, balance, activity, redemptionControl] = await Promise.all([
+  const [positions, balance, activity, initialRedemptionControl, unresolvedReservations] = await Promise.all([
     fetchPositions(),
     clob.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetchActivity(),
-    readRedemptionControl()
+    readRedemptionControl(),
+    config.dustRedemptionEnabled
+      ? loadCampaignUnresolvedRiskReservationRecords(config)
+      : []
   ]);
   const liquidBefore = Number(formatUnits(BigInt(balance.balance || "0"), 6));
   const onchainLiquidBefore = await readPusdBalance(publicClient);
   if (Math.abs(onchainLiquidBefore - liquidBefore) > 0.000001) {
     throw new Error("fail closed: CLOB and onchain liquid collateral disagree before redemption");
   }
-  const selection = await validateOnchainSelection(
-    publicClient,
-    selectRedeemableConditions(positions, config.maxPayout, config.maxConditions)
+  if (initialRedemptionControl?.state === "confirmed_pending_verification") {
+    return recoverConfirmedRedemption({
+      account,
+      clob,
+      publicClient,
+      geoblock,
+      control: initialRedemptionControl,
+      liquidCollateral: liquidBefore
+    });
+  }
+  if ([
+    "recovery_commit_pending_publication",
+    "confirmed_and_verified"
+  ].includes(initialRedemptionControl?.state) &&
+      initialRedemptionControl?.recovery_journal_blob_name) {
+    const resumed = await resumeCanonicalRecovery({
+      account,
+      geoblock,
+      control: initialRedemptionControl
+    });
+    canonicalRecoveryOwnsEvidence = recoveryEvidenceOwnershipAfterResume(resumed);
+    if (resumed) return resumed;
+  }
+  const candidates = await augmentRedeemableCandidatesFromRiskReservations(
+    positions,
+    unresolvedReservations,
+    { enabled: config.dustRedemptionEnabled }
+  );
+  const selection = await discoverOnchainRedeemableConditions(publicClient, candidates);
+  const redemptionControl = await reconcilePriorRejectedSubmission(
+    initialRedemptionControl,
+    selection
   );
   const approvals = await adapterApprovals(publicClient, selection);
   const calls = buildRedemptionCalls(selection, approvals);
@@ -150,6 +245,9 @@ async function run() {
     }))
   });
 
+  if (selection.selected.length && hasUnselectedUnresolvedRiskReservations(unresolvedReservations, selection)) {
+    return baseSummary("redemption_deferred_unrelated_unresolved_reservation", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
+  }
   if (!selection.selected.length) {
     return baseSummary("nothing_to_redeem", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
   }
@@ -160,7 +258,12 @@ async function run() {
   await validateRelayerCredential();
 
   const pending = redemptionControl;
-  if (pending && !["confirmed_and_verified", "failed_before_submission", "relayer_failed"].includes(pending.state)) {
+  if (pending && ![
+    "confirmed_and_verified",
+    "failed_before_submission",
+    "relayer_failed",
+    "relayer_rejected"
+  ].includes(pending.state)) {
     throw new Error(`fail closed: prior redemption control record is unresolved (${pending.state || "unknown"})`);
   }
 
@@ -168,12 +271,19 @@ async function run() {
   await checkOrigin("pre_submit");
   const finalOrders = await clob.getOpenOrders(undefined, true);
   if (!Array.isArray(finalOrders) || finalOrders.length) throw new Error("fail closed: open-order state changed before redemption");
-  const finalSelection = await validateOnchainSelection(
-    publicClient,
-    selectRedeemableConditions(await fetchPositions(), config.maxPayout, config.maxConditions)
-  );
-  if (JSON.stringify(finalSelection.selected) !== JSON.stringify(selection.selected)) {
-    throw new Error("fail closed: redeemable position set changed after preflight");
+  const [finalPositions, finalReservations] = await Promise.all([
+    fetchPositions(),
+    config.dustRedemptionEnabled
+      ? loadCampaignUnresolvedRiskReservationRecords(config)
+      : []
+  ]);
+  const finalSelection = await discoverOnchainRedeemableConditions(publicClient,
+    await augmentRedeemableCandidatesFromRiskReservations(finalPositions, finalReservations, {
+      enabled: config.dustRedemptionEnabled
+    }));
+  assertStableRedemptionSelection(selection, finalSelection);
+  if (hasUnselectedUnresolvedRiskReservations(finalReservations, finalSelection)) {
+    return baseSummary("redemption_deferred_unrelated_unresolved_reservation", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
   }
 
   const control = {
@@ -181,6 +291,7 @@ async function run() {
     state: "prepared",
     run_id: runId,
     owner: account.address,
+    signer_address: account.address,
     funder: config.funderAddress,
     condition_ids: selection.selected.map((row) => row.condition_id),
     expected_gross_payout: selection.selected_gross_payout,
@@ -195,7 +306,7 @@ async function run() {
   let sent = false;
   try {
     const nonce = await relayerJson(`/nonce?address=${encodeURIComponent(account.address)}&type=WALLET`);
-    const deadline = Math.floor(Date.now() / 1000) + 240;
+    const deadline = Math.floor(Date.now() / 1000) + RELAYER_DEADLINE_BUFFER_SECONDS;
     const typedData = depositWalletTypedData(config.funderAddress, nonce.nonce, deadline, calls);
     const signature = await account.signTypedData(typedData);
     const request = depositWalletRequest(account.address, config.funderAddress, nonce.nonce, deadline, calls, signature);
@@ -215,7 +326,19 @@ async function run() {
       call_count: calls.length
     });
     sent = true;
-    const accepted = await relayerJson("/submit", { method: "POST", body: JSON.stringify(request) });
+    let accepted;
+    try {
+      accepted = await relayerJson("/submit", { method: "POST", body: JSON.stringify(request) });
+    } catch (error) {
+      if (Number(error.relayerHttpStatus) >= 400 && Number(error.relayerHttpStatus) < 500) {
+        control.state = "relayer_rejected";
+        control.relayer_http_status = Number(error.relayerHttpStatus);
+        control.relayer_error_detail = error.relayerSafeDetail || null;
+        control.updated_ts = new Date().toISOString();
+        await writeRedemptionControl(control);
+      }
+      throw error;
+    }
     if (!accepted?.transactionID) throw new Error("relayer accepted response did not contain transactionID");
     control.state = "relayer_accepted";
     control.transaction_id = accepted.transactionID;
@@ -245,11 +368,33 @@ async function run() {
     await clob.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType });
 
     const verified = await waitForSettlementVerification(clob, publicClient, selection, approvals, liquidBefore);
+    const reservationRecords = await loadCampaignRiskReservationRecords(config);
+    const settlementValues = await waitForAutomaticSettlementEvidence({
+      clob,
+      transactionHash: transaction.transactionHash,
+      receipt,
+      reservationRecords,
+      conditionIds: selection.selected.map((row) => row.condition_id)
+    });
+    if (settlementValues.length !== selection.selected.length ||
+        settlementValues.some((settlement) =>
+          !selection.selected.some((row) =>
+            row.condition_id.toLowerCase() === settlement.condition_id.toLowerCase()
+          ))) {
+      throw new Error("fail closed: automatic settlement does not match the exact redeemed condition set");
+    }
+    const settlements = [];
+    for (const settlement of settlementValues) {
+      settlements.push(await putVerifiedInternalSettlement(
+        storageContainer(config),
+        settlement
+      ));
+    }
     control.state = "confirmed_and_verified";
     control.liquid_collateral_after = verified.liquid_collateral_after;
     control.realized_payout = verified.realized_payout;
+    control.internal_settlement_blobs = settlements.map((row) => row.blob_name);
     control.updated_ts = new Date().toISOString();
-    await writeRedemptionControl(control);
     await settleProbeRiskReservations(config, {
       condition_ids: selection.selected.map((row) => row.condition_id),
       settlement_verified: true,
@@ -266,7 +411,12 @@ async function run() {
       terminal_portfolio: verified.portfolio,
       zero_open_orders_confirmed: verified.zero_open_orders_confirmed,
       evidence_source: "polymarket_data_api_plus_onchain_redemption"
+    }, {
+      reservationRecords,
+      matchedNotionalRecoveries: settlementValues.flatMap((row) =>
+        row.reservation_risk_recoveries || [])
     });
+    await writeRedemptionControl(control);
     ledger.record("venue_redemption_verified", verified);
     return {
       ...baseSummary("redeemed_and_verified", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, verified.portfolio),
@@ -275,7 +425,8 @@ async function run() {
       transaction_hash: transaction.transactionHash || null,
       liquid_collateral_after: verified.liquid_collateral_after,
       realized_payout: verified.realized_payout,
-      zero_open_orders_confirmed: verified.zero_open_orders_confirmed
+      zero_open_orders_confirmed: verified.zero_open_orders_confirmed,
+      internal_settlement_blobs: settlements.map((row) => row.blob_name)
     };
   } catch (error) {
     if (!sent) {
@@ -287,13 +438,468 @@ async function run() {
   }
 }
 
+async function recoverConfirmedRedemption({
+  account,
+  clob,
+  publicClient,
+  geoblock,
+  control,
+  liquidCollateral
+}) {
+  if (!confirmedRedemptionControlMatches(control, {
+    owner: account.address,
+    funder: config.funderAddress,
+    maxPayout: config.maxPayout,
+    maxConditions: config.maxConditions
+  })) {
+    throw new Error("fail closed: confirmed redemption control binding is invalid");
+  }
+  const container = storageContainer(config);
+  const evidencePrefix = redemptionEvidencePrefix();
+  const journalBlobName = canonicalRecoveryJournalBlobName(
+    evidencePrefix,
+    control.run_id
+  );
+  const existingJournal = await readJsonBlobIfExists(
+    container,
+    journalBlobName
+  );
+  if (existingJournal) {
+    validateCanonicalRecoveryJournal(existingJournal.value, {
+      account: account.address,
+      config,
+      control,
+      journalBlobName
+    });
+    await persistCanonicalRecoveryJournal(
+      container,
+      evidencePrefix,
+      existingJournal.value
+    );
+    await commitCanonicalRecoveryJournal(
+      container,
+      evidencePrefix,
+      existingJournal.value,
+      { writeControl: writeRedemptionControl }
+    );
+    return existingJournal.value.recovered_summary;
+  }
+  const transactionHash = String(control.transaction_hash).toLowerCase();
+  const conditionIds = control.condition_ids.map((value) => String(value).toLowerCase());
+  ledger.record("venue_redemption_recovery_started", {
+    prior_run_id: control.run_id,
+    transaction_id: control.transaction_id,
+    transaction_hash: transactionHash,
+    condition_ids: conditionIds
+  });
+
+  const receipt = await publicClient.waitForTransactionReceipt({
+    hash: transactionHash,
+    confirmations: 2,
+    timeout: 60_000
+  });
+  if (receipt.status !== "success") {
+    throw new Error("fail closed: confirmed redemption recovery receipt was not successful");
+  }
+  await clob.updateBalanceAllowance({
+    asset_type: AssetType.COLLATERAL,
+    signature_type: config.signatureType
+  });
+
+  const manifest = JSON.parse(config.fundedSessionManifestJson);
+  const reservationRecords = await loadCampaignRiskReservationRecords(config);
+  const durableSettlements = await loadDurableInternalSettlements(
+    container,
+    config.campaignId
+  );
+  const exactDurable = exactControlledSettlements(
+    durableSettlements,
+    transactionHash,
+    conditionIds
+  );
+  let settlementValues = exactDurable;
+  if (settlementValues.length !== conditionIds.length) {
+    const discovered = await waitForAutomaticSettlementEvidence({
+      clob,
+      transactionHash,
+      receipt,
+      reservationRecords,
+      conditionIds
+    });
+    settlementValues = exactControlledSettlements(
+      [...exactDurable, ...discovered],
+      transactionHash,
+      conditionIds
+    );
+  }
+  assertExactControlledSettlements(
+    settlementValues,
+    transactionHash,
+    conditionIds,
+    control.expected_gross_payout
+  );
+
+  const settlements = [];
+  for (const settlement of settlementValues) {
+    settlements.push(await putVerifiedInternalSettlement(container, settlement));
+  }
+  const verified = await waitForRecoveredSettlementState({
+    clob,
+    publicClient,
+    conditionIds,
+    settlementValues,
+    expectedApprovals: expectedRecoveredAdapterApprovals(
+      receipt,
+      config.funderAddress,
+      settlementValues.map((settlement) =>
+        settlement.redemption_adapter_address)
+    )
+  });
+  await settleProbeRiskReservations(config, {
+    condition_ids: conditionIds,
+    settlement_verified: true,
+    trust_boundary_ready: config.trustBoundaryReady,
+    transaction_hash: transactionHash,
+    polygon_chain_id: polygon.id,
+    transaction_receipt_status: receipt.status,
+    transaction_block_number: receipt.blockNumber.toString(),
+    transaction_receipt_confirmations: 2,
+    settlement_wallet: config.funderAddress,
+    settlement_signer: account.address,
+    run_id: runId,
+    settled_ts: new Date().toISOString(),
+    zero_open_orders_confirmed: true,
+    evidence_source: "polymarket_data_api_plus_onchain_redemption"
+  }, {
+    reservationRecords,
+    matchedNotionalRecoveries: settlementValues.flatMap((row) =>
+      row.reservation_risk_recoveries || [])
+  });
+
+  const finishedTs = new Date().toISOString();
+  const recoverySummaryBlobName = redemptionArchiveBlobName(
+    evidencePrefix,
+    finishedTs,
+    runId
+  );
+  const recoveredSummary = {
+    schema_version: 1,
+    run_id: runId,
+    status: "recovered_confirmed_and_verified",
+    finished_ts: finishedTs,
+    execution_origin: config.executionOrigin,
+    execution_country: geoblock.country,
+    static_egress_verified: geoblock.ip === config.expectedEgressIp,
+    dry_run: false,
+    redemption_enabled: true,
+    owner: account.address,
+    funder: config.funderAddress,
+    wallet_type: "legacy_uups_deposit_wallet",
+    derived_wallet_match: true,
+    liquid_collateral_before: liquidCollateral,
+    liquid_collateral_after: verified.liquid_collateral_after,
+    realized_payout: verified.realized_payout,
+    selection: {
+      selected: settlementValues.map((settlement) => ({
+        condition_id: settlement.condition_id,
+        gross_payout: settlement.payout
+      })),
+      selected_gross_payout: verified.realized_payout,
+      payout_source: "decoded_confirmed_recovery_receipt"
+    },
+    recent_redemptions: [],
+    portfolio: verified.portfolio,
+    approvals: verified.approvals,
+    planned_calls: [],
+    zero_open_orders_confirmed: true,
+    redemption_submitted: true,
+    new_submission_attempted: false,
+    confirmed_transaction_reused: true,
+    predecessor_run_id: control.run_id,
+    recovery_journal_blob_name: journalBlobName,
+    transaction_id: control.transaction_id,
+    transaction_hash: transactionHash,
+    internal_settlement_blobs: settlements.map((row) => row.blob_name),
+    research_only: false,
+    live_strategy_enabled: true
+  };
+  const finalizedControl = {
+    ...control,
+    state: "confirmed_and_verified",
+    recovery_run_id: runId,
+    recovery_journal_blob_name: journalBlobName,
+    recovery_summary_blob_name: recoverySummaryBlobName,
+    recovery_summary_sha256: sha256(jsonPayload(recoveredSummary)),
+    recovery_publication_complete: true,
+    liquid_collateral_after: verified.liquid_collateral_after,
+    realized_payout: verified.realized_payout,
+    internal_settlement_blobs: settlements.map((row) => row.blob_name),
+    updated_ts: finishedTs
+  };
+  const journal = {
+    schema_version: 1,
+    type: "redemption_recovery_journal",
+    predecessor_run_id: control.run_id,
+    recovery_run_id: runId,
+    recovery_journal_blob_name: journalBlobName,
+    finalized_control: finalizedControl,
+    recovered_summary: recoveredSummary
+  };
+  await persistCanonicalRecoveryJournal(container, evidencePrefix, journal);
+  await commitCanonicalRecoveryJournal(
+    container,
+    evidencePrefix,
+    journal,
+    { writeControl: writeRedemptionControl }
+  );
+  ledger.record("venue_redemption_recovery_verified", {
+    prior_run_id: control.run_id,
+    transaction_hash: transactionHash,
+    condition_ids: conditionIds,
+    realized_payout: verified.realized_payout,
+    zero_open_orders_confirmed: true
+  });
+  return recoveredSummary;
+}
+
+async function resumeCanonicalRecovery({ account, control }) {
+  const container = storageContainer(config);
+  const prefix = redemptionEvidencePrefix();
+  const journalBlobName = canonicalRecoveryJournalBlobName(
+    prefix,
+    control.run_id
+  );
+  if (control.recovery_journal_blob_name !== journalBlobName) {
+    throw new Error("fail closed: mutable recovery journal binding is invalid");
+  }
+  const existing = await readJsonBlobIfExists(container, journalBlobName);
+  if (!existing) {
+    throw new Error("fail closed: canonical recovery journal is missing");
+  }
+  validateCanonicalRecoveryJournal(existing.value, {
+    account: account.address,
+    config,
+    control,
+    journalBlobName
+  });
+  await persistCanonicalRecoveryJournal(container, prefix, existing.value);
+  if (control.state === "confirmed_and_verified" &&
+      control.recovery_publication_complete === true) {
+    const publication = await commitCanonicalRecoveryJournal(
+      container,
+      prefix,
+      existing.value,
+      { writeControl: writeRedemptionControl, finalizedResume: true }
+    );
+    return publication.repaired ? existing.value.recovered_summary : null;
+  }
+  await commitCanonicalRecoveryJournal(
+    container,
+    prefix,
+    existing.value,
+    { writeControl: writeRedemptionControl }
+  );
+  return existing.value.recovered_summary;
+}
+
+export function confirmedRedemptionControlMatches(control, {
+  owner,
+  funder,
+  maxPayout,
+  maxConditions = 5
+}) {
+  const conditions = Array.isArray(control?.condition_ids)
+    ? control.condition_ids.map((value) => String(value).toLowerCase())
+    : [];
+  const expectedOwner = String(owner || "").toLowerCase();
+  const storedOwner = String(control?.owner || "").toLowerCase();
+  const storedSigner = String(control?.signer_address || "").toLowerCase();
+  const signerBound = storedSigner
+    ? storedSigner === expectedOwner && /^0x[0-9a-f]{40}$/.test(storedSigner)
+    : control?.schema_version === 1 && control?.owner === "[REDACTED]";
+  const expectedGrossPayout = Number(control?.expected_gross_payout);
+  const payoutWithinConfiguredLimit = Number.isFinite(expectedGrossPayout) &&
+    expectedGrossPayout > 0 &&
+    (!hasPayoutCap(maxPayout) || expectedGrossPayout <= Number(maxPayout) + 1e-9);
+  return control?.state === "confirmed_pending_verification" &&
+    control?.submission_attempted === true &&
+    typeof control?.run_id === "string" &&
+    control.run_id.startsWith("venue-redemption-") &&
+    typeof control?.transaction_id === "string" &&
+    control.transaction_id.length > 0 &&
+    /^0x[0-9a-f]{64}$/.test(String(control?.transaction_hash || "").toLowerCase()) &&
+    signerBound &&
+    (storedOwner === expectedOwner || control?.owner === "[REDACTED]") &&
+    String(control?.funder || "").toLowerCase() === String(funder || "").toLowerCase() &&
+    /^0x[0-9a-f]{40}$/.test(String(control?.funder || "").toLowerCase()) &&
+    conditions.length > 0 &&
+    conditions.length <= Number(maxConditions) &&
+    new Set(conditions).size === conditions.length &&
+    conditions.every((value) => /^0x[0-9a-f]{64}$/.test(value)) &&
+    payoutWithinConfiguredLimit &&
+    Number.isFinite(Date.parse(String(control?.created_ts || ""))) &&
+    Number.isFinite(Date.parse(String(control?.updated_ts || "")));
+}
+
+function exactControlledSettlements(settlements, transactionHash, conditionIds) {
+  const expectedConditions = new Set(conditionIds.map((value) => String(value).toLowerCase()));
+  return (Array.isArray(settlements) ? settlements : []).filter((settlement) =>
+    String(settlement?.transaction_hash || "").toLowerCase() === transactionHash &&
+    expectedConditions.has(String(settlement?.condition_id || "").toLowerCase())
+  );
+}
+
+function assertExactControlledSettlements(
+  settlements,
+  transactionHash,
+  conditionIds,
+  expectedPayout
+) {
+  const identities = settlements.map((settlement) =>
+    `${String(settlement?.transaction_hash || "").toLowerCase()}:` +
+    String(settlement?.condition_id || "").toLowerCase()
+  );
+  const conditions = settlements.map((settlement) =>
+    String(settlement?.condition_id || "").toLowerCase()
+  ).sort();
+  const expectedConditions = conditionIds.map((value) => String(value).toLowerCase()).sort();
+  const payout = settlements.reduce((total, settlement) =>
+    total + Number(settlement?.payout || 0), 0);
+  if (settlements.length !== expectedConditions.length ||
+      new Set(identities).size !== identities.length ||
+      identities.some((identity) => !identity.startsWith(`${transactionHash}:`)) ||
+      JSON.stringify(conditions) !== JSON.stringify(expectedConditions) ||
+      Math.abs(payout - Number(expectedPayout)) > 0.01) {
+    throw new Error("fail closed: recovered settlement does not match the exact durable control");
+  }
+}
+
+async function waitForRecoveredSettlementState({
+  clob,
+  publicClient,
+  conditionIds,
+  settlementValues,
+  expectedApprovals
+}) {
+  const selected = new Set(conditionIds.map((value) => String(value).toLowerCase()));
+  const tokenIds = [...new Set(settlementValues.flatMap((settlement) =>
+    settlement.token_ids || []
+  ))].map(BigInt);
+  const adapters = [...new Set(settlementValues.map((settlement) =>
+    String(settlement.redemption_adapter_address || "")
+  ))];
+  if (!tokenIds.length || !adapters.length) {
+    throw new Error("fail closed: recovered settlement token or adapter binding is unavailable");
+  }
+  if (adapters.some((adapter) =>
+    typeof expectedApprovals?.[adapter.toLowerCase()] !== "boolean")) {
+    throw new Error("fail closed: recovered settlement approval history is unavailable");
+  }
+  const deadline = Date.now() + 120_000;
+  while (Date.now() < deadline) {
+    const [positions, balance, openOrders, onchainLiquid, tokenBalances, approvals] =
+      await Promise.all([
+        fetchPositions(),
+        clob.getBalanceAllowance({
+          asset_type: AssetType.COLLATERAL,
+          signature_type: config.signatureType
+        }),
+        clob.getOpenOrders(undefined, true),
+        readPusdBalance(publicClient),
+        Promise.all(tokenIds.map((assetId) =>
+          readConditionalBalance(publicClient, assetId))),
+        Promise.all(adapters.map((adapter) =>
+          readAdapterApproval(publicClient, adapter)))
+      ]);
+    if (!Array.isArray(openOrders)) {
+      throw new Error("fail closed: recovered redemption open-order response is not an array");
+    }
+    const remaining = positions.filter((row) =>
+      row.redeemable === true &&
+      Number(row.currentValue || 0) > 0 &&
+      selected.has(String(row.conditionId || "").toLowerCase())
+    );
+    const liquidAfter = Number(formatUnits(BigInt(balance.balance || "0"), 6));
+    if (!remaining.length &&
+        Math.abs(liquidAfter - onchainLiquid) <= 0.000001 &&
+        tokenBalances.every((value) => value === 0n) &&
+        approvals.every((value, index) =>
+          value === expectedApprovals[adapters[index].toLowerCase()]) &&
+        openOrders.length === 0) {
+      return {
+        liquid_collateral_after: onchainLiquid,
+        realized_payout: Math.round(settlementValues.reduce(
+          (total, settlement) => total + Number(settlement.payout),
+          0
+        ) * 1_000_000) / 1_000_000,
+        zero_open_orders_confirmed: true,
+        conditional_token_balances_zero: true,
+        approvals: Object.fromEntries(adapters.map((adapter, index) => [
+          adapter.toLowerCase(),
+          approvals[index]
+        ])),
+        portfolio: {
+          ...summarizePortfolio(positions, onchainLiquid, config.startingCapital),
+          captured_ts: new Date().toISOString()
+        }
+      };
+    }
+    await sleep(2_000);
+  }
+  throw new Error("fail closed: confirmed redemption recovery did not reconcile account state");
+}
+
+export function expectedRecoveredAdapterApprovals(receipt, wallet, adapters) {
+  const expectedWallet = String(wallet || "").toLowerCase();
+  const expectedAdapters = [...new Set((adapters || []).map((adapter) =>
+    String(adapter || "").toLowerCase()
+  ))];
+  if (!Array.isArray(receipt?.logs) ||
+      !/^0x[0-9a-f]{40}$/.test(expectedWallet) ||
+      !expectedAdapters.length ||
+      expectedAdapters.some((adapter) => !/^0x[0-9a-f]{40}$/.test(adapter))) {
+    throw new Error("fail closed: recovered adapter approval binding is invalid");
+  }
+  const changes = new Map(expectedAdapters.map((adapter) => [adapter, []]));
+  for (const log of receipt.logs) {
+    if (String(log?.address || "").toLowerCase() !== CONDITIONAL_TOKENS.toLowerCase() ||
+        String(log?.topics?.[0] || "").toLowerCase() !== APPROVAL_FOR_ALL_TOPIC) {
+      continue;
+    }
+    const args = decodeEventLog({
+      abi: APPROVAL_FOR_ALL_EVENT,
+      data: log.data,
+      topics: log.topics,
+      strict: true
+    }).args || {};
+    if (String(args.account || "").toLowerCase() !== expectedWallet) continue;
+    const operator = String(args.operator || "").toLowerCase();
+    if (!changes.has(operator)) {
+      throw new Error("fail closed: redemption changed an unexpected adapter approval");
+    }
+    changes.get(operator).push(args.approved === true);
+  }
+  return Object.fromEntries(expectedAdapters.map((adapter) => {
+    const values = changes.get(adapter);
+    if (!values.length) {
+      // A successful adapter redemption with no ApprovalForAll event means
+      // the wallet was already approved and the batch left it unchanged.
+      return [adapter, true];
+    }
+    if (values.length === 2 && values[0] === true && values[1] === false) {
+      return [adapter, false];
+    }
+    throw new Error("fail closed: redemption adapter approval sequence is invalid");
+  }));
+}
+
 function baseSummary(status, geoblock, owner, liquidBefore, selection, approvals, calls, recentRedemptions = [], portfolio = null) {
   return {
     schema_version: 1,
     run_id: runId,
     status,
     finished_ts: new Date().toISOString(),
-    execution_origin: "azure_north_europe_static_egress",
+    execution_origin: config.executionOrigin,
     execution_country: geoblock.country,
     static_egress_verified: geoblock.ip === config.expectedEgressIp,
     dry_run: config.dryRun,
@@ -315,8 +921,8 @@ function baseSummary(status, geoblock, owner, liquidBefore, selection, approvals
     })),
     zero_open_orders_confirmed: true,
     redemption_submitted: false,
-    research_only: true,
-    live_strategy_enabled: false
+    research_only: !config.fundedServiceManaged,
+    live_strategy_enabled: config.fundedServiceManaged
   };
 }
 
@@ -345,7 +951,159 @@ async function adapterApprovals(publicClient, selection) {
   return result;
 }
 
-async function validateOnchainSelection(publicClient, selection) {
+export async function discoverOnchainRedeemableConditions(
+  publicClient,
+  positions,
+  {
+    funderAddress = config?.funderAddress,
+    maxPayout = config ? config.maxPayout : 25,
+    maxConditions = config?.maxConditions ?? 5
+  } = {}
+) {
+  // Data API identifies candidates; chain state below determines eligibility and payout.
+  const discovered = selectRedeemableConditions(
+    (Array.isArray(positions) ? positions : []).map((row) =>
+      row?.redeemable === true ? { ...row, currentValue: 1 } : row
+    ),
+    null,
+    Number.MAX_SAFE_INTEGER
+  );
+  const validated = await validateOnchainSelection(publicClient, discovered, {
+    funderAddress,
+    maxPayout,
+    maxConditions
+  });
+  return {
+    ...validated,
+    selected: validated.selected.map((row) => {
+      const bindings = positions.flatMap((position) =>
+        String(position?.conditionId || "").toLowerCase() === row.condition_id.toLowerCase()
+          ? position.riskReservationBindings || []
+          : []);
+      return bindings.length ? {
+        ...row,
+        candidate_source: "durable_unresolved_reservation_plus_resolved_gamma",
+        risk_reservation_bindings: bindings
+      } : row;
+    })
+  };
+}
+
+export async function augmentRedeemableCandidatesFromRiskReservations(
+  positions,
+  records,
+  { enabled = false, fetchMarket = fetchGammaMarket } = {}
+) {
+  if (!Array.isArray(positions) || !Array.isArray(records)) {
+    throw new Error("fail closed: redemption candidate inputs are unavailable");
+  }
+  if (!enabled) return [...positions];
+  const candidates = [...positions];
+  for (const record of records) {
+    const reservation = record?.reservation;
+    if (reservation?.state !== "position_unresolved") continue;
+    if (reservation?.schema_version !== 1 || reservation?.evidence_protocol_version !== 3 ||
+        !(Number(reservation?.matched_notional) > 0) || reservation?.reconciliation_complete !== true ||
+        reservation?.zero_open_orders_confirmed !== true ||
+        !/^0x[0-9a-f]{64}$/i.test(String(reservation?.condition_id || "")) ||
+        !/^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || "")) ||
+        !/^[1-9]\d{0,77}$/.test(String(reservation?.token_id || "")) ||
+        !/^[1-9]\d*$/.test(String(reservation?.market_id || "")) || !String(reservation?.run_id || "") ||
+        !String(reservation?.probe_id || "") ||
+        !/^sha256:[0-9a-f]{64}$/.test(String(record?.reservation_sha256 || "")) ||
+        !String(record?.blob_name || "").endsWith(`/${reservation.probe_id}.json`)) {
+      throw new Error("fail closed: unresolved redemption reservation binding is invalid");
+    }
+    const exact = candidates.filter((row) =>
+      String(row?.conditionId || "").toLowerCase() === reservation.condition_id.toLowerCase() &&
+      String(row?.asset || "") === String(reservation.token_id));
+    if (exact.length > 1) throw new Error("fail closed: Data API returned duplicate exact redemption positions");
+    if (exact.length === 1) continue;
+
+    const market = await fetchMarket(String(reservation.market_id));
+    const tokenIds = jsonArray(market?.clobTokenIds).map(String);
+    const outcomes = jsonArray(market?.outcomes).map(String);
+    const prices = jsonArray(market?.outcomePrices).map(Number);
+    const outcomeIndex = tokenIds.indexOf(String(reservation.token_id));
+    if (String(market?.id || "") !== String(reservation.market_id) ||
+        String(market?.conditionId || "").toLowerCase() !== reservation.condition_id.toLowerCase()) {
+      throw new Error("fail closed: Gamma market ID or condition does not match the unresolved reservation");
+    }
+    if (market?.closed !== true || market?.acceptingOrders !== false ||
+        market?.umaResolutionStatus !== "resolved" ||
+        typeof market?.negRisk !== "boolean" || tokenIds.length !== 2 || outcomes.length !== 2 ||
+        prices.length !== 2 || new Set(tokenIds).size !== 2) {
+      throw new Error("fail closed: Gamma market is not an exact resolved binary market");
+    }
+    if (outcomeIndex < 0 || prices[outcomeIndex] !== 1 || prices[1 - outcomeIndex] !== 0) {
+      throw new Error("fail closed: Gamma market does not bind the unresolved reservation to the winning token");
+    }
+    // ponytail: currentValue only admits the candidate; chain balance and payout vector remain authoritative.
+    candidates.push({
+      conditionId: reservation.condition_id,
+      redeemable: true,
+      currentValue: 1,
+      initialValue: Number(reservation.matched_notional),
+      negativeRisk: market.negRisk,
+      title: market.question || market.title || null,
+      asset: reservation.token_id,
+      oppositeAsset: tokenIds[1 - outcomeIndex],
+      outcomeIndex,
+      riskReservationBindings: [{
+        blob_name: record.blob_name,
+        sha256: record.reservation_sha256,
+        run_id: reservation.run_id,
+        probe_id: reservation.probe_id,
+        order_id: reservation.order_id,
+        matched_notional: Number(reservation.matched_notional)
+      }]
+    });
+  }
+  return candidates;
+}
+
+export function assertStableRedemptionSelection(initial, final) {
+  if (JSON.stringify(final?.selected) !== JSON.stringify(initial?.selected)) {
+    throw new Error("fail closed: redeemable position set changed after preflight");
+  }
+}
+
+export function hasUnselectedUnresolvedRiskReservations(records, selection) {
+  const selected = new Set((selection?.selected || []).map((row) => String(row.condition_id || "").toLowerCase()));
+  return (records || []).some((record) =>
+    !selected.has(String(record?.reservation?.condition_id || "").toLowerCase()));
+}
+
+export async function fetchGammaMarket(marketId, { fetchImpl = fetch } = {}) {
+  if (!/^[1-9]\d*$/.test(String(marketId || ""))) {
+    throw new Error("fail closed: Gamma market ID is invalid");
+  }
+  const response = await fetchImpl(`https://gamma-api.polymarket.com/markets/${marketId}`, {
+    signal: AbortSignal.timeout(10_000)
+  });
+  if (!response.ok) throw new Error(`fail closed: Gamma market lookup failed (${response.status})`);
+  const market = await response.json();
+  if (!market || typeof market !== "object" || Array.isArray(market)) {
+    throw new Error("fail closed: Gamma exact-market response is invalid");
+  }
+  return market;
+}
+
+function jsonArray(value) {
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function validateOnchainSelection(publicClient, selection, {
+  funderAddress,
+  maxPayout,
+  maxConditions
+}) {
   const ctfAbi = [
     {
       type: "function", name: "getCollectionId", stateMutability: "view",
@@ -383,9 +1141,7 @@ async function validateOnchainSelection(publicClient, selection) {
         functionName: "WRAPPED_COLLATERAL"
       })
     : null;
-  const rows = [];
-  let totalPayout = 0;
-  for (const row of selection.selected) {
+  const rows = (await Promise.all(selection.selected.map(async (row) => {
     if (!Array.isArray(row.assets) || row.assets.length !== 2 ||
         row.assets.some((asset, index) => asset.outcome_index !== index || !/^\d+$/.test(asset.asset))) {
       throw new Error(`fail closed: complete two-outcome asset metadata is required for ${row.condition_id}`);
@@ -412,22 +1168,19 @@ async function validateOnchainSelection(publicClient, selection) {
         address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "payoutNumerators", args: [row.condition_id, index]
       }))),
       Promise.all(derivedAssets.map((asset) => publicClient.readContract({
-        address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "balanceOf", args: [config.funderAddress, asset]
+        address: CONDITIONAL_TOKENS, abi: ctfAbi, functionName: "balanceOf", args: [funderAddress, asset]
       })))
     ]);
-    if (denominator === 0n) throw new Error(`fail closed: condition is not resolved onchain (${row.condition_id})`);
+    if (denominator === 0n) return null;
     const payoutBaseUnits = balances.reduce(
       (sum, balance, index) => sum + (balance * numerators[index]) / denominator,
       0n
     );
     const expectedPayout = Number(formatUnits(payoutBaseUnits, 6));
-    if (!(expectedPayout > 0)) throw new Error(`fail closed: selected condition has no positive onchain payout (${row.condition_id})`);
-    if (Math.abs(expectedPayout - row.gross_payout) > 0.01) {
-      throw new Error(`fail closed: Data API payout disagrees with onchain payout for ${row.condition_id}`);
-    }
-    totalPayout += expectedPayout;
-    rows.push({
+    if (!(expectedPayout > 0)) return null;
+    return {
       ...row,
+      gross_payout: expectedPayout,
       adapter: row.negative_risk ? NEG_RISK_CTF_COLLATERAL_ADAPTER : CTF_COLLATERAL_ADAPTER,
       underlying_collateral: collateral,
       asset_ids: derivedAssets.map(String),
@@ -435,15 +1188,24 @@ async function validateOnchainSelection(publicClient, selection) {
       payout_numerators: numerators.map(String),
       payout_denominator: String(denominator),
       onchain_expected_payout: expectedPayout
-    });
-  }
-  if (totalPayout > config.maxPayout + 1e-9) {
-    throw new Error(`fail closed: exact onchain payout ${totalPayout} exceeds the configured redemption cap`);
+    };
+  }))).filter(Boolean);
+  const selected = [];
+  let totalPayout = 0;
+  for (const row of rows) {
+    if (selected.length >= Number(maxConditions)) break;
+    if (hasPayoutCap(maxPayout) && totalPayout + row.gross_payout > Number(maxPayout) + 1e-9) {
+      continue;
+    }
+    selected.push(row);
+    totalPayout += row.gross_payout;
   }
   return {
     ...selection,
-    selected: rows,
+    selected,
     selected_gross_payout: Math.round(totalPayout * 1_000_000) / 1_000_000,
+    available_winner_conditions: rows.length,
+    skipped_winner_conditions: rows.length - selected.length,
     payout_source: "onchain_balances_and_payout_vector"
   };
 }
@@ -501,8 +1263,46 @@ async function relayerJson(path, options = {}) {
   const body = await response.text();
   let value;
   try { value = body ? JSON.parse(body) : null; } catch { value = null; }
-  if (!response.ok) throw new Error(`relayer ${path.split("?")[0]} returned HTTP ${response.status}`);
+  if (!response.ok) {
+    const detail = safeRelayerErrorDetail(value ?? body, [
+      config.relayerApiKey,
+      config.apiSecret,
+      config.apiPassphrase,
+      config.privateKey
+    ]);
+    const error = new Error(
+      `relayer ${path.split("?")[0]} returned HTTP ${response.status}` +
+      (detail ? ` (${detail})` : "")
+    );
+    error.relayerHttpStatus = response.status;
+    error.relayerSafeDetail = detail;
+    throw error;
+  }
   return value;
+}
+
+export function safeRelayerErrorDetail(value, secrets = []) {
+  let detail = "";
+  if (typeof value === "string") {
+    detail = value;
+  } else if (value && typeof value === "object") {
+    for (const key of ["code", "error", "message", "reason", "detail"]) {
+      if (typeof value[key] === "string" && value[key].trim()) {
+        detail = `${key}=${value[key]}`;
+        break;
+      }
+    }
+  }
+  detail = detail.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  for (const secret of secrets) {
+    if (typeof secret === "string" && secret.length >= 8) {
+      detail = detail.split(secret).join("[redacted]");
+    }
+  }
+  return detail
+    .replace(/0x[0-9a-fA-F]{64,}/g, "[hex-redacted]")
+    .replace(/[A-Za-z0-9+/=_-]{48,}/g, "[token-redacted]")
+    .slice(0, 500);
 }
 
 async function validateRelayerCredential() {
@@ -578,6 +1378,93 @@ async function waitForSettlementVerification(clob, publicClient, selection, init
   throw new Error("fail closed: confirmed relayer redemption did not reconcile in Data API/CLOB before timeout");
 }
 
+async function waitForAutomaticSettlementEvidence({
+  clob,
+  transactionHash,
+  receipt,
+  reservationRecords,
+  conditionIds
+}) {
+  const container = storageContainer(config);
+  const manifest = JSON.parse(config.fundedSessionManifestJson);
+  const expectedTransactionHash = String(transactionHash).toLowerCase();
+  const expectedConditions = new Set((conditionIds || []).map((value) =>
+    String(value).toLowerCase()
+  ));
+  if (!/^0x[0-9a-f]{64}$/.test(expectedTransactionHash) ||
+      !expectedConditions.size ||
+      [...expectedConditions].some((value) => !/^0x[0-9a-f]{64}$/.test(value))) {
+    throw new Error("fail closed: automatic settlement control binding is invalid");
+  }
+  const deadline = Date.now() + 120_000;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    try {
+      const durableSettlements = await loadDurableInternalSettlements(
+        container,
+        config.campaignId
+      );
+      const settlements = await discoverVerifiedAutomaticInternalSettlements({
+        manifest,
+        reservations: reservationRecords.map((record) => record.reservation),
+        activity: (await fetchActivity()).filter((row) =>
+          String(row?.type || "").toUpperCase() !== "REDEEM" ||
+          (
+            String(row?.transactionHash || "").toLowerCase() === expectedTransactionHash &&
+            expectedConditions.has(String(row?.conditionId || "").toLowerCase())
+          )
+        ),
+        durableSettlements,
+        expectedWallet: config.funderAddress,
+        getOrderFills: async (reservation) => {
+          const trades = await clob.getTrades({ market: reservation.condition_id });
+          if (!Array.isArray(trades)) {
+            throw new Error("fail closed: authenticated CLOB trade history is invalid");
+          }
+          return tradeFillsFromRest(trades, reservation.order_id);
+        },
+        getTransactionReceipt: async (hash) => {
+          if (String(hash).toLowerCase() !== expectedTransactionHash) {
+            throw new Error("fail closed: automatic settlement receipt hash is not the submitted redemption");
+          }
+          return automaticSettlementReceiptEvidence(receipt, transactionHash);
+        }
+      });
+      if (settlements.length) return settlements;
+      lastError = new Error("automatic settlement activity is not visible yet");
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(2_000);
+  }
+  throw new Error(`fail closed: automatic settlement evidence did not reconcile (${lastError?.message || "unknown"})`);
+}
+
+export function automaticSettlementReceiptEvidence(
+  receipt,
+  transactionHash,
+  confirmations = 2
+) {
+  const decoded = decodeSettlementReceiptEvidence(receipt, transactionHash);
+  const blockNumber = BigInt(receipt?.blockNumber ?? 0);
+  const normalizedHash = String(transactionHash || "").toLowerCase();
+  if (receipt?.status !== "success" ||
+      !/^0x[0-9a-f]{64}$/.test(normalizedHash) ||
+      blockNumber <= 0n ||
+      !Number.isInteger(Number(confirmations)) ||
+      Number(confirmations) < 2) {
+    throw new Error("fail closed: automatic settlement receipt confirmation is invalid");
+  }
+  return {
+    status: "success",
+    chain_id: polygon.id,
+    transaction_hash: normalizedHash,
+    block_number: blockNumber.toString(),
+    confirmations: Number(confirmations),
+    ...decoded
+  };
+}
+
 async function readPusdBalance(publicClient) {
   const value = await publicClient.readContract({
     address: PUSD,
@@ -626,7 +1513,7 @@ async function readAdapterApproval(publicClient, adapter) {
 
 async function readRedemptionControl() {
   const container = storageContainer(config);
-  const blob = container.getBlobClient("reports/research/venue-probe/control/redemption-state.json");
+  const blob = container.getBlobClient(redemptionControlBlobName());
   try {
     const response = await blob.download();
     return JSON.parse(await streamToString(response.readableStreamBody));
@@ -636,24 +1523,460 @@ async function readRedemptionControl() {
   }
 }
 
+async function readRedemptionEvidenceForControl(control) {
+  const createdMs = Date.parse(String(control?.created_ts || ""));
+  if (!control?.run_id || !Number.isFinite(createdMs)) return null;
+  const date = new Date(createdMs).toISOString().slice(0, 10);
+  const container = storageContainer(config);
+  const blob = container.getBlobClient(
+    `${redemptionEvidencePrefix()}/redemptions/${date}/${control.run_id}.json`
+  );
+  try {
+    const response = await blob.download();
+    return JSON.parse(await streamToString(response.readableStreamBody));
+  } catch (error) {
+    if (Number(error.statusCode) === 404) return null;
+    throw error;
+  }
+}
+
+async function reconcilePriorRejectedSubmission(control, selection) {
+  if (!control || control.state !== "submission_attempted" || control.transaction_id) {
+    return control;
+  }
+  const evidence = await readRedemptionEvidenceForControl(control);
+  if (!rejectedRelayerSubmissionMatches(control, evidence, selection)) {
+    return control;
+  }
+  const reconciled = {
+    ...control,
+    state: "relayer_rejected",
+    relayer_http_status: Number(
+      String(evidence.error).match(/HTTP (4\d\d)/)?.[1]
+    ),
+    relayer_error_detail: "reconciled_from_immutable_failed_submission_evidence",
+    updated_ts: new Date().toISOString()
+  };
+  await writeRedemptionControl(reconciled);
+  ledger.record("venue_redemption_prior_rejection_reconciled", {
+    run_id: control.run_id,
+    condition_ids: control.condition_ids,
+    relayer_http_status: reconciled.relayer_http_status
+  });
+  return reconciled;
+}
+
+export function rejectedRelayerSubmissionMatches(control, evidence, selection) {
+  if (control?.state !== "submission_attempted" ||
+      control?.transaction_id ||
+      evidence?.run_id !== control.run_id ||
+      evidence?.status !== "failed_closed" ||
+      evidence?.redemption_submitted !== true ||
+      !/^relayer \/submit returned HTTP 4\d\d(?:\s|\(|$)/.test(String(evidence?.error || ""))) {
+    return false;
+  }
+  const expectedConditions = [...new Set(
+    (control.condition_ids || []).map((value) => String(value).toLowerCase())
+  )].sort();
+  const currentConditions = [...new Set(
+    (selection?.selected || []).map((value) => String(value.condition_id).toLowerCase())
+  )].sort();
+  return expectedConditions.length > 0 &&
+    JSON.stringify(expectedConditions) === JSON.stringify(currentConditions) &&
+    Math.abs(
+      Number(control.expected_gross_payout) -
+      Number(selection?.selected_gross_payout)
+    ) <= 0.000001;
+}
+
 async function writeRedemptionControl(value) {
   const container = storageContainer(config);
-  await container.getBlockBlobClient("reports/research/venue-probe/control/redemption-state.json").uploadData(
+  await container.getBlockBlobClient(redemptionControlBlobName()).uploadData(
     Buffer.from(JSON.stringify(sanitize(value), null, 2)),
     { blobHTTPHeaders: { blobContentType: "application/json" } }
   );
 }
 
+function canonicalRecoveryJournalBlobName(prefix, predecessorRunId) {
+  return `${prefix}/recovery-controls/${predecessorRunId}.json`;
+}
+
+function redemptionArchiveBlobName(prefix, finishedTs, recoveryRunId) {
+  return `${prefix}/redemptions/${String(finishedTs).slice(0, 10)}/${recoveryRunId}.json`;
+}
+
+function jsonPayload(value) {
+  return Buffer.from(JSON.stringify(sanitize(value), null, 2));
+}
+
+async function readBlobBytesIfExists(blob) {
+  try {
+    const response = await blob.download();
+    return Buffer.from(await streamToString(response.readableStreamBody), "utf8");
+  } catch (error) {
+    if (Number(error?.statusCode) === 404) return null;
+    throw error;
+  }
+}
+
+async function readJsonBlobIfExists(container, blobName) {
+  const payload = await readBlobBytesIfExists(
+    container.getBlockBlobClient(blobName)
+  );
+  if (!payload) return null;
+  let value;
+  try {
+    value = JSON.parse(payload.toString("utf8"));
+  } catch {
+    throw new Error("fail closed: canonical recovery journal is not valid JSON");
+  }
+  return { payload, value };
+}
+
+const IMMUTABLE_WRITE_OUTCOME = Object.freeze({
+  NOT_OWNED: "not_owned",
+  ACCEPTED_OWNED: "accepted_owned",
+  COLLISION_OWNED: "collision_owned",
+  UNKNOWN_MAY_OWN: "unknown_may_own"
+});
+const IMMUTABLE_WRITE_READBACK_ATTEMPTS = 3;
+
+function immutableWriteError(message, outcome, cause = undefined) {
+  const error = new Error(message, cause ? { cause } : undefined);
+  error.immutableWriteOutcome = outcome;
+  return error;
+}
+
+function isKnownPreWriteFailure(error) {
+  return error?.immutableWriteOutcome === IMMUTABLE_WRITE_OUTCOME.NOT_OWNED ||
+    [400, 401, 403, 404].includes(Number(error?.statusCode));
+}
+
+async function readImmutableWriteResult(blob) {
+  let lastError;
+  for (let attempt = 0; attempt < IMMUTABLE_WRITE_READBACK_ATTEMPTS; attempt += 1) {
+    try {
+      return {
+        determinate: true,
+        payload: await readBlobBytesIfExists(blob)
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return { determinate: false, error: lastError };
+}
+
+async function putImmutableJsonExact(container, blobName, value, label) {
+  const payload = jsonPayload(value);
+  const blob = container.getBlockBlobClient(blobName);
+  let created = false;
+  try {
+    await blob.uploadData(payload, {
+      conditions: { ifNoneMatch: "*" },
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    created = true;
+  } catch (error) {
+    const readback = await readImmutableWriteResult(blob);
+    if (readback.determinate && readback.payload?.equals(payload)) {
+      return {
+        blob_name: blobName,
+        sha256: sha256(payload),
+        created: false,
+        immutable_write_outcome: IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED
+      };
+    }
+    if (readback.determinate && readback.payload) {
+      throw immutableWriteError(
+        `fail closed: immutable ${label} collision`,
+        IMMUTABLE_WRITE_OUTCOME.COLLISION_OWNED,
+        error
+      );
+    }
+    if (readback.determinate || isKnownPreWriteFailure(error)) {
+      throw immutableWriteError(
+        String(error?.message || `immutable ${label} upload failed before write`),
+        IMMUTABLE_WRITE_OUTCOME.NOT_OWNED,
+        error
+      );
+    }
+    throw immutableWriteError(
+      `fail closed: immutable ${label} upload outcome is indeterminate after ` +
+        `${IMMUTABLE_WRITE_READBACK_ATTEMPTS} read-back attempts`,
+      IMMUTABLE_WRITE_OUTCOME.UNKNOWN_MAY_OWN,
+      error
+    );
+  }
+  let verifiedPayload;
+  try {
+    verifiedPayload = await readBlobBytesIfExists(blob);
+  } catch {
+    const error = new Error(
+      `fail closed: immutable ${label} byte verification failed`
+    );
+    error.immutableWriteOutcome = IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED;
+    throw error;
+  }
+  if (!verifiedPayload?.equals(payload)) {
+    const error = new Error(
+      `fail closed: immutable ${label} byte verification failed`
+    );
+    error.immutableWriteOutcome = IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED;
+    throw error;
+  }
+  return {
+    blob_name: blobName,
+    sha256: sha256(payload),
+    created,
+    immutable_write_outcome: IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED
+  };
+}
+
+export function recoveryEvidenceOwnershipAfterResume(summary) {
+  return Boolean(summary);
+}
+
+export async function putCanonicalRecoveryJournal(container, prefix, journal) {
+  const predecessorRunId = String(journal?.predecessor_run_id || "");
+  if (!/^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(predecessorRunId)) {
+    throw new Error("fail closed: recovery journal predecessor run id is invalid");
+  }
+  const blobName = canonicalRecoveryJournalBlobName(prefix, predecessorRunId);
+  if (journal?.recovery_journal_blob_name !== blobName) {
+    throw new Error("fail closed: recovery journal blob binding is invalid");
+  }
+  return putImmutableJsonExact(
+    container,
+    blobName,
+    journal,
+    "recovery journal"
+  );
+}
+
+export async function persistCanonicalRecoveryJournal(container, prefix, journal, {
+  claimEvidence = () => { canonicalRecoveryOwnsEvidence = true; }
+} = {}) {
+  try {
+    const persisted = await putCanonicalRecoveryJournal(container, prefix, journal);
+    claimEvidence();
+    return persisted;
+  } catch (error) {
+    if ([
+      IMMUTABLE_WRITE_OUTCOME.ACCEPTED_OWNED,
+      IMMUTABLE_WRITE_OUTCOME.COLLISION_OWNED,
+      IMMUTABLE_WRITE_OUTCOME.UNKNOWN_MAY_OWN
+    ].includes(error?.immutableWriteOutcome)) {
+      claimEvidence();
+    }
+    throw error;
+  }
+}
+
+function sameLowercaseValues(left, right) {
+  return JSON.stringify((left || []).map((value) =>
+    String(value).toLowerCase()).sort()) ===
+    JSON.stringify((right || []).map((value) =>
+      String(value).toLowerCase()).sort());
+}
+
+export function validateCanonicalRecoveryJournal(journal, {
+  account,
+  config: recoveryConfig,
+  control,
+  journalBlobName
+}) {
+  const finalized = journal?.finalized_control;
+  const summary = journal?.recovered_summary;
+  const predecessorRunId = String(journal?.predecessor_run_id || "");
+  const recoveryRunId = String(journal?.recovery_run_id || "");
+  const transactionHash = String(finalized?.transaction_hash || "").toLowerCase();
+  const expectedSummaryBlob = redemptionArchiveBlobName(
+    journalBlobName.slice(0, journalBlobName.lastIndexOf("/recovery-controls/")),
+    summary?.finished_ts,
+    recoveryRunId
+  );
+  const owner = String(account || "").toLowerCase();
+  const storedOwner = String(finalized?.owner || "").toLowerCase();
+  const storedSigner = String(finalized?.signer_address || "").toLowerCase();
+  const ownerBound = storedOwner === owner || finalized?.owner === "[REDACTED]";
+  const signerBound = storedSigner === owner || finalized?.signer_address === "[REDACTED]";
+  const valid = journal?.schema_version === 1 &&
+    journal?.type === "redemption_recovery_journal" &&
+    /^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(predecessorRunId) &&
+    /^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(recoveryRunId) &&
+    predecessorRunId !== recoveryRunId &&
+    journal.recovery_journal_blob_name === journalBlobName &&
+    finalized?.state === "confirmed_and_verified" &&
+    finalized?.run_id === predecessorRunId &&
+    finalized?.recovery_run_id === recoveryRunId &&
+    finalized?.recovery_journal_blob_name === journalBlobName &&
+    finalized?.recovery_publication_complete === true &&
+    finalized?.recovery_summary_blob_name === expectedSummaryBlob &&
+    finalized?.recovery_summary_sha256 === sha256(jsonPayload(summary)) &&
+    finalized?.submission_attempted === true &&
+    ownerBound && signerBound &&
+    String(finalized?.funder || "").toLowerCase() ===
+      String(recoveryConfig?.funderAddress || "").toLowerCase() &&
+    String(control?.run_id || "") === predecessorRunId &&
+    String(control?.transaction_id || "") === String(finalized?.transaction_id || "") &&
+    String(control?.transaction_hash || "").toLowerCase() === transactionHash &&
+    sameLowercaseValues(control?.condition_ids, finalized?.condition_ids) &&
+    Math.abs(Number(control?.expected_gross_payout) -
+      Number(finalized?.expected_gross_payout)) <= 0.0000011 &&
+    /^0x[0-9a-f]{64}$/.test(transactionHash) &&
+    Array.isArray(finalized?.condition_ids) && finalized.condition_ids.length > 0 &&
+    sameLowercaseValues(finalized.condition_ids,
+      summary?.selection?.selected?.map((row) => row.condition_id)) &&
+    Array.isArray(finalized?.internal_settlement_blobs) &&
+    finalized.internal_settlement_blobs.length > 0 &&
+    sameLowercaseValues(finalized.internal_settlement_blobs,
+      summary?.internal_settlement_blobs) &&
+    summary?.schema_version === 1 &&
+    summary?.status === "recovered_confirmed_and_verified" &&
+    summary?.run_id === recoveryRunId &&
+    summary?.predecessor_run_id === predecessorRunId &&
+    summary?.recovery_journal_blob_name === journalBlobName &&
+    summary?.transaction_id === finalized?.transaction_id &&
+    String(summary?.transaction_hash || "").toLowerCase() === transactionHash &&
+    summary?.execution_origin === recoveryConfig?.executionOrigin &&
+    summary?.execution_country === recoveryConfig?.expectedCountry &&
+    summary?.static_egress_verified === true &&
+    summary?.funder?.toLowerCase() ===
+      String(recoveryConfig?.funderAddress || "").toLowerCase() &&
+    summary?.redemption_submitted === true &&
+    summary?.new_submission_attempted === false &&
+    summary?.confirmed_transaction_reused === true &&
+    summary?.zero_open_orders_confirmed === true &&
+    summary?.research_only === false &&
+    summary?.live_strategy_enabled === true &&
+    Number.isFinite(Date.parse(String(summary?.finished_ts || ""))) &&
+    Math.abs(Number(summary?.selection?.selected_gross_payout) -
+      Number(finalized?.expected_gross_payout)) <= 0.0000011 &&
+    Math.abs(Number(summary?.realized_payout) -
+      Number(finalized?.realized_payout)) <= 0.0000011;
+  if (!valid) {
+    throw new Error("fail closed: canonical recovery journal binding is invalid");
+  }
+  return true;
+}
+
+async function latestPointerAliasesNewerArchive(
+  container,
+  prefix,
+  latestPayload,
+  recoveryFinishedTs
+) {
+  let latest;
+  try {
+    latest = JSON.parse(latestPayload.toString("utf8"));
+  } catch {
+    return false;
+  }
+  if (!/^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/.test(String(latest?.run_id || "")) ||
+      !Number.isFinite(Date.parse(String(latest?.finished_ts || ""))) ||
+      Date.parse(latest.finished_ts) <= Date.parse(recoveryFinishedTs)) {
+    return false;
+  }
+  const archivePayload = await readBlobBytesIfExists(
+    container.getBlockBlobClient(redemptionArchiveBlobName(
+      prefix,
+      latest.finished_ts,
+      latest.run_id
+    ))
+  );
+  return Boolean(archivePayload?.equals(latestPayload));
+}
+
+async function ensureCanonicalRecoveryPublished(
+  container,
+  prefix,
+  journal,
+  { forceLatest = false } = {}
+) {
+  const summary = journal.recovered_summary;
+  const summaryPayload = jsonPayload(summary);
+  const archiveBlobName = journal.finalized_control.recovery_summary_blob_name;
+  const archive = await putImmutableJsonExact(
+    container,
+    archiveBlobName,
+    summary,
+    "recovered redemption archive"
+  );
+  const latestBlob = container.getBlockBlobClient(`${prefix}/latest-redemption.json`);
+  const latestPayload = await readBlobBytesIfExists(latestBlob);
+  let latestWritten = false;
+  if (forceLatest || !latestPayload || latestPayload.equals(summaryPayload)) {
+    if (!latestPayload || !latestPayload.equals(summaryPayload)) {
+      await latestBlob.uploadData(summaryPayload, {
+        blobHTTPHeaders: { blobContentType: "application/json" }
+      });
+      latestWritten = true;
+    }
+  } else if (!await latestPointerAliasesNewerArchive(
+    container,
+    prefix,
+    latestPayload,
+    summary.finished_ts
+  )) {
+    await latestBlob.uploadData(summaryPayload, {
+      blobHTTPHeaders: { blobContentType: "application/json" }
+    });
+    latestWritten = true;
+  }
+  return { repaired: archive.created || latestWritten };
+}
+
+export async function commitCanonicalRecoveryJournal(
+  container,
+  prefix,
+  journal,
+  { writeControl, finalizedResume = false } = {}
+) {
+  if (typeof writeControl !== "function") {
+    throw new Error("fail closed: recovery journal control writer is unavailable");
+  }
+  if (finalizedResume) {
+    const publication = await ensureCanonicalRecoveryPublished(
+      container,
+      prefix,
+      journal
+    );
+    if (publication.repaired) await writeControl(journal.finalized_control);
+    return publication;
+  }
+  await putImmutableJsonExact(
+    container,
+    journal.finalized_control.recovery_summary_blob_name,
+    journal.recovered_summary,
+    "recovered redemption archive"
+  );
+  await writeControl({
+    ...journal.finalized_control,
+    state: "recovery_commit_pending_publication",
+    recovery_publication_complete: false
+  });
+  await ensureCanonicalRecoveryPublished(
+    container,
+    prefix,
+    journal,
+    { forceLatest: true }
+  );
+  await writeControl(journal.finalized_control);
+  return { repaired: true };
+}
+
 async function uploadRedemptionEvidence(value) {
   const container = storageContainer(config);
-  await container.createIfNotExists();
-  const payload = Buffer.from(JSON.stringify(sanitize(value), null, 2));
-  const date = new Date().toISOString().slice(0, 10);
-  await container.getBlockBlobClient(`reports/research/venue-probe/redemptions/${date}/${runId}.json`).uploadData(payload, {
-    conditions: { ifNoneMatch: "*" },
-    blobHTTPHeaders: { blobContentType: "application/json" }
-  });
-  await container.getBlockBlobClient("reports/research/venue-probe/latest_redemption.json").uploadData(payload, {
+  const prefix = redemptionEvidencePrefix();
+  const payload = jsonPayload(value);
+  await putImmutableJsonExact(
+    container,
+    redemptionArchiveBlobName(prefix, value.finished_ts, value.run_id),
+    value,
+    "redemption archive"
+  );
+  await container.getBlockBlobClient(`${prefix}/latest-redemption.json`).uploadData(payload, {
     blobHTTPHeaders: { blobContentType: "application/json" }
   });
 }
@@ -661,6 +1984,16 @@ async function uploadRedemptionEvidence(value) {
 function normalizePrivateKey(value) {
   const trimmed = String(value || "").trim();
   return trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`;
+}
+
+function redemptionEvidencePrefix() {
+  return config.fundedServiceManaged
+    ? `reports/funded/dynamic-quote/sessions/${config.campaignId}`
+    : "reports/research/venue-probe";
+}
+
+function redemptionControlBlobName() {
+  return `${redemptionEvidencePrefix()}/control/redemption-state.json`;
 }
 
 async function streamToString(stream) {
@@ -671,4 +2004,15 @@ async function streamToString(stream) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  runVenueRedemption().catch((error) => {
+    process.exitCode = 1;
+    console.error(JSON.stringify(sanitize({
+      status: "failed_closed",
+      error: error.message
+    })));
+  });
 }

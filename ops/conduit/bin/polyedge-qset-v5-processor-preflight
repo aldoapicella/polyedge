@@ -1,0 +1,92 @@
+#!/bin/sh
+set -eu
+
+fail() { echo "$*" >&2; exit 64; }
+sha256_file() { printf 'sha256:%s\n' "$(sha256sum "$1" | awk '{print $1}')"; }
+require_root_receipt() {
+  receipt=$1 label=$2 expected_sha=$3
+  [ ! -L "$receipt" ] && [ -f "$receipt" ] && [ "$(stat -c '%u:%g:%a:%h' "$receipt")" = 0:0:640:1 ] \
+    || fail "$label is missing or unsafe: $receipt"
+  [ "$(sha256_file "$receipt")" = "$expected_sha" ] || fail "$label hash mismatch: $receipt"
+}
+
+for name in POLYEDGE_QSET_V5_PROCESSOR_IMAGE POLYEDGE_QSET_V5_PROCESSOR_GIT_SHA POLYEDGE_QSET_V5_SOURCE_FREEZE_RECEIPT_SHA256 POLYEDGE_QSET_V5_DAY1_RECEIPT_SHA256 POLYEDGE_QSET_V5_DAY1_INVENTORY_SHA256 POLYEDGE_QSET_V5_DAY2_RECEIPT_SHA256 POLYEDGE_QSET_V5_DAY2_INVENTORY_SHA256 SHADOW_CODE_FREEZE_SHA256 SHADOW_CODE_FREEZE_MANIFEST EXECUTION_FREEZE_ARTIFACT_PATH EXECUTION_FREEZE_SHA256 AZURE_STORAGE_ACCOUNT_NAME AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_FEDERATED_TOKEN_FILE SHADOW_EXECUTION_MODEL_BLOB_NAME SHADOW_EXECUTION_MODEL_SHA256; do
+  eval "value=\${$name:-}"
+  [ -n "$value" ] || fail "qset-v5 processor requires $name"
+done
+for digest in "$POLYEDGE_QSET_V5_SOURCE_FREEZE_RECEIPT_SHA256" "$POLYEDGE_QSET_V5_DAY1_RECEIPT_SHA256" "$POLYEDGE_QSET_V5_DAY1_INVENTORY_SHA256" "$POLYEDGE_QSET_V5_DAY2_RECEIPT_SHA256" "$POLYEDGE_QSET_V5_DAY2_INVENTORY_SHA256" "$SHADOW_CODE_FREEZE_SHA256" "$EXECUTION_FREEZE_SHA256" "$SHADOW_EXECUTION_MODEL_SHA256"; do
+  printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || fail 'qset-v5 processor received an invalid sha256 binding'
+done
+printf '%s' "$POLYEDGE_QSET_V5_PROCESSOR_IMAGE" | grep -Eq '^ghcr\.io/[a-z0-9][a-z0-9._-]*/polyedge-rust-backend@sha256:[0-9a-f]{64}$' \
+  || fail 'qset-v5 processor image must be an immutable GHCR Rust backend digest'
+printf '%s' "$POLYEDGE_QSET_V5_PROCESSOR_GIT_SHA" | grep -Eq '^[0-9a-f]{40}$' \
+  || fail 'qset-v5 processor revision must be a full Git SHA'
+
+[ "${SHADOW_CAMPAIGN_ID:-}" = campaign-2026-08-26-qset-v5 ] \
+  && [ "${SHADOW_CAMPAIGN_START:-}" = 2026-08-26 ] \
+  && [ "${SHADOW_CAMPAIGN_PREFIX:-}" = shadow-events/campaign-2026-08-26-qset-v5 ] \
+  && [ "${SHADOW_CAMPAIGN_REPORT_ROOT:-}" = reports/research/shadow/campaigns/campaign-2026-08-26-qset-v5 ] \
+  && [ "${SHADOW_CORRECTION_ROOT:-}" = reports/research/shadow/campaigns/campaign-2026-08-26-qset-v5/corrections ] \
+  && [ "${SHADOW_CAMPAIGN_CONTRACT:-}" = research/configs/profitability_gate_v3_2026-08-26_qset_v5.yaml ] \
+  && [ "${SHADOW_EVIDENCE_VERSION:-}" = protocol-v3-qset-v5 ] \
+  || fail 'qset-v5 processor campaign binding is inexact'
+[ "${AZURE_STORAGE_CONTAINER_NAME:-}" = polyedge-research-qset-v5 ] \
+  && [ "${SHADOW_SOURCE_CONTAINER_NAME:-}" = polyedge-shadow-qset-v5-events ] \
+  && [ "${QSET_V5_CONTROL_CONTAINER_NAME:-}" = polyedge-qset-v5-control ] \
+  && [ "${POLYEDGE_CAMPAIGN_LEASE_BLOB:-}" = data/research/shadow/campaign-2026-08-26-qset-v5/control/replay.lock ] \
+  || fail 'qset-v5 processor storage or lease binding is inexact'
+[ "${SHADOW_CODE_FREEZE_FINALIZED:-}" = true ] && [ "$SHADOW_CODE_FREEZE_SHA256" = "$EXECUTION_FREEZE_SHA256" ] \
+  || fail 'qset-v5 processor source freeze is not final and exact'
+case "$EXECUTION_FREEZE_ARTIFACT_PATH" in
+  reports/research/shadow/campaigns/campaign-2026-08-26-qset-v5/control/code-freeze/source-${EXECUTION_FREEZE_SHA256#sha256:}.json) ;;
+  *) fail 'qset-v5 processor execution freeze path is inexact' ;;
+esac
+[ "$SHADOW_CODE_FREEZE_MANIFEST" = "azure://$AZURE_STORAGE_ACCOUNT_NAME/polyedge-qset-v5-control/$EXECUTION_FREEZE_ARTIFACT_PATH" ] \
+  || fail 'qset-v5 processor source-freeze manifest is inexact'
+[ "${AZURE_FEDERATED_TOKEN_FILE:-}" = /run/credentials/azure-federated-token ] \
+  && [ "${AZURE_TOKEN_CREDENTIALS:-}" = WorkloadIdentityCredential ] \
+  || fail 'qset-v5 processor requires the federated token credential only'
+[ "${EXECUTION_MODE:-}" = paper ] && [ "${ALLOW_LIVE:-}" = false ] \
+  && [ "${RUN_BOT_ON_STARTUP:-}" = false ] && [ "${ENABLE_TAKER_ORDERS:-}" = false ] \
+  || fail 'qset-v5 processor must remain non-live and non-trading'
+[ "${FUNDED_DIRECT_SERVICE_BUS_ENABLED:-false}" = false ] \
+  && [ -z "${FUNDED_DIRECT_SERVICE_BUS_NAMESPACE:-}" ] \
+  && [ -z "${FUNDED_DIRECT_SERVICE_BUS_QUEUE:-}" ] \
+  && [ -z "${AZURE_FUNDED_STORAGE_CONTAINER_NAME:-}" ] \
+  && [ -z "${AZURE_KEY_VAULT_URL:-}" ] \
+  && [ -z "${AZURE_CLIENT_SECRET:-}" ] \
+  && [ -z "${AZURE_CLIENT_SECRET_FILE:-}" ] \
+  || fail 'qset-v5 processor refuses funded, Service Bus, Key Vault, or client-secret bindings'
+
+source_receipt=/srv/polyedge-ring/migration/qset-v5/source-freeze/source-${EXECUTION_FREEZE_SHA256#sha256:}.json
+day_one_receipt=/srv/polyedge-ring/migration/qset-v5-seal/2026-08-26.json
+day_two_receipt=/srv/polyedge-ring/migration/qset-v5-seal/2026-08-27.json
+require_root_receipt "$source_receipt" 'qset-v5 final source-freeze receipt' "$POLYEDGE_QSET_V5_SOURCE_FREEZE_RECEIPT_SHA256"
+jq -e --arg uri "$SHADOW_CODE_FREEZE_MANIFEST" --arg freeze "$EXECUTION_FREEZE_SHA256" \
+  --arg image "$POLYEDGE_QSET_V5_PROCESSOR_IMAGE" --arg commit "$POLYEDGE_QSET_V5_PROCESSOR_GIT_SHA" '
+  .schema == "polyedge.qset_v5_source_freeze_upload_receipt.v2"
+  and .manifest.uri == $uri and .manifest.sha256 == $freeze and .manifest.bytes > 0 and (.manifest.etag | length) > 0
+  and .researchImage == $image and .sourceCommit == $commit and (.gitTree | test("^[0-9a-f]{40}$"))
+  and .immutabilityPolicy.state == "Locked" and .immutabilityPolicy.days >= 90
+' "$source_receipt" >/dev/null || fail 'qset-v5 final source-freeze receipt is invalid'
+
+for receipt_binding in "2026-08-26|$day_one_receipt|$POLYEDGE_QSET_V5_DAY1_RECEIPT_SHA256|$POLYEDGE_QSET_V5_DAY1_INVENTORY_SHA256" "2026-08-27|$day_two_receipt|$POLYEDGE_QSET_V5_DAY2_RECEIPT_SHA256|$POLYEDGE_QSET_V5_DAY2_INVENTORY_SHA256"; do
+  old_ifs=$IFS; IFS='|'; set -- $receipt_binding; IFS=$old_ifs
+  date=$1 receipt=$2 receipt_sha=$3 inventory_sha=$4
+  require_root_receipt "$receipt" "qset-v5 sealed-day $date receipt" "$receipt_sha"
+  jq -e --arg date "$date" --arg inventory "$inventory_sha" --arg freeze "$EXECUTION_FREEZE_SHA256" --arg freeze_blob "$EXECUTION_FREEZE_ARTIFACT_PATH" '
+    .schema == "polyedge.qset_v5_closed_day_seal.v1" and .campaign_id == "campaign-2026-08-26-qset-v5"
+    and .date == $date and .container == "polyedge-shadow-qset-v5-events"
+    and .blob_count == 1440 and .sealed_blob_count == 1440 and .all_sealed == true and .total_bytes > 0
+    and .source_inventory_sha256 == $inventory
+    and .source_freeze == {container:"polyedge-qset-v5-control",blob:$freeze_blob,sha256:$freeze,verified:true}
+    and (.sealer_image | test("^ghcr\\.io/.+/polyedge-rust-backend@sha256:[0-9a-f]{64}$"))
+    and (.sealer_git_sha | test("^[0-9a-f]{40}$")) and (.writer_git_sha | test("^[0-9a-f]{40}$"))
+    and (has("generated_ts") | not) and (has("sealed_at") | not)
+  ' "$receipt" >/dev/null || fail "qset-v5 sealed-day $date receipt is invalid"
+done
+
+[ "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}' "$POLYEDGE_QSET_V5_PROCESSOR_IMAGE")" = linux/arm64 ] \
+  || { echo 'qset-v5 processor image is not present locally as linux/arm64' >&2; exit 1; }
+[ "$(/usr/bin/podman image inspect --format '{{ index .Labels "org.opencontainers.image.revision" }}' "$POLYEDGE_QSET_V5_PROCESSOR_IMAGE")" = "$POLYEDGE_QSET_V5_PROCESSOR_GIT_SHA" ] \
+  || { echo 'qset-v5 processor local image revision mismatch' >&2; exit 1; }

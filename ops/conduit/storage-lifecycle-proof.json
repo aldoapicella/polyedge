@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "capturedAtUtc": "2026-08-09T16:44:04Z",
+  "status": "live-verified",
+  "subscriptionId": "73783c0c-5a53-4f9b-b244-6f64e813814c",
+  "resourceGroup": "rg-polyedge-dev",
+  "storageAccount": {
+    "name": "stpolyedge6urdjr5nmwx7w",
+    "kind": "StorageV2",
+    "sku": "Standard_LRS",
+    "defaultAccessTier": "Hot",
+    "allowBlobPublicAccess": false,
+    "minimumTlsVersion": "TLS1_2"
+  },
+  "managementPolicy": {
+    "name": "DefaultManagementPolicy",
+    "lastModifiedTime": "2026-08-06T06:17:06.821019+00:00",
+    "deployedPolicyAlreadyMatchesDesired": true,
+    "mutationPerformedForThisProof": false,
+    "rules": [
+      {
+        "name": "delete-normalized-research-snapshots-after-7-days",
+        "enabled": true,
+        "blobTypes": ["blockBlob"],
+        "prefixMatch": ["bot-events/data/research/normalized/v1/"],
+        "deleteAfterModificationDays": 7
+      },
+      {
+        "name": "tier-future-oci-raw-after-7-and-30-days",
+        "enabled": true,
+        "blobTypes": ["blockBlob"],
+        "prefixMatch": ["bot-events/events-oci-hot7-v1/"],
+        "coolAfterModificationDays": 7,
+        "archiveAfterModificationDays": 30
+      }
+    ]
+  },
+  "futureOciPrefix": {
+    "container": "bot-events",
+    "prefix": "events-oci-hot7-v1/",
+    "objectCount": 996,
+    "totalBytes": 18205708074,
+    "blobTypes": ["BlockBlob"],
+    "accessTiers": ["Hot"],
+    "listContinuationPresent": false
+  },
+  "existingCorpusProtection": {
+    "legacyPrefix": "bot-events/events/",
+    "approximateAccountUsedCapacityBytesAt2026-08-09T13:00:00Z": 2204118414920,
+    "sampleObjectCount": 5,
+    "sampleBlobTypes": ["AppendBlob"],
+    "matchedByAnyLifecyclePrefix": false,
+    "matchedByAnyLifecycleBlobTypeAndPrefix": false,
+    "existingCorpusTierOrDeleteAuthorized": false
+  },
+  "verification": {
+    "controlPlanePolicyReadback": "passed",
+    "futurePrefixDataPlaneInventory": "passed",
+    "legacyPrefixDataPlaneSample": "passed",
+    "readIdentity": "id-polyedge-conduit-research",
+    "accountKeyUsed": false,
+    "sasUsed": false,
+    "secretsOrTokensCaptured": false
+  }
+}

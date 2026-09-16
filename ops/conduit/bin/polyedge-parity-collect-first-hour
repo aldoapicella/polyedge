@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 027
+
+readonly window=2026-08-22T21:00:00Z
+readonly collect_not_before=1787437080
+readonly enable_deadline=1787439600
+readonly ledger=/srv/polyedge-ring/parity/20260822T210000Z-funded-active.json
+readonly evidence=/srv/polyedge-ring/parity/hourly/20260822T21/evidence.json
+readonly formal=/etc/polyedge/parity-hourly.env
+readonly hourly=/etc/polyedge/jobs/hourly.env
+readonly rollback=/etc/polyedge/rollback/20260822T210000Z-funded-active
+readonly transaction=$rollback/env-transaction.json
+readonly staged=/srv/polyedge-ring/parity/activation/20260822T210000Z-staged.json
+readonly validated=/srv/polyedge-ring/parity/activation/20260822T210000Z-first-hour-validated.json
+readonly recovery=/srv/polyedge-ring/parity/funded-recovery/20260822T195013Z-acknowledged-evicted-no-fill.json
+readonly rollout=/srv/polyedge-ring/parity/activation/20260822T195013Z-funded-signer-rollout.json
+readonly collector=/usr/local/libexec/polyedge-parity-hourly
+readonly collector_sha=sha256:031a38be219fa23664bf3bae345453ad371ac7edb8ec34954e724abfb6000a50
+readonly validator=/usr/local/libexec/polyedge-reboot-attestation
+readonly validator_sha=sha256:739c420ba37e1287b84897908b2e4851249ea9f6775b71d8a6efa31d75d6faec
+readonly subscription=73783c0c-5a53-4f9b-b244-6f64e813814c
+readonly resource_group=rg-polyedge-dev
+readonly namespace=sb-polyedge-funded-cl-6urdjr5nmwx7w
+readonly queue=funded-dynamic-quote-intents
+readonly producer_env_binding_sha=sha256:8faa07c90246486bcd9e609924d85368a1e69ad85ca6961bb45af22ee46bbb9b
+readonly producer_mount_binding_sha=sha256:8f5f4dcf132460eed131e7a0d096d54d1cb1f972b8bd5b279700021ac1bc698e
+readonly old_formal_sha=41b0cbbd22adcb872a8005a1b9f5502733ad7c7bcf11ad160eb1d1e1d25cb8c8
+readonly old_hourly_sha=5a6b85b8ae29a62603e902e3da10e184c4d9c71a78cc8790b6426f79dd61059b
+
+formal_tmp=
+hourly_tmp=
+receipt_tmp=
+complete=false
+mutations_started=false
+
+sha() { /usr/bin/sha256sum "$1" | /usr/bin/cut -d' ' -f1; }
+
+secure_file() {
+  local path=$1 mode=$2 max=$3 uid gid actual links size
+  test ! -L "$path" && test -f "$path"
+  read -r uid gid actual links size < <(/usr/bin/stat -c '%u %g %a %h %s' "$path")
+  test "$uid:$gid:$actual:$links" = "0:0:$mode:1"
+  test "$size" -gt 0 && test "$size" -le "$max"
+}
+
+validate_staged_receipt() {
+  local staged_path=${1:-$staged} recovery_path=${2:-$recovery} rollout_path=${3:-$rollout}
+  /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" --arg recovery "$recovery_path" \
+    --arg recovery_sha "sha256:$(sha "$recovery_path")" --arg rollout "$rollout_path" --arg rollout_sha "sha256:$(sha "$rollout_path")" \
+    --arg collector "$collector_sha" --arg validator "$validator_sha" '
+      .schemaVersion == 1 and .status == "staged" and .windowStartUtc == $window and
+      .ledger.path == $ledger and .recovery.path == $recovery and .recovery.sha256 == $recovery_sha and
+      .rollout == {path:$rollout,sha256:$rollout_sha} and
+      .bindings.collectorSha256 == $collector and .bindings.validatorSha256 == $validator and
+      .acceptedCleanLiveHours == 0 and .completedDailyCycles == 0 and .rebootRecoveryPassed == false and
+      .recurrenceEnabled == false and .azureAuthoritative == true and .azureDeletionAllowed == false
+    ' "$staged_path" >/dev/null
+}
+
+transaction_uid=${POLYEDGE_TEST_UID:-0}
+transaction_gid=${POLYEDGE_TEST_GID:-0}
+
+write_env_transaction() {
+  local marker=$1 phase=$2 formal_path=$3 hourly_path=$4 before_formal=$5 before_hourly=$6 candidate_formal=$7 candidate_hourly=$8 tmp marker_dir
+  marker_dir=${marker%/*}
+  tmp=$(/usr/bin/mktemp "${marker}.XXXXXX") || return 1
+  /usr/bin/jq -n --arg phase "$phase" --arg formal "$formal_path" --arg hourly "$hourly_path" \
+    --arg before_formal "sha256:$(sha "$before_formal")" --arg before_hourly "sha256:$(sha "$before_hourly")" \
+    --arg candidate_formal "sha256:$(sha "$candidate_formal")" --arg candidate_hourly "sha256:$(sha "$candidate_hourly")" '
+    {schema:"polyedge.parity_env_transaction.v1",phase:$phase,
+     formal:{path:$formal,beforeSha256:$before_formal,candidateSha256:$candidate_formal},
+     hourly:{path:$hourly,beforeSha256:$before_hourly,candidateSha256:$candidate_hourly}}
+  ' >"$tmp" || { /usr/bin/rm -f "$tmp"; return 1; }
+  /usr/bin/chown "$transaction_uid:$transaction_gid" "$tmp" &&
+    /usr/bin/chmod 0600 "$tmp" && /usr/bin/sync -f "$tmp" &&
+    /usr/bin/mv -f "$tmp" "$marker" && /usr/bin/sync -f "$marker_dir"
+}
+
+validate_env_transaction() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7
+  test ! -L "$marker" && test -f "$marker" || return 1
+  test "$(/usr/bin/stat -c '%u:%g:%a:%h' "$marker")" = "$transaction_uid:$transaction_gid:600:1" || return 1
+  /usr/bin/jq -e --arg formal "$formal_path" --arg hourly "$hourly_path" \
+    --arg before_formal "sha256:$(sha "$before_formal")" --arg before_hourly "sha256:$(sha "$before_hourly")" \
+    --arg candidate_formal "sha256:$(sha "$candidate_formal")" --arg candidate_hourly "sha256:$(sha "$candidate_hourly")" '
+    .schema == "polyedge.parity_env_transaction.v1" and
+    (.phase | test("^(prepared|formal_moved|committed|recovering|formal_restored|recovered_before)$")) and
+    .formal == {path:$formal,beforeSha256:$before_formal,candidateSha256:$candidate_formal} and
+    .hourly == {path:$hourly,beforeSha256:$before_hourly,candidateSha256:$candidate_hourly}
+  ' "$marker" >/dev/null
+}
+
+restore_before_pair() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7 formal_restore hourly_restore
+  formal_restore=$(/usr/bin/mktemp "${formal_path}.XXXXXX") || return 1
+  hourly_restore=$(/usr/bin/mktemp "${hourly_path}.XXXXXX") || { /usr/bin/rm -f "$formal_restore"; return 1; }
+  /usr/bin/install -o "$transaction_uid" -g "$transaction_gid" -m 0640 "$before_formal" "$formal_restore" &&
+    /usr/bin/install -o "$transaction_uid" -g "$transaction_gid" -m 0600 "$before_hourly" "$hourly_restore" &&
+    /usr/bin/sync -f "$formal_restore" && /usr/bin/sync -f "$hourly_restore" &&
+    write_env_transaction "$marker" recovering "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" &&
+    /usr/bin/mv -f "$formal_restore" "$formal_path" &&
+    write_env_transaction "$marker" formal_restored "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" &&
+    /usr/bin/mv -f "$hourly_restore" "$hourly_path" &&
+    write_env_transaction "$marker" recovered_before "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+}
+
+recover_env_transaction() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7 prefer=$8 formal_sha hourly_sha before_formal_sha before_hourly_sha candidate_formal_sha candidate_hourly_sha
+  test -e "$marker" || return 0
+  validate_env_transaction "$marker" "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" || return 1
+  formal_sha="sha256:$(sha "$formal_path")"
+  hourly_sha="sha256:$(sha "$hourly_path")"
+  before_formal_sha="sha256:$(sha "$before_formal")"
+  before_hourly_sha="sha256:$(sha "$before_hourly")"
+  candidate_formal_sha="sha256:$(sha "$candidate_formal")"
+  candidate_hourly_sha="sha256:$(sha "$candidate_hourly")"
+  if test "$formal_sha" = "$before_formal_sha" && test "$hourly_sha" = "$before_hourly_sha"; then
+    write_env_transaction "$marker" recovered_before "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+  elif test "$formal_sha" = "$candidate_formal_sha" && test "$hourly_sha" = "$candidate_hourly_sha"; then
+    if test "$prefer" = before; then
+      restore_before_pair "$marker" "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+    else
+      write_env_transaction "$marker" committed "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+    fi
+  elif { test "$formal_sha" = "$candidate_formal_sha" && test "$hourly_sha" = "$before_hourly_sha"; } ||
+       { test "$formal_sha" = "$before_formal_sha" && test "$hourly_sha" = "$candidate_hourly_sha"; }; then
+    restore_before_pair "$marker" "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+  else
+    return 1
+  fi
+}
+
+commit_candidate_pair() {
+  local marker=$1 formal_path=$2 hourly_path=$3 before_formal=$4 before_hourly=$5 candidate_formal=$6 candidate_hourly=$7 formal_source=$8 hourly_source=$9
+  write_env_transaction "$marker" prepared "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" &&
+    /usr/bin/mv -f "$formal_source" "$formal_path" &&
+    write_env_transaction "$marker" formal_moved "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly" || return 1
+  if test "${POLYEDGE_TEST_KILL_BETWEEN_ENV_MOVES:-0}" = 1; then /usr/bin/kill -KILL "${BASHPID:-$$}"; fi
+  /usr/bin/mv -f "$hourly_source" "$hourly_path" &&
+    write_env_transaction "$marker" committed "$formal_path" "$hourly_path" "$before_formal" "$before_hourly" "$candidate_formal" "$candidate_hourly"
+}
+
+validate_first_hour_evidence() {
+  local evidence_path=${1:-$evidence}
+  local funded_user="$POLYEDGE_PARITY_FUNDED_UID:$POLYEDGE_PARITY_FUNDED_GID"
+  /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" \
+    --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
+    --arg rollout "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT" \
+    --arg rollout_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" \
+    --arg namespace "$namespace" --arg queue "$queue" \
+    --arg collector "$collector_sha" --arg validator "$validator_sha" \
+    --arg funded_image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg funded_user "$funded_user" \
+    --arg funded_session "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_ID" \
+    --arg funded_session_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_SESSION_SHA256" \
+    --arg funded_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_CONFIG_SHA256" \
+    --arg producer_image "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_IMAGE" --arg producer_user "984:980" \
+    --arg producer_config_sha "$POLYEDGE_PARITY_EXPECTED_FUNDED_PRODUCER_CONFIG_SHA256" \
+    --arg producer_env_sha "$producer_env_binding_sha" --arg producer_mount_sha "$producer_mount_binding_sha" \
+    --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
+    .schemaVersion == 1 and .status == "validated" and .acceptedForParityWindow == true and
+    .hourStartUtc == $window and .ledgerPath == $ledger and
+    .services.fundedSignerEnabled == true and .services.fundedSignerMode == "active" and
+    .services.fundedSignerRevision == $revision and
+    .services.fundedRolloutReceipt == {path:$rollout,sha256:$rollout_sha} and
+    .services.fundedSignerImage == $funded_image and .services.fundedSignerUser == $funded_user and
+    .services.fundedSessionId == $funded_session and
+    .services.fundedSessionManifestSha256 == $funded_session_sha and
+    .services.fundedConfigSha256 == $funded_config_sha and
+    .services.fundedIntentProducerEnabled == true and
+    .services.fundedIntentProducerImage == $producer_image and
+    .services.fundedIntentProducerUser == $producer_user and
+    .services.fundedIntentProducerConfigSha256 == $producer_config_sha and
+    .services.fundedIntentProducerRuntime.configEnvBindingSha256 == $producer_env_sha and
+    .services.fundedIntentProducerRuntime.tokenMountBindingSha256 == $producer_mount_sha and
+    .services.fundedServiceBusDlqBaseline == $dlq and
+    .services.parityCollectorSha256 == $collector and .services.rebootValidatorSha256 == $validator and
+    .services.fundedServiceBusRuntime == {namespace:$namespace,queue:$queue,status:"Active",
+      activeMessageCount:0,scheduledMessageCount:0,deadLetterMessageCount:$dlq,expectedDeadLetterMessageCount:$dlq} and
+    .services.fundedRuntime.heartbeatCount >= 50 and .services.fundedRuntime.alertCount == 0 and
+    .services.fundedRuntime.failedClosedCount == 0 and .services.fundedRuntime.restartCount == 0 and
+    .services.fundedIntentProducerRuntime.continuity.restartCount == 0 and
+    .sameInput.deterministicResultExactMatch == true and
+    .azureAuthoritative == true and .azureDeletionAllowed == false
+  ' "$evidence_path" >/dev/null
+}
+if [ "${POLYEDGE_TEST_SOURCE_ONLY:-}" = 1 ]; then return 0; fi
+
+restore_bindings() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  /usr/bin/rm -f "$formal_tmp" "$hourly_tmp" "$receipt_tmp"
+  if [ "$complete" != true ] && [ "$mutations_started" = true ]; then
+    /usr/bin/systemctl disable --now polyedge-parity-hourly.timer >/dev/null 2>&1 || true
+    if [ -f "$transaction" ] && [ -f "$rollback/parity-hourly.env.candidate" ] && [ -f "$rollback/hourly.env.candidate" ]; then
+      restore_before_pair "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+        "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" || true
+    fi
+    /usr/bin/logger -p daemon.err -t polyedge-parity-activation "first-hour validation failed closed rc=$rc; previous bindings restored"
+  fi
+  exit "$rc"
+}
+trap restore_bindings EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+test "$(/usr/bin/id -u)" -eq 0
+exec 9>/run/polyedge/utility.lock
+/usr/bin/flock -n 9 || { echo 'another PolyEdge utility is active' >&2; exit 75; }
+
+secure_file "$collector" 755 262144
+secure_file "$validator" 755 262144
+test "sha256:$(sha "$collector")" = "$collector_sha"
+test "sha256:$(sha "$validator")" = "$validator_sha"
+secure_file "$recovery" 640 65536
+secure_file "$rollout" 640 65536
+secure_file "$staged" 640 65536
+secure_file "$rollback/parity-hourly.env.before" 640 1048576
+secure_file "$rollback/hourly.env.before" 600 1048576
+secure_file "$rollback/parity-hourly.env.candidate" 640 1048576
+secure_file "$rollback/hourly.env.candidate" 600 1048576
+secure_file "$ledger" 640 1048576
+secure_file "$formal" 640 1048576
+secure_file "$hourly" 600 1048576
+test "$(sha "$rollback/parity-hourly.env.before")" = "$old_formal_sha"
+test "$(sha "$rollback/hourly.env.before")" = "$old_hourly_sha"
+validate_staged_receipt
+set -a
+. "$formal"
+set +a
+test "$POLYEDGE_PARITY_FUNDED_MODE" = active
+test "$POLYEDGE_PARITY_FUNDED_ROLLOUT_RECEIPT" = "$rollout"
+test "$POLYEDGE_PARITY_EXPECTED_FUNDED_ROLLOUT_RECEIPT_SHA256" = "sha256:$(sha "$rollout")"
+test "$POLYEDGE_PARITY_EXPECTED_COLLECTOR_SHA256" = "$collector_sha"
+test "$POLYEDGE_PARITY_EXPECTED_REBOOT_VALIDATOR_SHA256" = "$validator_sha"
+/usr/bin/jq -e --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
+  .schema == "polyedge.acknowledged_no_fill_reconciliation.v1" and .status == "finalized_no_fill" and
+  .unresolvedReservationsAfter == 0 and .queueActiveMessages == 0 and .queueScheduledMessages == 0 and
+  .queueDeadLetterMessages == $dlq and .parityTimerRemainsPaused == true and .azureDeletionAllowed == false
+' "$recovery" >/dev/null
+/usr/bin/jq -e --arg image "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE" --arg revision "$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION" \
+  --arg recovery "$recovery" --arg recovery_sha "sha256:$(sha "$recovery")" --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '
+    .schema == "polyedge.funded_signer_post_recovery_rollout.v1" and .status == "validated" and
+    .newImage == $image and .newRevision == $revision and (.newRevision | test("^[0-9a-f]{40}$")) and
+    .recoveryReceipt == {path:$recovery,sha256:$recovery_sha} and .producerRestored == true and
+    .unresolvedReservationsAfter == 0 and .queue == {status:"Active",activeMessageCount:0,
+      scheduledMessageCount:0,deadLetterMessageCount:$dlq} and .parityTimerRemainsPaused == true and
+    .azureDeletionAllowed == false
+  ' "$rollout" >/dev/null
+test "$(/usr/bin/podman inspect --format '{{.Config.Image}}|{{.Config.User}}|{{.State.Status}}' polyedge-funded-signer)" = "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE|986:982|running"
+test "$(/usr/bin/podman image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels \"org.opencontainers.image.revision\" }}' "$POLYEDGE_PARITY_EXPECTED_FUNDED_IMAGE")" = "linux/arm64|$POLYEDGE_PARITY_EXPECTED_FUNDED_REVISION"
+queue_json=$(/usr/sbin/runuser -u ubuntu -- /usr/bin/az servicebus queue show --subscription "$subscription" --resource-group "$resource_group" --namespace-name "$namespace" --name "$queue" --only-show-errors -o json)
+/usr/bin/jq -e --argjson dlq "$POLYEDGE_PARITY_EXPECTED_FUNDED_SERVICE_BUS_DLQ" '.status == "Active" and
+  .countDetails.activeMessageCount == 0 and .countDetails.scheduledMessageCount == 0 and
+  .countDetails.deadLetterMessageCount == $dlq' <<<"$queue_json" >/dev/null
+
+if [ -e "$validated" ]; then
+  if (
+    secure_file "$validated" 640 65536 || exit 1
+    secure_file "$evidence" 640 1048576 || exit 1
+    secure_file "$formal" 640 1048576 || exit 1
+    secure_file "$hourly" 600 1048576 || exit 1
+    evidence_sha="sha256:$(sha "$evidence")" || exit 1
+    /usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" --arg evidence "$evidence" --arg evidence_sha "$evidence_sha" \
+      --arg collector "$collector_sha" --arg validator "$validator_sha" '
+      .schemaVersion == 1 and .status == "validated" and .windowStartUtc == $window and
+      .ledger.path == $ledger and .evidence.path == $evidence and .evidence.sha256 == $evidence_sha and
+      .acceptedCleanLiveHours == 1 and .completedDailyCycles == 0 and
+      .collectorSha256 == $collector and .validatorSha256 == $validator and .recurrenceEnabled == false and
+      .azureAuthoritative == true and .azureDeletionAllowed == false
+    ' "$validated" >/dev/null || exit 1
+    test "$(sha "$rollback/parity-hourly.env.candidate")" = "$(/usr/bin/jq -r '.bindings.formalSha256' "$staged" | /usr/bin/cut -d: -f2)" || exit 1
+    test "$(sha "$rollback/hourly.env.candidate")" = "$(/usr/bin/jq -r '.bindings.hourlySha256' "$staged" | /usr/bin/cut -d: -f2)" || exit 1
+    test "$(sha "$formal")" = "$(/usr/bin/jq -r '.bindings.formalSha256' "$staged" | /usr/bin/cut -d: -f2)" || exit 1
+    test "$(sha "$hourly")" = "$(/usr/bin/jq -r '.bindings.hourlySha256' "$staged" | /usr/bin/cut -d: -f2)" || exit 1
+    /usr/bin/jq -e --arg window "$window" --arg evidence "$evidence" --arg evidence_sha "$evidence_sha" '
+      .windowStartUtc == $window and .acceptedCleanLiveHours >= 1 and
+      (.acceptedHourlyEvidence | length) == .acceptedCleanLiveHours and
+      .acceptedHourlyEvidence[0].hourStartUtc == $window and
+      .acceptedHourlyEvidence[0].path == $evidence and .acceptedHourlyEvidence[0].sha256 == $evidence_sha and
+      .azureAuthoritative == true and .azureDeletionAllowed == false and
+      .shadowQsetEnabled == false and .fundedSignerEnabled == true and .fundedIntentProducerEnabled == true
+    ' "$ledger" >/dev/null || exit 1
+    POLYEDGE_PARITY_ENV_FILE="$formal" "$validator" validate-ledger || exit 1
+    ! /usr/bin/systemctl is-enabled --quiet polyedge-parity-hourly.timer || exit 1
+    ! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer || exit 1
+  ); then
+    complete=true
+    trap - EXIT HUP INT TERM
+    exit 0
+  fi
+  complete=true
+  /usr/bin/logger -p daemon.err -t polyedge-parity-activation 'terminal stage-two rerun found inconsistent accepted parity state; no mutation performed'
+  trap - EXIT HUP INT TERM
+  exit 1
+fi
+
+test "$(/usr/bin/date -u +%s)" -ge "$collect_not_before"
+test "$(/usr/bin/date -u +%s)" -lt "$enable_deadline"
+mutations_started=true
+/usr/bin/systemctl disable --now polyedge-parity-hourly.timer >/dev/null
+! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
+recover_env_transaction "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+  "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" candidate
+/usr/bin/jq -e --arg window "$window" --arg ledger "$ledger" '
+  .schemaVersion == 1 and .status == "staged" and .windowStartUtc == $window and
+  .ledger.path == $ledger and .acceptedCleanLiveHours == 0 and .completedDailyCycles == 0 and
+  .rebootRecoveryPassed == false and .shadowQsetEnabled == false and
+  .azureAuthoritative == true and .azureDeletionAllowed == false
+' "$staged" >/dev/null
+test "$(sha "$rollback/parity-hourly.env.candidate")" = "$(/usr/bin/jq -r '.bindings.formalSha256' "$staged" | /usr/bin/cut -d: -f2)"
+test "$(sha "$rollback/hourly.env.candidate")" = "$(/usr/bin/jq -r '.bindings.hourlySha256' "$staged" | /usr/bin/cut -d: -f2)"
+
+formal_tmp=$(/usr/bin/mktemp "${formal}.XXXXXX")
+hourly_tmp=$(/usr/bin/mktemp "${hourly}.XXXXXX")
+/usr/bin/install -o root -g root -m 0640 "$rollback/parity-hourly.env.candidate" "$formal_tmp"
+/usr/bin/install -o root -g root -m 0600 "$rollback/hourly.env.candidate" "$hourly_tmp"
+/usr/bin/sync -f "$formal_tmp"
+/usr/bin/sync -f "$hourly_tmp"
+commit_candidate_pair "$transaction" "$formal" "$hourly" "$rollback/parity-hourly.env.before" \
+  "$rollback/hourly.env.before" "$rollback/parity-hourly.env.candidate" "$rollback/hourly.env.candidate" "$formal_tmp" "$hourly_tmp"
+formal_tmp=
+hourly_tmp=
+secure_file "$formal" 640 1048576
+secure_file "$hourly" 600 1048576
+POLYEDGE_PARITY_ENV_FILE="$formal" "$validator" validate-ledger
+/usr/local/libexec/polyedge-boot-disk-guard --assert-headroom
+test ! -e /run/polyedge/image-pulls-paused
+
+count=$(/usr/bin/jq -r '.acceptedCleanLiveHours' "$ledger")
+case "$count" in
+  0)
+    test "$(sha "$ledger")" = "$(/usr/bin/jq -r '.ledger.sha256' "$staged" | /usr/bin/cut -d: -f2)"
+    POLYEDGE_PARITY_UTILITY_LOCKED=1 POLYEDGE_PARITY_TARGET_HOUR_UTC="$window" "$collector"
+    ;;
+  1) ;;
+  *) echo "unexpected accepted hour count: $count" >&2; exit 1 ;;
+esac
+
+secure_file "$ledger" 640 1048576
+secure_file "$evidence" 640 1048576
+/usr/bin/jq -e --arg window "$window" --arg evidence "$evidence" --arg collector "$collector_sha" --arg validator "$validator_sha" '
+  .schemaVersion == 1 and .status == "in_progress" and .windowStartUtc == $window and
+  .acceptedCleanLiveHours == 1 and (.acceptedHourlyEvidence | length) == 1 and
+  .acceptedHourlyEvidence[0].hourStartUtc == $window and .acceptedHourlyEvidence[0].path == $evidence and
+  (.acceptedHourlyEvidence[0].sha256 | test("^sha256:[0-9a-f]{64}$")) and
+  .completedDailyCycles == 0 and .acceptedDailyEvidence == [] and
+  .rebootRecoveryPassed == false and (has("rebootRecovery") | not) and
+  .shadowQsetEnabled == false and .fundedSignerEnabled == true and .fundedSignerMode == "active" and
+  .fundedIntentProducerEnabled == true and .parityCollectorSha256 == $collector and
+  .rebootValidatorSha256 == $validator and .azureAuthoritative == true and .azureDeletionAllowed == false
+' "$ledger" >/dev/null
+test "sha256:$(sha "$evidence")" = "$(/usr/bin/jq -r '.acceptedHourlyEvidence[0].sha256' "$ledger")"
+validate_first_hour_evidence "$evidence"
+
+test "$(/usr/bin/date -u +%s)" -lt "$enable_deadline"
+! /usr/bin/systemctl is-enabled --quiet polyedge-parity-hourly.timer
+! /usr/bin/systemctl is-active --quiet polyedge-parity-hourly.timer
+
+receipt_tmp=$(/usr/bin/mktemp /srv/polyedge-ring/parity/activation/.20260822T210000Z-first-hour.XXXXXX)
+/usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg window "$window" \
+  --arg ledger "$ledger" --arg ledgerSha "sha256:$(sha "$ledger")" --arg evidence "$evidence" \
+  --arg evidenceSha "sha256:$(sha "$evidence")" --arg collectorSha "$collector_sha" --arg validatorSha "$validator_sha" '
+  {schemaVersion:1,status:"validated",createdAtUtc:$created,windowStartUtc:$window,
+   ledger:{path:$ledger,sha256:$ledgerSha},evidence:{path:$evidence,sha256:$evidenceSha},
+   collectorSha256:$collectorSha,validatorSha256:$validatorSha,acceptedCleanLiveHours:1,completedDailyCycles:0,
+   rebootRecoveryPassed:false,shadowQsetEnabled:false,recurrenceEnabled:false,
+   azureAuthoritative:true,azureDeletionAllowed:false}
+' >"$receipt_tmp"
+/usr/bin/chown root:root "$receipt_tmp"
+/usr/bin/chmod 0640 "$receipt_tmp"
+/usr/bin/ln "$receipt_tmp" "$validated"
+/usr/bin/rm -f "$receipt_tmp"
+receipt_tmp=
+complete=true
+/usr/bin/logger -p daemon.info -t polyedge-parity-activation "validated first funded-active hour $window; recurring collector remains disabled"
+trap - EXIT HUP INT TERM

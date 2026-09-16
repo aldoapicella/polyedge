@@ -1,0 +1,9 @@
+[Unit]
+Description=Fail-closed qset-v5 UTC boundary guard (%i)
+After=network-online.target polyedge-shadow-qset-v5.service polyedge-shadow-qset-v3.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/polyedge-qset-v5-boundary-guard %i
+TimeoutStartSec=3min
+UMask=0027
