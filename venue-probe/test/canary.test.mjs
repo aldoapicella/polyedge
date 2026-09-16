@@ -36,6 +36,7 @@ import {
   selectFreshCachedSafetySnapshot,
   startSafetySnapshotCache,
   streamBookEvidence,
+  unresolvedAccountPositionCount,
   createAndPostFundedOrderWithinSignalToSendDeadline,
   waitForSafetySnapshotIdle,
   cachedSafetySnapshotStatus
@@ -297,6 +298,14 @@ test("protected-reserve startup rejects malformed or negative position amounts",
       }]
     }), new RegExp(`account position ${field} is invalid`));
   }
+});
+
+test("funded rollover ignores resolved zero-value shares but blocks economic positions", () => {
+  assert.equal(unresolvedAccountPositionCount([
+    { size: 30, currentValue: 0 },
+    { size: 5, currentValue: 0.000001 },
+    { size: 5, currentValue: 1.25 }
+  ]), 2);
 });
 
 test("protected-compounding startup skips settlement activity for an empty manifest ledger", async () => {

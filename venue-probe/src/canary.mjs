@@ -426,10 +426,14 @@ async function migrateProtectedReserveAtStartup({ client, container, manifest })
     fullyReconciled: Math.abs(summedPositionValue - reportedPositionValue) <=
       Number(manifest.max_reconciliation_discrepancy) + 1e-9,
     openOrderCount: openOrders.length,
-    positionCount: positions.filter((row) => row.size > 1e-9).length,
+    positionCount: unresolvedAccountPositionCount(positions),
     unresolvedReservationCount: unresolvedReservations.size,
     sourceUnresolvedReservationCount
   });
+}
+
+export function unresolvedAccountPositionCount(positions) {
+  return positions.filter((row) => Number(row.currentValue) > 1e-9).length;
 }
 
 async function reconcileProtectedCompoundingWithAutomaticSettlement({
