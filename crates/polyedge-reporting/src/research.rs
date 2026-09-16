@@ -7817,6 +7817,7 @@ struct ReplayOrder {
     side: String,
     price: Decimal,
     size: Decimal,
+    minimum_order_size: Option<Decimal>,
     order_kind: String,
     decision_ts: DateTime<Utc>,
     ttl_ms: Option<i64>,
@@ -7922,6 +7923,8 @@ struct ReplayWalletConstraints {
     maximum_drawdown: Decimal,
     maximum_order_notional: Decimal,
     maximum_unresolved_orders_or_positions: usize,
+    simulated_initial_equity: Option<Decimal>,
+    current_equity_policy: Option<ReplayCurrentEquityPolicy>,
     #[serde(skip)]
     source_sha256: Option<String>,
 }
@@ -7934,6 +7937,8 @@ impl Default for ReplayWalletConstraints {
             maximum_drawdown: WALLET_MAX_DRAWDOWN,
             maximum_order_notional: WALLET_MAX_ORDER_NOTIONAL,
             maximum_unresolved_orders_or_positions: 1,
+            simulated_initial_equity: None,
+            current_equity_policy: None,
             source_sha256: None,
         }
     }
@@ -7952,6 +7957,24 @@ impl ReplayWalletConstraints {
             || wallet.maximum_drawdown <= Decimal::ZERO
             || wallet.maximum_order_notional <= Decimal::ZERO
             || wallet.maximum_unresolved_orders_or_positions != 1
+            || wallet.maximum_drawdown > wallet.campaign_baseline - wallet.equity_floor
+            || wallet.simulated_initial_equity.is_some() != wallet.current_equity_policy.is_some()
+            || wallet
+                .simulated_initial_equity
+                .is_some_and(|equity| equity <= Decimal::ZERO || equity.scale() > 6)
+            || wallet
+                .current_equity_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.valid())
+            || (wallet.current_equity_policy.is_some()
+                && [
+                    wallet.campaign_baseline,
+                    wallet.equity_floor,
+                    wallet.maximum_drawdown,
+                    wallet.maximum_order_notional,
+                ]
+                .iter()
+                .any(|value| value.scale() > 6))
         {
             return Err(ResearchError::InvalidInput(
                 "wallet config requires positive baseline/drawdown/order limit, a nonnegative floor below baseline, and exactly one unresolved order or position".to_owned(),
@@ -7962,15 +7985,121 @@ impl ReplayWalletConstraints {
     }
 
     fn as_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "campaign_baseline": self.campaign_baseline.to_string(),
             "equity_floor": self.equity_floor.to_string(),
             "maximum_drawdown": self.maximum_drawdown.to_string(),
             "maximum_order_notional": self.maximum_order_notional.to_string(),
             "maximum_unresolved_orders_or_positions": self.maximum_unresolved_orders_or_positions,
             "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
-        })
+        });
+        if let Some(policy) = &self.current_equity_policy {
+            value["simulated_initial_equity"] = json!(self.initial_equity().to_string());
+            value["current_equity_policy"] = json!(policy);
+            value["fee_basis"] = json!("configured_funded_contract_not_observed_historical_market");
+        }
+        value
     }
+
+    fn initial_equity(&self) -> Decimal {
+        self.simulated_initial_equity
+            .unwrap_or(self.campaign_baseline)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayCurrentEquityPolicy {
+    reserve_ratio: Decimal,
+    minimum_reserve: Decimal,
+    target_order_ratio: Decimal,
+    operating_buffer_ratio: Decimal,
+    minimum_order_notional: Decimal,
+    fee_rate: Decimal,
+    fee_exponent: u32,
+}
+
+impl ReplayCurrentEquityPolicy {
+    fn valid(&self) -> bool {
+        self.reserve_ratio > Decimal::ZERO
+            && self.reserve_ratio < Decimal::ONE
+            && self.target_order_ratio > Decimal::ZERO
+            && self.target_order_ratio < Decimal::ONE
+            && self.operating_buffer_ratio >= Decimal::ZERO
+            && self.operating_buffer_ratio < Decimal::ONE
+            && self.minimum_reserve >= Decimal::ZERO
+            && self.minimum_order_notional >= Decimal::ONE
+            && self.minimum_reserve.scale() <= 6
+            && self.minimum_order_notional.scale() <= 6
+            && self.fee_rate >= Decimal::ZERO
+            && self.fee_rate <= Decimal::ONE
+            && self.fee_exponent <= 10
+    }
+
+    fn fee_per_share(&self, price: Decimal) -> Decimal {
+        self.fee_rate
+            * (0..self.fee_exponent).fold(Decimal::ONE, |product, _| {
+                product * price * (Decimal::ONE - price)
+            })
+    }
+
+    // Keep admission in parity with venue-probe sizeProtectedOrder. The policy
+    // recomputes its reserve after reconciliation; peak equity is diagnostic only.
+    fn size(
+        &self,
+        equity: Decimal,
+        order: &ReplayOrder,
+        fee: Decimal,
+        maximum_notional: Decimal,
+    ) -> Result<Decimal, &'static str> {
+        let venue_minimum = order
+            .minimum_order_size
+            .filter(|minimum| *minimum > Decimal::ZERO)
+            .ok_or("missing_decision_time_venue_minimum")?;
+        if order.price >= Decimal::ONE {
+            return Err("invalid_or_unsupported_order");
+        }
+        let reserve = wallet_money(self.minimum_reserve.max(equity * self.reserve_ratio));
+        let buffer = wallet_money(equity * self.operating_buffer_ratio);
+        let operable = wallet_money((equity - reserve - buffer).max(Decimal::ZERO));
+        if equity <= reserve + self.minimum_order_notional {
+            return Err("protected_reserve_order_floor_reached");
+        }
+        let minimum_shares = venue_minimum
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity)
+            .max(
+                (self.minimum_order_notional / order.price)
+                    .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity),
+            );
+        let budget = (minimum_shares * (order.price + fee))
+            .max(equity * self.target_order_ratio)
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToPositiveInfinity);
+        let shares = order
+            .size
+            .min(maximum_notional / order.price)
+            .min(operable / (order.price + fee))
+            .min(budget / (order.price + fee))
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToNegativeInfinity);
+        let notional = wallet_money(shares * order.price);
+        let reserved = wallet_money(notional + wallet_money(shares * fee));
+        if shares < venue_minimum {
+            return Err("protected_order_below_venue_minimum");
+        }
+        if notional < self.minimum_order_notional {
+            return Err("protected_order_below_policy_minimum");
+        }
+        if shares > order.size || notional > order.size * order.price + Decimal::new(1, 9) {
+            return Err("protected_order_exceeds_source_intent");
+        }
+        if reserved > operable {
+            return Err("operable_capital_exceeded");
+        }
+        Ok(shares)
+    }
+}
+
+fn wallet_money(value: Decimal) -> Decimal {
+    value.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
 }
 
 #[derive(Clone, Debug)]
@@ -8001,7 +8130,7 @@ struct WalletConstrainedResult {
 
 impl WalletConstrainedResult {
     fn as_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "wallet_constrained": true,
             "wallet_constrained_net_pnl": self.net_pnl.to_string(),
             "wallet_constrained_ending_equity": self.ending_equity.to_string(),
@@ -8013,7 +8142,16 @@ impl WalletConstrainedResult {
             "wallet_constrained_skip_reasons": self.skip_reasons,
             "wallet_constrained_equity_curve": self.equity_curve,
             "wallet_constraints": self.constraints.as_json()
-        })
+        });
+        if self.constraints.current_equity_policy.is_some() {
+            value["wallet_constrained_campaign_net_pnl"] =
+                json!((self.ending_equity - self.constraints.campaign_baseline).to_string());
+            value["wallet_constrained_campaign_drawdown"] =
+                json!((self.constraints.campaign_baseline - self.ending_equity)
+                    .max(Decimal::ZERO)
+                    .to_string());
+        }
+        value
     }
 }
 
@@ -8030,7 +8168,7 @@ fn wallet_constrained_replay(
             .then(left_index.cmp(right_index))
     });
 
-    let mut equity = constraints.campaign_baseline;
+    let mut equity = constraints.initial_equity();
     let mut peak_equity = equity;
     let mut max_drawdown = Decimal::ZERO;
     let mut accepted_orders = 0_usize;
@@ -8046,6 +8184,10 @@ fn wallet_constrained_replay(
         "net_pnl": "0",
         "drawdown": "0"
     })];
+    if constraints.current_equity_policy.is_some() {
+        equity_curve[0]["campaign_net_pnl"] =
+            json!((equity - constraints.campaign_baseline).to_string());
+    }
 
     for (_, order) in ordered {
         settle_wallet_pending(
@@ -8056,7 +8198,7 @@ fn wallet_constrained_replay(
             &mut peak_equity,
             &mut max_drawdown,
             &mut equity_curve,
-            constraints.campaign_baseline,
+            constraints,
         );
         if pending.is_some() {
             increment_count(
@@ -8074,7 +8216,10 @@ fn wallet_constrained_replay(
 
         // Size from facts available at decision time only. In particular, neither
         // the eventual fill quantity nor the winning outcome may affect admission.
-        let fee_bound_per_share = if order.is_maker() {
+        let fee_bound_per_share = if let Some(policy) = &constraints.current_equity_policy {
+            // The funded signer reserves the taker fee bound even for post-only orders.
+            policy.fee_per_share(order.price)
+        } else if order.is_maker() {
             Decimal::ZERO
         } else {
             crypto_taker_fee_per_share(order.price).unwrap_or(Decimal::ZERO)
@@ -8085,19 +8230,36 @@ fn wallet_constrained_replay(
             Decimal::ZERO
         };
         let worst_loss_per_share = order.price + fee_bound_per_share + penalty_bound_per_share;
-        let drawdown_floor =
-            (peak_equity - constraints.maximum_drawdown).max(constraints.equity_floor);
-        let loss_budget = equity - drawdown_floor;
-        if loss_budget <= Decimal::ZERO || worst_loss_per_share <= Decimal::ZERO {
-            increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
-            skipped_orders += 1;
-            continue;
-        }
-        let accepted_size = order
-            .size
-            .min(constraints.maximum_order_notional / order.price)
-            .min(equity / order.price)
-            .min(loss_budget / worst_loss_per_share);
+        let accepted_size = if let Some(policy) = &constraints.current_equity_policy {
+            match policy.size(
+                equity,
+                order,
+                fee_bound_per_share,
+                constraints.maximum_order_notional,
+            ) {
+                Ok(size) => size,
+                Err(reason) => {
+                    increment_count(&mut skip_reasons, reason);
+                    skipped_orders += 1;
+                    continue;
+                }
+            }
+        } else {
+            let drawdown_floor =
+                (peak_equity - constraints.maximum_drawdown).max(constraints.equity_floor);
+            let loss_budget = equity - drawdown_floor;
+            if loss_budget <= Decimal::ZERO || worst_loss_per_share <= Decimal::ZERO {
+                increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
+                skipped_orders += 1;
+                continue;
+            }
+            let accepted_size = order
+                .size
+                .min(constraints.maximum_order_notional / order.price)
+                .min(equity / order.price)
+                .min(loss_budget / worst_loss_per_share);
+            accepted_size
+        };
         if accepted_size <= Decimal::ZERO {
             increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
             skipped_orders += 1;
@@ -8109,7 +8271,13 @@ fn wallet_constrained_replay(
         if constrained_fill > Decimal::ZERO {
             accepted_filled_orders += 1;
         }
-        let fee_per_share = if order.filled_size > Decimal::ZERO {
+        let fee_per_share = if let Some(policy) = &constraints.current_equity_policy {
+            if order.is_maker() {
+                Decimal::ZERO
+            } else {
+                policy.fee_per_share(order.avg_price.unwrap_or(order.price))
+            }
+        } else if order.filled_size > Decimal::ZERO {
             order.fee / order.filled_size
         } else {
             Decimal::ZERO
@@ -8157,13 +8325,13 @@ fn wallet_constrained_replay(
             &mut peak_equity,
             &mut max_drawdown,
             &mut equity_curve,
-            constraints.campaign_baseline,
+            constraints,
         );
     }
 
     WalletConstrainedResult {
         constraints: constraints.clone(),
-        net_pnl: equity - constraints.campaign_baseline,
+        net_pnl: equity - constraints.initial_equity(),
         ending_equity: equity,
         max_drawdown,
         accepted_orders,
@@ -8184,7 +8352,7 @@ fn settle_wallet_pending(
     peak_equity: &mut Decimal,
     max_drawdown: &mut Decimal,
     equity_curve: &mut Vec<Value>,
-    campaign_baseline: Decimal,
+    constraints: &ReplayWalletConstraints,
 ) {
     let Some(order) = pending.as_ref() else {
         return;
@@ -8213,6 +8381,9 @@ fn settle_wallet_pending(
         Decimal::ZERO
     };
     *equity += pnl;
+    if constraints.current_equity_policy.is_some() {
+        *equity = wallet_money(*equity);
+    }
     *peak_equity = (*peak_equity).max(*equity);
     let drawdown = *peak_equity - *equity;
     *max_drawdown = (*max_drawdown).max(drawdown);
@@ -8221,9 +8392,13 @@ fn settle_wallet_pending(
         "event": if order.filled_size > Decimal::ZERO { "market_settlement" } else { "unfilled_order_release" },
         "market_id": order.market_id,
         "equity": equity.to_string(),
-        "net_pnl": (*equity - campaign_baseline).to_string(),
+        "net_pnl": (*equity - constraints.initial_equity()).to_string(),
         "drawdown": drawdown.to_string()
     }));
+    if constraints.current_equity_policy.is_some() {
+        equity_curve.last_mut().unwrap()["campaign_net_pnl"] =
+            json!((*equity - constraints.campaign_baseline).to_string());
+    }
 }
 
 fn increment_count(counts: &mut BTreeMap<String, usize>, key: &str) {
@@ -8250,6 +8425,7 @@ struct QueueMarketEvidence {
 struct ResearchReplayEngine {
     request: ReplayRequest,
     markets: BTreeMap<String, MarketTruth>,
+    observed_minimum_order_sizes: BTreeMap<String, Decimal>,
     token_to_market: BTreeMap<String, (String, String)>,
     books: BTreeMap<String, OrderBookState>,
     fair_values: BTreeMap<String, Value>,
@@ -8319,6 +8495,7 @@ impl ResearchReplayEngine {
                 policy: RegimePolicy::new(request.settings.strategy.clone()),
                 request,
                 markets,
+                observed_minimum_order_sizes: BTreeMap::new(),
                 token_to_market,
                 books: BTreeMap::new(),
                 fair_values: BTreeMap::new(),
@@ -8361,6 +8538,7 @@ impl ResearchReplayEngine {
                 policy: RegimePolicy::new(request.settings.strategy.clone()),
                 request,
                 markets,
+                observed_minimum_order_sizes: BTreeMap::new(),
                 token_to_market,
                 books: BTreeMap::new(),
                 fair_values: BTreeMap::new(),
@@ -8481,6 +8659,12 @@ impl ResearchReplayEngine {
         let market = market_from_payload(payload);
         if market.market_id.is_empty() {
             return;
+        }
+        // Never initialize venue rules from preloaded final market truth.
+        self.observed_minimum_order_sizes.remove(&market.market_id);
+        if let Some(minimum) = decimal(payload.get("minimum_order_size")) {
+            self.observed_minimum_order_sizes
+                .insert(market.market_id.clone(), minimum);
         }
         if !market.up_token_id.is_empty() {
             self.token_to_market.insert(
@@ -9201,6 +9385,7 @@ impl ResearchReplayEngine {
             order_id: None,
             applied_order_id: None,
             queue_snapshot_bound: false,
+            minimum_order_size: self.observed_minimum_order_sizes.get(&market_id).copied(),
             market_id,
             token_id,
             outcome: text(payload, "outcome"),
@@ -9835,6 +10020,17 @@ fn run_replay_requests(
     let queue_input_binding = replay_queue_input_binding(input, &stream)?;
     let mut results = Vec::new();
     for mut engine in engines {
+        if wallet.current_equity_policy.is_some()
+            && engine.orders.iter().any(|order| {
+                order
+                    .minimum_order_size
+                    .is_none_or(|minimum| minimum <= Decimal::ZERO)
+            })
+        {
+            return Err(ResearchError::InvalidInput(
+                "current-equity replay requires a positive decision-time venue minimum for every order".to_owned()
+            ));
+        }
         if stream.malformed_lines > 0 {
             engine.warnings.insert(format!(
                 "{} malformed lines skipped",
@@ -10492,24 +10688,25 @@ fn sweep_pnl_eligible(result: &Value) -> bool {
         && result["wallet_constrained_equity_curve"]
             .as_array()
             .is_some_and(|curve| !curve.is_empty())
-        && result["wallet_constrained_max_drawdown"]
-            .as_str()
-            .and_then(|v| v.parse::<Decimal>().ok())
-            .is_some_and(|dd| {
-                result["wallet_constraints"]["maximum_drawdown"]
+        && (result["wallet_constraints"]["current_equity_policy"].is_object()
+            || (result["wallet_constrained_max_drawdown"]
+                .as_str()
+                .and_then(|v| v.parse::<Decimal>().ok())
+                .is_some_and(|dd| {
+                    result["wallet_constraints"]["maximum_drawdown"]
+                        .as_str()
+                        .and_then(|v| v.parse::<Decimal>().ok())
+                        .is_some_and(|limit| dd <= limit)
+                })
+                && result["wallet_constrained_ending_equity"]
                     .as_str()
                     .and_then(|v| v.parse::<Decimal>().ok())
-                    .is_some_and(|limit| dd <= limit)
-            })
-        && result["wallet_constrained_ending_equity"]
-            .as_str()
-            .and_then(|v| v.parse::<Decimal>().ok())
-            .is_some_and(|eq| {
-                result["wallet_constraints"]["equity_floor"]
-                    .as_str()
-                    .and_then(|v| v.parse::<Decimal>().ok())
-                    .is_some_and(|floor| eq >= floor)
-            })
+                    .is_some_and(|eq| {
+                        result["wallet_constraints"]["equity_floor"]
+                            .as_str()
+                            .and_then(|v| v.parse::<Decimal>().ok())
+                            .is_some_and(|floor| eq >= floor)
+                    })))
         && result["market_results"].as_array().is_some_and(|rows| {
             !rows.is_empty() && rows.iter().all(|r| r["complete_for_simulation"] == true)
         })
@@ -13356,6 +13553,7 @@ mod tests {
             side: "buy".to_owned(),
             price: d("0.50"),
             size: d("5"),
+            minimum_order_size: None,
             order_kind: "post_only_gtc".to_owned(),
             decision_ts: wallet_ts(decision),
             ttl_ms: None,
@@ -13372,6 +13570,84 @@ mod tests {
             queue_initial_size_ahead: None,
             queue_size_ahead: None,
         }
+    }
+
+    #[test]
+    fn current_equity_sizing_matches_funded_helper() {
+        let policy = ReplayCurrentEquityPolicy {
+            reserve_ratio: d("0.1"),
+            minimum_reserve: d("2"),
+            target_order_ratio: d("0.05"),
+            operating_buffer_ratio: d("0.01"),
+            minimum_order_notional: d("1"),
+            fee_rate: d("0.07"),
+            fee_exponent: 1,
+        };
+        let vectors = json!([
+            ["50.690567", "0.5", "5", "0.0175"],
+            ["50.690567", "0.2", "5", "0.0112"],
+            ["50.690567", "0.9", "5", "0.0063"],
+            ["3.6", "0.3224734", "5", "0.0152939014404708"]
+        ]);
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../venue-probe/src/compounding-risk.mjs");
+        let output = std::process::Command::new("node")
+            .args([
+                "--input-type=module",
+                "-e",
+                r#"
+            const {sizeProtectedOrder} = await import(process.argv[1]);
+            const rows = JSON.parse(process.argv[2]).map(([e,p,m,f]) => {
+                const equity=Number(e), price=Number(p);
+                return sizeProtectedOrder({state:{high_water_equity:equity, authorized_equity_ceiling:equity,
+                    protected_reserve:Math.round(Math.max(2,equity*.1)*1e6)/1e6,
+                    operating_buffer_ratio:.01, minimum_order_notional:1,
+                    minimum_reserve:2, target_order_ratio:.05},
+                    accountEquity:equity, price, requestedShares:10.5/price,
+                    requestedNotional:10.5, minimumOrderSize:Number(m),
+                    maximumOrderNotional:10.5, feePerShare:Number(f)});
+            });
+            console.log(JSON.stringify(rows));
+        "#,
+            ])
+            .arg(helper)
+            .arg(vectors.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let funded: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        for (input, expected) in vectors.as_array().unwrap().iter().zip(funded) {
+            let mut order = wallet_order("m", "2026-06-01T00:01:00Z", "0");
+            order.price = d(input[1].as_str().unwrap());
+            order.size = d("10.5") / order.price;
+            order.minimum_order_size = Some(d(input[2].as_str().unwrap()));
+            let fee = policy.fee_per_share(order.price);
+            assert_eq!(fee, d(input[3].as_str().unwrap()));
+            let actual = policy.size(d(input[0].as_str().unwrap()), &order, fee, d("10.5"));
+            assert_eq!(actual.is_ok(), expected["executable"] == true);
+            match actual {
+                Ok(shares) => assert_eq!(shares, decimal(expected.get("shares")).unwrap()),
+                Err(reason) => assert!(expected["blockers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == reason)),
+            }
+        }
+        let mut result = json!({"warnings":[], "wallet_constrained_unresolved_orders":0,
+            "wallet_constrained_equity_curve":[{"equity":"3.6"}],
+            "wallet_constrained_max_drawdown":"47.090567", "wallet_constrained_ending_equity":"3.6",
+            "wallet_constraints":{"maximum_drawdown":"29.505501", "equity_floor":"0"},
+            "market_results":[{"complete_for_simulation":true}], "fill_model":"trade_through"});
+        assert!(!sweep_pnl_eligible(&result));
+        result["wallet_constraints"]["current_equity_policy"] = json!(policy);
+        assert!(sweep_pnl_eligible(&result));
+        result["wallet_constrained_unresolved_orders"] = json!(1);
+        assert!(!sweep_pnl_eligible(&result));
     }
 
     #[test]

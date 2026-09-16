@@ -141,6 +141,65 @@ fn explicit_wallet_changes_capital_and_binds_every_baseline_fill_model() {
 }
 
 #[test]
+fn current_equity_wallet_requires_causal_minimum_and_separates_replay_profit() {
+    let dir = test_dir("current_equity_wallet");
+    let raw = dir.join("raw.jsonl");
+    let events = filled_touch_fixture("2026-06-01T00:01:01+00:00");
+    write_events(&raw, &events);
+    let wallet = dir.join("wallet.json");
+    let mut config = json!({
+        "campaign_baseline":"29.505501", "simulated_initial_equity":"50.690567",
+        "equity_floor":"0", "maximum_drawdown":"29.505501", "maximum_order_notional":"10.5",
+        "maximum_unresolved_orders_or_positions":1,
+        "current_equity_policy":{"reserve_ratio":"0.1", "minimum_reserve":"2",
+            "target_order_ratio":"0.05", "operating_buffer_ratio":"0.01", "minimum_order_notional":"1",
+            "fee_rate":"0.07", "fee_exponent":1}
+    });
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    let options = ReplayOptions {
+        wallet_config: Some(wallet.clone()),
+        input: raw.clone(),
+        markets: None,
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    };
+    assert!(run_replay(options.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("decision-time venue minimum"));
+    let mut rows: Vec<Value> = events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for row in &mut rows {
+        if row["event_type"] == "market" {
+            row["payload"]["minimum_order_size"] = json!("5");
+        }
+    }
+    write_events(
+        &raw,
+        &rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let report = run_replay(options.clone()).unwrap();
+    let start = &report["result"]["wallet_constrained_equity_curve"][0];
+    assert_eq!(start["equity"], "50.690567");
+    assert_eq!(start["net_pnl"], "0");
+    assert_eq!(start["campaign_net_pnl"], "21.185066");
+    assert!(report["result"]["wallet_config_sha256"].is_string());
+    config["simulated_initial_equity"] = Value::Null;
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options).is_err());
+}
+
+#[test]
 fn configured_replay_and_profiles_are_used_and_index_binds_real_shards() {
     let dir = test_dir("configured_replay_index");
     let raw = dir.join("raw.jsonl");
