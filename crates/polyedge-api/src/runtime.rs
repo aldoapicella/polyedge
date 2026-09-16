@@ -1750,6 +1750,32 @@ impl RuntimeController {
             }
             data = self.inner.data.write().await;
         }
+        let retained_market_ids = data.markets.keys().cloned().collect::<BTreeSet<_>>();
+        let pending_start_ids = data
+            .pending_market_start_events
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        data.market_start_references.retain(|market_id, _| {
+            retained_market_ids.contains(market_id) || pending_start_ids.contains(market_id)
+        });
+        data.market_start_evidence_durable
+            .retain(|market_id| retained_market_ids.contains(market_id));
+        data.fair_values
+            .retain(|market_id, _| retained_market_ids.contains(market_id));
+        data.chart_samples
+            .retain(|market_id, _| retained_market_ids.contains(market_id));
+        data.chart_last_persisted_ms
+            .retain(|market_id, _| retained_market_ids.contains(market_id));
+        data.settled_markets
+            .retain(|market_id| retained_market_ids.contains(market_id));
+        if data
+            .funded_warmup_market_id
+            .as_ref()
+            .is_some_and(|market_id| !retained_market_ids.contains(market_id))
+        {
+            data.funded_warmup_market_id = None;
+        }
         let warmup_market = select_funded_warmup_market(
             data.markets.values(),
             now,
@@ -1762,6 +1788,12 @@ impl RuntimeController {
         .cloned();
         data.decision_generation = data.decision_generation.wrapping_add(1);
         drop(data);
+        self.inner
+            .engine
+            .lock()
+            .await
+            .regime_classifiers
+            .retain(|market_id, _| retained_market_ids.contains(market_id));
         drop(_decision_guard);
         self.retry_pending_market_start_events().await;
         if let Some(market) = warmup_market {
@@ -6501,6 +6533,100 @@ mod tests {
             .map(|market| market.market_id.to_string()),
             Some("future".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn market_rotation_discards_retired_market_state() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let now = Utc::now();
+        let market = |id: &str| MarketSpec {
+            asset: "BTC".to_owned(),
+            horizon: "15m".to_owned(),
+            event_id: None,
+            event_slug: None,
+            market_id: MarketId::new(id),
+            market_slug: None,
+            condition_id: ConditionId::new(format!("{id}-condition")),
+            question: "BTC up?".to_owned(),
+            description: None,
+            up_token_id: TokenId::new(format!("{id}-up")),
+            down_token_id: TokenId::new(format!("{id}-down")),
+            start_ts: now,
+            end_ts: now + chrono::Duration::minutes(15),
+            start_price: Some(Decimal::from(100)),
+            resolution_source: "chainlink_reference".to_owned(),
+            tick_size: Decimal::new(1, 2),
+            minimum_order_size: Decimal::from(5),
+            neg_risk: false,
+            fees_enabled: true,
+            accepting_orders: true,
+            status: MarketStatus::Tradeable,
+            raw: BTreeMap::new(),
+        };
+        let retired = market("retired");
+        let retained = market("retained");
+        let reference = ReferencePrice {
+            source: "chainlink_rtds".to_owned(),
+            price: Decimal::from(100),
+            source_ts: now,
+            local_ts: now,
+            latency_ms: 0.0,
+            stale: false,
+            exact_resolution_source: true,
+            quality_flags: Vec::new(),
+        };
+        {
+            let mut data = controller.inner.data.write().await;
+            data.markets
+                .insert(retired.market_id.clone(), retired.clone());
+            data.settled_markets.push(retired.market_id.clone());
+            for market_id in [&retired.market_id, &retained.market_id] {
+                data.market_start_references
+                    .insert(market_id.clone(), reference.clone());
+                data.market_start_evidence_durable.insert(market_id.clone());
+                data.fair_values
+                    .insert(market_id.clone(), json!({"p": 0.5}));
+                data.chart_samples.insert(
+                    market_id.clone(),
+                    VecDeque::from(vec![json!({"p": 0.5}); CHART_HISTORY_LIMIT]),
+                );
+                data.chart_last_persisted_ms.insert(market_id.clone(), 1);
+            }
+            data.funded_warmup_market_id = Some(retired.market_id.clone());
+        }
+        {
+            let mut engine = controller.inner.engine.lock().await;
+            engine
+                .regime_classifiers
+                .insert(retired.market_id.clone(), RegimeClassifier::default());
+            engine
+                .regime_classifiers
+                .insert(retained.market_id.clone(), RegimeClassifier::default());
+        }
+
+        controller.replace_markets(vec![retained.clone()]).await;
+
+        let data = controller.inner.data.read().await;
+        for market_id in data
+            .market_start_references
+            .keys()
+            .chain(data.market_start_evidence_durable.iter())
+            .chain(data.fair_values.keys())
+            .chain(data.chart_samples.keys())
+            .chain(data.chart_last_persisted_ms.keys())
+        {
+            assert_ne!(market_id, &retired.market_id);
+        }
+        assert_eq!(
+            data.chart_samples[&retained.market_id].len(),
+            CHART_HISTORY_LIMIT
+        );
+        assert!(!data.settled_markets.contains(&retired.market_id));
+        assert_eq!(data.funded_warmup_market_id, None);
+        drop(data);
+        let engine = controller.inner.engine.lock().await;
+        assert!(!engine.regime_classifiers.contains_key(&retired.market_id));
+        assert!(engine.regime_classifiers.contains_key(&retained.market_id));
     }
 
     #[tokio::test]

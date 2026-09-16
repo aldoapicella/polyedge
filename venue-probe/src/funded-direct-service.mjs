@@ -12,6 +12,76 @@ import { sanitize } from "./lib.mjs";
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
 const FUNDED_BUSY_VALIDATION_LIMIT = 4;
 const FUNDED_OCI_QUEUE_BRIDGE_URL = "http://10.89.0.1:8182/v1/messages";
+const EXPIRED_MARKET_CACHE_ERRORS = new Set([
+  "fail closed: intent market was not found at the venue",
+  "No orderbook exists for the requested token id"
+]);
+
+export async function activeBtcFifteenMinuteMarket() {
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const currentStart = Math.floor(nowSeconds / 900) * 900;
+  for (const start of [currentStart, currentStart + 900]) {
+    const response = await fetch(
+      `https://gamma-api.polymarket.com/markets?slug=btc-updown-15m-${start}`,
+      { signal: AbortSignal.timeout(10_000) }
+    );
+    if (!response.ok) throw new Error(`fail closed: market lookup failed (${response.status})`);
+    const values = await response.json();
+    const market = Array.isArray(values) ? values[0] : null;
+    if (market?.active === true && market?.closed !== true &&
+        market?.acceptingOrders === true &&
+        Date.parse(market.endDate) > Date.now() + 30_000) return market;
+  }
+  throw new Error("fail closed: active BTC 15-minute market was not discoverable");
+}
+
+export function fundedMarketWarmup(market) {
+  let values;
+  try {
+    values = Array.isArray(market?.clobTokenIds)
+      ? market.clobTokenIds
+      : JSON.parse(String(market?.clobTokenIds || "[]"));
+  } catch {
+    throw new Error("fail closed: funded market token ids are invalid");
+  }
+  const tokenIds = values.map(String).filter(Boolean);
+  const marketId = String(market?.id || "").trim();
+  const conditionId = String(market?.conditionId || "").trim();
+  const endMs = Date.parse(String(market?.endDate || ""));
+  if (!marketId || !conditionId || tokenIds.length !== 2 || !Number.isFinite(endMs)) {
+    throw new Error("fail closed: funded market warmup is invalid");
+  }
+  return {
+    market_id: marketId,
+    condition_id: conditionId,
+    token_id: tokenIds[0],
+    token_ids: tokenIds,
+    market_end_ts: new Date(endMs).toISOString()
+  };
+}
+
+export async function recoverExpiredWarmedMarket({
+  executor,
+  discoverMarket = activeBtcFifteenMinuteMarket,
+  nowMs = Date.now()
+}) {
+  const status = executor.status();
+  const warmed = status?.warmed_market;
+  if (status?.reconnect_reconciliation_required !== true ||
+      !EXPIRED_MARKET_CACHE_ERRORS.has(status?.safety_snapshot_cache_error) ||
+      Number(status?.safety_snapshot_cache_in_flight || 0) > 0 ||
+      !Number.isFinite(Date.parse(String(warmed?.market_end_ts || ""))) ||
+      Date.parse(warmed.market_end_ts) > nowMs) return null;
+  const market = await discoverMarket();
+  const next = fundedMarketWarmup(market);
+  if (market.active !== true || market.closed === true || market.acceptingOrders !== true ||
+      Date.parse(next.market_end_ts) <= nowMs + 30_000 ||
+      next.market_id === String(warmed.market_id)) {
+    throw new Error("fail closed: expired market recovery did not discover a new active market");
+  }
+  await executor.warmMarket(next);
+  return { ...next, prior_market_id: String(warmed.market_id) };
+}
 
 function createStreamingInbox(receiver, processError) {
   const pending = [];
@@ -257,6 +327,7 @@ export async function runPersistentFundedDirectService({
   createExecutor = createPersistentCanaryExecutor,
   createProcessor = createFundedDirectProcessor,
   runRedemption = runVenueRedemption,
+  discoverMarket = activeBtcFifteenMinuteMarket,
   now = Date.now,
   sleep = delay,
   createBridgeReceiver = createOciQueueBridgeReceiver,
@@ -624,6 +695,43 @@ export async function runPersistentFundedDirectService({
     if (window.eligible) trackActiveWorkflow(runAutomaticRedemption(window), "maintenance");
   };
   const busyValidations = new Set();
+  let nextExpiredMarketRecoveryAtMs = 0;
+  const maybeRecoverExpiredMarket = async () => {
+    if (activeWorkflow || busyValidations.size > 0) return;
+    const checkedAt = now();
+    if (checkedAt < nextExpiredMarketRecoveryAtMs) return;
+    nextExpiredMarketRecoveryAtMs = checkedAt + config.restartDelayMs;
+    try {
+      const recovered = await recoverExpiredWarmedMarket({
+        executor,
+        discoverMarket,
+        nowMs: checkedAt
+      });
+      if (recovered) {
+        const recoveredStatus = executor.status();
+        const cacheReady = recoveredStatus.safety_snapshot_cache_ready === true &&
+          recoveredStatus.safety_snapshot_cache_error == null;
+        logger({
+          schema: "polyedge.funded_direct_service.v2",
+          status: cacheReady ? "expired_market_recovered" : "expired_market_reconciled_cache_pending",
+          prior_market_id: recovered.prior_market_id,
+          market_id: recovered.market_id,
+          market_end_ts: recovered.market_end_ts,
+          account_risk_pause: !cacheReady,
+          safety_snapshot_cache_ready: cacheReady
+        });
+      }
+    } catch (error) {
+      nextExpiredMarketRecoveryAtMs = checkedAt + config.riskPauseMs;
+      logger({
+        schema: "polyedge.funded_direct_alert.v1",
+        status: "expired_market_recovery_failed_closed",
+        account_risk_pause: true,
+        error: safeErrorMessage(error),
+        error_detail: safeErrorProjection(error)
+      });
+    }
+  };
   const trackBusyValidation = (entry) => {
     const task = processIntent(entry, true);
     busyValidations.add(task);
@@ -646,6 +754,7 @@ export async function runPersistentFundedDirectService({
         ? await streaming.receive(config.pollIntervalMs)
         : (await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs }))[0] || null;
       if (!incoming) {
+        await maybeRecoverExpiredMarket();
         maybeStartAutomaticRedemption();
         await new Promise((resolve) => setImmediate(resolve));
         continue;

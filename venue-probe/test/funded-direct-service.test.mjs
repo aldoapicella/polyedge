@@ -4,6 +4,7 @@ import {
   createOciQueueBridgeReceiver,
   fundedRedemptionMaintenanceWindow,
   loadFundedDirectServiceConfig,
+  recoverExpiredWarmedMarket,
   runFundedDirectService,
   runPersistentFundedDirectService
 } from "../src/funded-direct-service.mjs";
@@ -485,6 +486,130 @@ test("persistent service warms a new market after the active intent finishes", a
   assert.equal(logs.some((value) => value.status === "market_warmup_deferred"), false);
   assert.equal(logs.some((value) => value.status === "market_warmup_waiting"), true);
   assert.equal(logs.some((value) => value.status === "market_warmed"), true);
+});
+
+test("expired missing market recovery warms a newly discovered active market only", async () => {
+  const now = Date.parse("2026-09-16T18:15:00Z");
+  const status = {
+    reconnect_reconciliation_required: true,
+    safety_snapshot_cache_error: "fail closed: intent market was not found at the venue",
+    warmed_market: {
+      market_id: "expired-market",
+      market_end_ts: "2026-09-16T18:00:00Z"
+    }
+  };
+  const warmups = [];
+  let discoveries = 0;
+  const executor = {
+    status: () => status,
+    warmMarket: async (value) => warmups.push(value)
+  };
+  const discoverMarket = async () => {
+    discoveries += 1;
+    return {
+      id: "active-market",
+      conditionId: "active-condition",
+      clobTokenIds: ["up-token", "down-token"],
+      endDate: "2026-09-16T18:30:00Z",
+      active: true,
+      closed: false,
+      acceptingOrders: true
+    };
+  };
+
+  const recovered = await recoverExpiredWarmedMarket({
+    executor,
+    discoverMarket,
+    nowMs: now
+  });
+
+  assert.equal(recovered.prior_market_id, "expired-market");
+  assert.deepEqual(warmups, [{
+    market_id: "active-market",
+    condition_id: "active-condition",
+    token_id: "up-token",
+    token_ids: ["up-token", "down-token"],
+    market_end_ts: "2026-09-16T18:30:00.000Z"
+  }]);
+  assert.equal(discoveries, 1);
+
+  status.safety_snapshot_cache_in_flight = 1;
+  assert.equal(await recoverExpiredWarmedMarket({ executor, discoverMarket, nowMs: now }), null);
+  status.safety_snapshot_cache_in_flight = 0;
+  status.safety_snapshot_cache_error = "No orderbook exists for the requested token id";
+  assert.equal((await recoverExpiredWarmedMarket({
+    executor,
+    discoverMarket,
+    nowMs: now
+  })).market_id, "active-market");
+  assert.equal(discoveries, 2);
+
+  status.warmed_market.market_end_ts = "2026-09-16T18:30:00Z";
+  assert.equal(await recoverExpiredWarmedMarket({ executor, discoverMarket, nowMs: now }), null);
+  status.warmed_market.market_end_ts = "2026-09-16T18:00:00Z";
+  status.safety_snapshot_cache_error = "temporary venue timeout";
+  assert.equal(await recoverExpiredWarmedMarket({ executor, discoverMarket, nowMs: now }), null);
+  assert.equal(discoveries, 2);
+});
+
+test("expired market discovery failure backs off on the idle service path", async () => {
+  const warmup = {
+    messageId: "stop-after-backoff",
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_market_warmup.v1",
+      market_id: "stop-market",
+      token_id: "stop-token"
+    }
+  };
+  let receiveCalls = 0;
+  const receiver = {
+    async receiveMessages() {
+      receiveCalls += 1;
+      return receiveCalls < 3 ? [] : [warmup];
+    },
+    async completeMessage() {},
+    async abandonMessage() {},
+    async deadLetterMessage() {},
+    async close() {}
+  };
+  let now = Date.parse("2026-09-16T18:15:00Z");
+  let discoveries = 0;
+  const logs = [];
+
+  await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "1" }),
+    now: () => { now += 1_000; return now; },
+    createBusClient: () => ({
+      createReceiver: () => receiver,
+      async close() {}
+    }),
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      status: () => ({
+        reconnect_reconciliation_required: true,
+        safety_snapshot_cache_error: "fail closed: intent market was not found at the venue",
+        safety_snapshot_cache_in_flight: 0,
+        warmed_market: {
+          market_id: "expired-market",
+          market_end_ts: "2026-09-16T18:00:00Z"
+        }
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({ process: async () => ({}) }),
+    discoverMarket: async () => {
+      discoveries += 1;
+      throw new Error("Gamma 429");
+    },
+    logger: (value) => logs.push(value)
+  });
+
+  assert.equal(receiveCalls, 3);
+  assert.equal(discoveries, 1);
+  assert.equal(logs.filter((value) =>
+    value.status === "expired_market_recovery_failed_closed").length, 1);
 });
 
 test("persistent service counts only terminal warmup failures after a successful redelivery", async () => {
