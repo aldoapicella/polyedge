@@ -7,7 +7,7 @@ use polyedge_reporting::research::{
     FinalReportOptions, NormalizeOptions, ProspectiveValidationOptions, QueueAuditOptions,
     RegimesOptions, ReplayIndexOptions, ReplayOptions, SampleSizeOptions, SweepOptions,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +79,68 @@ fn invalid_event_timestamps_are_rejected_in_raw_and_merged_inputs() {
 }
 
 #[test]
+fn explicit_wallet_changes_capital_and_binds_every_baseline_fill_model() {
+    let dir = test_dir("explicit_wallet");
+    let raw = dir.join("raw.jsonl");
+    write_events(&raw, &filled_touch_fixture("2026-06-01T00:01:01+00:00"));
+    let wallet = dir.join("wallet.json");
+    let mut config = json!({
+        "campaign_baseline": "20", "equity_floor": "19",
+        "maximum_drawdown": "0.5", "maximum_order_notional": "0.1",
+        "maximum_unresolved_orders_or_positions": 1
+    });
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut options = ReplayOptions {
+        wallet_config: None,
+        input: raw.clone(),
+        markets: None,
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    };
+    let historical = run_replay(options.clone()).unwrap();
+    options.wallet_config = Some(wallet.clone());
+    let configured = run_replay(options.clone()).unwrap();
+    assert_ne!(
+        historical["result"]["wallet_constrained_net_pnl"],
+        configured["result"]["wallet_constrained_net_pnl"]
+    );
+    assert_eq!(
+        configured["result"]["wallet_constrained_equity_curve"][0]["equity"],
+        "20"
+    );
+    let hash = configured["result"]["wallet_config_sha256"].clone();
+    assert!(hash.as_str().unwrap().starts_with("sha256:"));
+    let baseline = run_baseline(BaselineOptions {
+        wallet_config: Some(wallet.clone()),
+        input: raw,
+        markets: None,
+        out: dir.join("baseline.json"),
+        markdown: dir.join("baseline.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    for row in baseline["result"]["fill_models"].as_array().unwrap() {
+        assert_eq!(row["wallet_config_sha256"], hash);
+        assert_eq!(row["wallet_constraints"]["campaign_baseline"], "20");
+        assert_eq!(row["wallet_constraints"]["maximum_order_notional"], "0.1");
+    }
+    config["maximum_unresolved_orders_or_positions"] = json!(2);
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options.clone()).is_err());
+    config["maximum_unresolved_orders_or_positions"] = json!(1);
+    config["equity_floor"] = json!("20");
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options.clone()).is_err());
+    config["equity_floor"] = json!("19");
+    config["ignored_limit"] = json!("999");
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options).is_err());
+}
+
+#[test]
 fn configured_replay_and_profiles_are_used_and_index_binds_real_shards() {
     let dir = test_dir("configured_replay_index");
     let raw = dir.join("raw.jsonl");
@@ -89,6 +151,7 @@ fn configured_replay_and_profiles_are_used_and_index_binds_real_shards() {
     let config = dir.join("strategy.json");
     fs::write(&config, b"{ invalid json }").unwrap();
     let options = ReplayOptions {
+        wallet_config: None,
         input: raw.clone(),
         markets: None,
         strategy_config: Some(config.clone()),
@@ -127,6 +190,7 @@ fn configured_replay_and_profiles_are_used_and_index_binds_real_shards() {
     )
     .unwrap();
     let error = run_regimes(RegimesOptions {
+        wallet_config: None,
         input: raw.clone(),
         markets: None,
         fill_model: FillModel::Touch,
@@ -266,6 +330,7 @@ fn adverse_penalty_uses_fresh_fill_reference_and_requires_later_evidence() {
         let input = dir.join(format!("{name}.jsonl"));
         write_events(&input, &lines.join("\n"));
         let report = run_replay(ReplayOptions {
+            wallet_config: None,
             input,
             markets: None,
             strategy_config: None,
@@ -466,6 +531,7 @@ fn exclude_window_skips_events_and_prevents_contaminated_fills() {
     assert_eq!(audit["result"]["excluded_event_count"], 3);
 
     let replay = run_replay(ReplayOptions {
+        wallet_config: None,
         input: events,
         markets: None,
         strategy_config: None,
@@ -795,6 +861,7 @@ fn gzip_normalized_outputs_feed_build_markets_and_replay() {
     assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
 
     let replay = run_replay(ReplayOptions {
+        wallet_config: None,
         input: normalized,
         markets: Some(markets_path),
         strategy_config: None,
@@ -847,6 +914,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
     assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
 
     let replay = run_replay(ReplayOptions {
+        wallet_config: None,
         input: normalized,
         markets: Some(markets_path),
         strategy_config: None,
@@ -1017,6 +1085,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     })
     .unwrap();
     let baseline = run_baseline(BaselineOptions {
+        wallet_config: None,
         input: events.clone(),
         markets: None,
         out: reports.join("baseline.json"),
@@ -1033,6 +1102,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     })
     .unwrap();
     let sweep = run_sweep(SweepOptions {
+        wallet_config: None,
         test_input: None,
         test_markets: None,
         input: events.clone(),
@@ -1537,6 +1607,7 @@ fn future_settlement_reference_is_not_a_decision_time_feature() {
     );
 
     let report = run_regimes(RegimesOptions {
+        wallet_config: None,
         input: events,
         markets: None,
         fill_model: FillModel::Touch,
@@ -1592,6 +1663,7 @@ fn sweep_without_separate_holdout_is_validation_only() {
     let input = dir.join("events.jsonl");
     write_events(&input, &five_day_fixture());
     let report = run_sweep(SweepOptions {
+        wallet_config: None,
         input,
         markets: None,
         test_input: None,
@@ -1641,6 +1713,7 @@ quote_style: [fair_minus_margin_only]
     .unwrap();
 
     let report = run_sweep(SweepOptions {
+        wallet_config: None,
         test_input: None,
         test_markets: None,
         input: events,
@@ -1700,6 +1773,7 @@ fn sweep_rejects_search_parameters_that_are_not_applied() {
     fs::write(&search, "version: 1\nmaker_margin: [0.01, 0.02]\n").unwrap();
 
     let error = run_sweep(SweepOptions {
+        wallet_config: None,
         test_input: None,
         test_markets: None,
         input: events,
@@ -1747,6 +1821,7 @@ fn sweep_search_rejects_zero_configured_runs_duplicate_json_and_multiple_version
         let search = dir.join(name);
         fs::write(&search, text).unwrap();
         let error = run_sweep(SweepOptions {
+            wallet_config: None,
             test_input: None,
             test_markets: None,
             input: events.clone(),
@@ -1809,6 +1884,7 @@ fn sweep_report_rule_text_matches_fail_closed_computation() {
     write_events(&events, &filled_five_day_fixture("101"));
 
     let report = run_sweep(SweepOptions {
+        wallet_config: None,
         test_input: None,
         test_markets: None,
         input: events,
@@ -1846,6 +1922,7 @@ fn sweep_report_rule_text_matches_fail_closed_computation() {
 
 fn replay(dir: &Path, events: &Path, fill_model: FillModel) -> Value {
     run_replay(ReplayOptions {
+        wallet_config: None,
         input: events.to_path_buf(),
         markets: None,
         strategy_config: None,
@@ -2096,6 +2173,7 @@ fn run_leakage_sweep(name: &str, final_day_price: &str) -> Value {
         .unwrap();
     }
     let options = SweepOptions {
+        wallet_config: None,
         input: dir.join("selection"),
         markets: None,
         test_input: Some(dir.join("holdout")),

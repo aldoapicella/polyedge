@@ -362,6 +362,7 @@ pub struct SettlementCarryOptions {
 
 #[derive(Clone, Debug)]
 pub struct ReplayOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub markets: Option<PathBuf>,
     pub strategy_config: Option<PathBuf>,
@@ -373,6 +374,7 @@ pub struct ReplayOptions {
 
 #[derive(Clone, Debug)]
 pub struct BaselineOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub markets: Option<PathBuf>,
     pub out: PathBuf,
@@ -382,6 +384,7 @@ pub struct BaselineOptions {
 
 #[derive(Clone, Debug)]
 pub struct RegimesOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub markets: Option<PathBuf>,
     pub fill_model: FillModel,
@@ -393,6 +396,7 @@ pub struct RegimesOptions {
 
 #[derive(Clone, Debug)]
 pub struct SweepOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub test_input: Option<PathBuf>,
     pub test_markets: Option<PathBuf>,
@@ -804,6 +808,7 @@ fn replay_settings(
 
 pub fn run_replay(options: ReplayOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     let markets = load_market_truth(options.markets.as_deref())?;
     let (settings, strategy_config_sha256) = replay_settings(options.strategy_config.as_deref())?;
     let request = ReplayRequest {
@@ -817,6 +822,7 @@ pub fn run_replay(options: ReplayOptions) -> Result<Value, ResearchError> {
         &markets,
         vec![request],
         &options.exclude_windows,
+        &wallet,
     )?;
     let mut result = results.pop().unwrap_or_else(empty_replay_result);
     result["strategy_config_sha256"] = json!(strategy_config_sha256);
@@ -840,6 +846,7 @@ pub fn run_replay(options: ReplayOptions) -> Result<Value, ResearchError> {
 
 pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     let markets = load_market_truth(options.markets.as_deref())?;
     let settings = RuntimeSettings::default();
     let requests = FillModel::all_baseline()
@@ -851,8 +858,13 @@ pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
             settings: settings.clone(),
         })
         .collect::<Vec<_>>();
-    let results =
-        run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
+    let results = run_replay_requests(
+        &options.input,
+        &markets,
+        requests,
+        &options.exclude_windows,
+        &wallet,
+    )?;
     let result = json!({
         "fill_models": results,
         "primary_unit": "settled_market_net_pnl",
@@ -878,6 +890,7 @@ pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
 
 pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     let projected_campaign_manifest_sha256 = {
         let path = options.input.join(PROJECTED_CAMPAIGN_INDEX_FILE);
         if path.is_file() {
@@ -924,8 +937,13 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
             settings: settings.clone(),
         })
         .collect::<Vec<_>>();
-    let results =
-        run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
+    let results = run_replay_requests(
+        &options.input,
+        &markets,
+        requests,
+        &options.exclude_windows,
+        &wallet,
+    )?;
     let static_net = results
         .iter()
         .find(|row| row["profile"].as_str() == Some("static"))
@@ -1002,6 +1020,7 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
 
 pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     if !options.split.eq_ignore_ascii_case("walk_forward") {
         return Err(ResearchError::InvalidInput(format!(
             "sweep selection supports only chronological walk_forward, got {}",
@@ -1056,8 +1075,13 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
         ));
     }
     let requests = sweep_replay_requests(&build.candidates, &settings);
-    let results =
-        run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
+    let results = run_replay_requests(
+        &options.input,
+        &markets,
+        requests,
+        &options.exclude_windows,
+        &wallet,
+    )?;
     if selection_markets_before != options.markets.as_ref().map(fs::read).transpose()? {
         return Err(ResearchError::InvalidInput(
             "selection market truth changed during replay".to_owned(),
@@ -1102,6 +1126,7 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
                 "fill_models":sweep_fill_models().map(|m|m.as_str()),
                 "candidate_set_sha256":sha256_prefixed(&serde_json::to_vec(&build.candidates.iter().map(|c|json!({"name":c.name,"parameters":c.parameters_json()})).collect::<Vec<_>>())?),
                 "validation_ranking_sha256":sha256_prefixed(&serde_json::to_vec(&candidates)?),
+                "wallet_constraints":wallet.as_json(), "wallet_config_sha256":wallet.source_sha256,
                 "git_sha":git_sha()});
                 let state_root = std::env::var_os("XDG_STATE_HOME")
                     .map(PathBuf::from)
@@ -1129,6 +1154,7 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
                     &test_markets,
                     sweep_replay_requests(std::slice::from_ref(winner), &settings),
                     &options.exclude_windows,
+                    &wallet,
                 )?;
                 if holdout_id != holdout_inventory_identity(test_input)?
                     || test_binding != labs::collect_replay_index_inputs(test_input)?
@@ -1178,6 +1204,8 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
     ));
     let result = json!({
         "schema_version": 3,
+        "wallet_constraints": wallet.as_json(),
+        "wallet_config_sha256": wallet.source_sha256,
         "split_method": options.split,
         "split_plan": plan,
         "fold_results": fold_results,
@@ -7885,6 +7913,66 @@ impl ReplayOrder {
     }
 }
 
+/// An explicit research wallet, shared by every candidate and fill assumption.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayWalletConstraints {
+    campaign_baseline: Decimal,
+    equity_floor: Decimal,
+    maximum_drawdown: Decimal,
+    maximum_order_notional: Decimal,
+    maximum_unresolved_orders_or_positions: usize,
+    #[serde(skip)]
+    source_sha256: Option<String>,
+}
+
+impl Default for ReplayWalletConstraints {
+    fn default() -> Self {
+        Self {
+            campaign_baseline: WALLET_CAMPAIGN_BASELINE,
+            equity_floor: WALLET_EQUITY_FLOOR,
+            maximum_drawdown: WALLET_MAX_DRAWDOWN,
+            maximum_order_notional: WALLET_MAX_ORDER_NOTIONAL,
+            maximum_unresolved_orders_or_positions: 1,
+            source_sha256: None,
+        }
+    }
+}
+
+impl ReplayWalletConstraints {
+    fn load(path: Option<&Path>) -> Result<Self, ResearchError> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let bytes = fs::read(path)?;
+        let mut wallet: Self = serde_json::from_slice(&bytes)?;
+        if wallet.campaign_baseline <= Decimal::ZERO
+            || wallet.equity_floor < Decimal::ZERO
+            || wallet.equity_floor >= wallet.campaign_baseline
+            || wallet.maximum_drawdown <= Decimal::ZERO
+            || wallet.maximum_order_notional <= Decimal::ZERO
+            || wallet.maximum_unresolved_orders_or_positions != 1
+        {
+            return Err(ResearchError::InvalidInput(
+                "wallet config requires positive baseline/drawdown/order limit, a nonnegative floor below baseline, and exactly one unresolved order or position".to_owned(),
+            ));
+        }
+        wallet.source_sha256 = Some(sha256_prefixed(&bytes));
+        Ok(wallet)
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "campaign_baseline": self.campaign_baseline.to_string(),
+            "equity_floor": self.equity_floor.to_string(),
+            "maximum_drawdown": self.maximum_drawdown.to_string(),
+            "maximum_order_notional": self.maximum_order_notional.to_string(),
+            "maximum_unresolved_orders_or_positions": self.maximum_unresolved_orders_or_positions,
+            "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 struct WalletPendingOrder {
     market_id: String,
@@ -7899,6 +7987,7 @@ struct WalletPendingOrder {
 
 #[derive(Clone, Debug)]
 struct WalletConstrainedResult {
+    constraints: ReplayWalletConstraints,
     net_pnl: Decimal,
     ending_equity: Decimal,
     max_drawdown: Decimal,
@@ -7923,14 +8012,7 @@ impl WalletConstrainedResult {
             "wallet_constrained_unresolved_orders": self.unresolved_orders,
             "wallet_constrained_skip_reasons": self.skip_reasons,
             "wallet_constrained_equity_curve": self.equity_curve,
-            "wallet_constraints": {
-                "campaign_baseline": WALLET_CAMPAIGN_BASELINE.to_string(),
-                "equity_floor": WALLET_EQUITY_FLOOR.to_string(),
-                "maximum_drawdown": WALLET_MAX_DRAWDOWN.to_string(),
-                "maximum_order_notional": WALLET_MAX_ORDER_NOTIONAL.to_string(),
-                "maximum_unresolved_orders_or_positions": 1,
-                "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
-            }
+            "wallet_constraints": self.constraints.as_json()
         })
     }
 }
@@ -7939,6 +8021,7 @@ fn wallet_constrained_replay(
     orders: &[ReplayOrder],
     markets: &BTreeMap<String, MarketTruth>,
     fill_model: FillModel,
+    constraints: &ReplayWalletConstraints,
 ) -> WalletConstrainedResult {
     let mut ordered = orders.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by(|(left_index, left), (right_index, right)| {
@@ -7947,7 +8030,7 @@ fn wallet_constrained_replay(
             .then(left_index.cmp(right_index))
     });
 
-    let mut equity = WALLET_CAMPAIGN_BASELINE;
+    let mut equity = constraints.campaign_baseline;
     let mut peak_equity = equity;
     let mut max_drawdown = Decimal::ZERO;
     let mut accepted_orders = 0_usize;
@@ -7973,6 +8056,7 @@ fn wallet_constrained_replay(
             &mut peak_equity,
             &mut max_drawdown,
             &mut equity_curve,
+            constraints.campaign_baseline,
         );
         if pending.is_some() {
             increment_count(
@@ -8001,7 +8085,8 @@ fn wallet_constrained_replay(
             Decimal::ZERO
         };
         let worst_loss_per_share = order.price + fee_bound_per_share + penalty_bound_per_share;
-        let drawdown_floor = (peak_equity - WALLET_MAX_DRAWDOWN).max(WALLET_EQUITY_FLOOR);
+        let drawdown_floor =
+            (peak_equity - constraints.maximum_drawdown).max(constraints.equity_floor);
         let loss_budget = equity - drawdown_floor;
         if loss_budget <= Decimal::ZERO || worst_loss_per_share <= Decimal::ZERO {
             increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
@@ -8010,7 +8095,7 @@ fn wallet_constrained_replay(
         }
         let accepted_size = order
             .size
-            .min(WALLET_MAX_ORDER_NOTIONAL / order.price)
+            .min(constraints.maximum_order_notional / order.price)
             .min(equity / order.price)
             .min(loss_budget / worst_loss_per_share);
         if accepted_size <= Decimal::ZERO {
@@ -8072,11 +8157,13 @@ fn wallet_constrained_replay(
             &mut peak_equity,
             &mut max_drawdown,
             &mut equity_curve,
+            constraints.campaign_baseline,
         );
     }
 
     WalletConstrainedResult {
-        net_pnl: equity - WALLET_CAMPAIGN_BASELINE,
+        constraints: constraints.clone(),
+        net_pnl: equity - constraints.campaign_baseline,
         ending_equity: equity,
         max_drawdown,
         accepted_orders,
@@ -8097,6 +8184,7 @@ fn settle_wallet_pending(
     peak_equity: &mut Decimal,
     max_drawdown: &mut Decimal,
     equity_curve: &mut Vec<Value>,
+    campaign_baseline: Decimal,
 ) {
     let Some(order) = pending.as_ref() else {
         return;
@@ -8133,7 +8221,7 @@ fn settle_wallet_pending(
         "event": if order.filled_size > Decimal::ZERO { "market_settlement" } else { "unfilled_order_release" },
         "market_id": order.market_id,
         "equity": equity.to_string(),
-        "net_pnl": (*equity - WALLET_CAMPAIGN_BASELINE).to_string(),
+        "net_pnl": (*equity - campaign_baseline).to_string(),
         "drawdown": drawdown.to_string()
     }));
 }
@@ -9485,7 +9573,7 @@ impl ResearchReplayEngine {
             .find(|reference| reference.ts <= now)
     }
 
-    fn finish(mut self) -> Value {
+    fn finish(mut self, wallet_constraints: &ReplayWalletConstraints) -> Value {
         let adverse_missing = if self.request.fill_model == FillModel::AdverseSelectionPenalized {
             self.orders
                 .iter()
@@ -9514,8 +9602,12 @@ impl ResearchReplayEngine {
         for market in self.markets.values_mut() {
             market.finalize_flags();
         }
-        let wallet =
-            wallet_constrained_replay(&self.orders, &self.markets, self.request.fill_model);
+        let wallet = wallet_constrained_replay(
+            &self.orders,
+            &self.markets,
+            self.request.fill_model,
+            wallet_constraints,
+        );
         let wallet_json = wallet.as_json();
         let queue_eligible_market_ids = self
             .queue_market_evidence
@@ -9724,6 +9816,7 @@ fn run_replay_requests(
     markets: &[MarketTruth],
     requests: Vec<ReplayRequest>,
     exclude_windows: &[ExcludedTimeWindow],
+    wallet: &ReplayWalletConstraints,
 ) -> Result<Vec<Value>, ResearchError> {
     let mut engines = requests
         .into_iter()
@@ -9756,7 +9849,10 @@ fn run_replay_requests(
                 engine.warnings.insert(text.to_owned());
             }
         }
-        let mut result = engine.finish();
+        let mut result = engine.finish(wallet);
+        if let Some(hash) = &wallet.source_sha256 {
+            result["wallet_config_sha256"] = json!(hash);
+        }
         if let Some(object) = result.as_object_mut() {
             insert_exclusion_metadata(object, &stream, exclude_windows);
             if let Some(queue) = object
@@ -10399,11 +10495,21 @@ fn sweep_pnl_eligible(result: &Value) -> bool {
         && result["wallet_constrained_max_drawdown"]
             .as_str()
             .and_then(|v| v.parse::<Decimal>().ok())
-            .is_some_and(|dd| dd <= WALLET_MAX_DRAWDOWN)
+            .is_some_and(|dd| {
+                result["wallet_constraints"]["maximum_drawdown"]
+                    .as_str()
+                    .and_then(|v| v.parse::<Decimal>().ok())
+                    .is_some_and(|limit| dd <= limit)
+            })
         && result["wallet_constrained_ending_equity"]
             .as_str()
             .and_then(|v| v.parse::<Decimal>().ok())
-            .is_some_and(|eq| eq >= WALLET_EQUITY_FLOOR)
+            .is_some_and(|eq| {
+                result["wallet_constraints"]["equity_floor"]
+                    .as_str()
+                    .and_then(|v| v.parse::<Decimal>().ok())
+                    .is_some_and(|floor| eq >= floor)
+            })
         && result["market_results"].as_array().is_some_and(|rows| {
             !rows.is_empty() && rows.iter().all(|r| r["complete_for_simulation"] == true)
         })
@@ -13290,7 +13396,12 @@ mod tests {
             wallet_order("m3", "2026-06-01T00:16:01Z", "5"),
         ];
 
-        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+        let result = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.accepted_orders, 2);
         assert_eq!(result.skipped_orders, 1);
@@ -13317,10 +13428,18 @@ mod tests {
             wallet_order("eligible", "2026-06-01T00:02:00Z", "5"),
         ];
 
-        let full_wallet =
-            wallet_constrained_replay(&orders, &markets, FillModel::QueueProxyConservative);
-        let filtered_wallet =
-            wallet_constrained_replay(&orders[1..], &markets, FillModel::QueueProxyConservative);
+        let full_wallet = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::QueueProxyConservative,
+            &ReplayWalletConstraints::default(),
+        );
+        let filtered_wallet = wallet_constrained_replay(
+            &orders[1..],
+            &markets,
+            FillModel::QueueProxyConservative,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(full_wallet.net_pnl, Decimal::ZERO);
         assert_eq!(full_wallet.accepted_orders, 1);
@@ -13349,7 +13468,12 @@ mod tests {
             wallet_order("m2", "2026-06-01T00:16:00Z", "5"),
         ];
 
-        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+        let result = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.net_pnl, -Decimal::ONE);
         assert_eq!(result.ending_equity, d("4.030521"));
@@ -13378,7 +13502,12 @@ mod tests {
             wallet_order("m2", "2026-06-01T00:16:00Z", "5"),
         ];
 
-        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+        let result = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.accepted_orders, 2);
         assert_eq!(result.net_pnl, d("2"));
@@ -13413,8 +13542,18 @@ mod tests {
             ),
         ]);
 
-        let winner = wallet_constrained_replay(&orders, &markets_for_winner, FillModel::Touch);
-        let loser = wallet_constrained_replay(&orders, &markets_for_loser, FillModel::Touch);
+        let winner = wallet_constrained_replay(
+            &orders,
+            &markets_for_winner,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
+        let loser = wallet_constrained_replay(
+            &orders,
+            &markets_for_loser,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(winner.accepted_orders, loser.accepted_orders);
         assert_eq!(winner.skipped_orders, loser.skipped_orders);
@@ -13431,8 +13570,12 @@ mod tests {
         order.fee = d("0.01");
         order.adverse_penalty = d("0.005");
 
-        let result =
-            wallet_constrained_replay(&[order], &markets, FillModel::AdverseSelectionPenalized);
+        let result = wallet_constrained_replay(
+            &[order],
+            &markets,
+            FillModel::AdverseSelectionPenalized,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.net_pnl, d("-0.515"));
         assert_eq!(result.accepted_filled_orders, 1);
@@ -13655,7 +13798,7 @@ mod tests {
                 raw: Value::Null,
             });
         }
-        let replay = replay.finish();
+        let replay = replay.finish(&ReplayWalletConstraints::default());
         assert_eq!(replay["orders"], 1);
         assert_eq!(replay["fills"], 0);
         assert_eq!(replay["net_pnl"], "0");
@@ -13741,7 +13884,7 @@ mod tests {
             raw: Value::Null,
         });
 
-        let result = replay.finish();
+        let result = replay.finish(&ReplayWalletConstraints::default());
         assert_eq!(result["orders"], 1);
         assert_eq!(result["fills"], 0);
         assert_eq!(result["replay_metrics"]["fills_prevented_expired"], 1);

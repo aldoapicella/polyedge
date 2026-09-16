@@ -649,6 +649,9 @@ enum ResearchCommand {
         market_day: Option<String>,
     },
     Replay {
+        /// Exact research wallet constraints; omitted retains historical defaults.
+        #[arg(long)]
+        wallet_config: Option<PathBuf>,
         #[arg(long, default_value = "data/research/normalized")]
         input: PathBuf,
         #[arg(long, default_value = "data/research/markets.json")]
@@ -667,6 +670,9 @@ enum ResearchCommand {
         exclude_window: Vec<String>,
     },
     Baseline {
+        /// Exact research wallet constraints; omitted retains historical defaults.
+        #[arg(long)]
+        wallet_config: Option<PathBuf>,
         #[arg(long, default_value = "data/research/normalized")]
         input: PathBuf,
         #[arg(long, default_value = "data/research/markets.json")]
@@ -687,6 +693,9 @@ enum ResearchCommand {
         exclude_window: Vec<String>,
     },
     Regimes {
+        /// Exact research wallet constraints; omitted retains historical defaults.
+        #[arg(long)]
+        wallet_config: Option<PathBuf>,
         #[arg(long, default_value = "data/research/normalized")]
         input: PathBuf,
         #[arg(long, default_value = "data/research/markets.json")]
@@ -705,6 +714,9 @@ enum ResearchCommand {
         exclude_window: Vec<String>,
     },
     Sweep {
+        /// Exact research wallet constraints; omitted retains historical defaults.
+        #[arg(long)]
+        wallet_config: Option<PathBuf>,
         /// Sealed holdout events; never used during candidate selection.
         #[arg(long)]
         test_input: Option<PathBuf>,
@@ -1459,6 +1471,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             )?,
         })?,
         ResearchCommand::Replay {
+            wallet_config,
             input,
             markets,
             strategy_config,
@@ -1468,6 +1481,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_file,
             exclude_window,
         } => run_replay(ReplayOptions {
+            wallet_config,
             input,
             markets: Some(markets),
             strategy_config,
@@ -1477,6 +1491,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Baseline {
+            wallet_config,
             input,
             markets,
             out,
@@ -1484,6 +1499,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_file,
             exclude_window,
         } => run_baseline(BaselineOptions {
+            wallet_config,
             input,
             markets: Some(markets),
             out,
@@ -1491,6 +1507,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Regimes {
+            wallet_config,
             input,
             markets,
             fill_model,
@@ -1500,6 +1517,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_file,
             exclude_window,
         } => run_regimes(RegimesOptions {
+            wallet_config,
             input,
             markets: Some(markets),
             fill_model: fill_model.parse::<FillModel>()?,
@@ -1509,6 +1527,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
         ResearchCommand::Sweep {
+            wallet_config,
             input,
             test_input,
             test_markets,
@@ -1521,6 +1540,7 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_file,
             exclude_window,
         } => run_sweep(SweepOptions {
+            wallet_config,
             test_input,
             test_markets,
             input,

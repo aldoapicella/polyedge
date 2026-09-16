@@ -2,6 +2,8 @@
 
 Research runs remain separate from funded execution and qset promotion. The default replay wallet is the existing paper campaign wallet; it is not an authenticated current funded balance.
 
+`replay`, `baseline`, `regimes`, and `sweep` accept `--wallet-config` with an exact-byte-hashed JSON object containing `campaign_baseline`, `equity_floor`, `maximum_drawdown`, `maximum_order_notional`, and `maximum_unresolved_orders_or_positions` (currently exactly one). Positive decimal limits and a nonnegative floor below the baseline are required; unknown fields fail. The same parsed wallet is used across every candidate, fill model and fixed-winner holdout, and its hash is included in the pre-test receipt. These static limits do not yet implement the funded compounding reserve, operating buffer, target ratio or venue minimum; supplying them alone does not establish full funded-policy parity.
+
 - Event ingestion skips missing or invalid top-level timestamps, counts them as malformed, and reports `invalid_timestamps`. It never substitutes wall-clock time.
 - `replay --strategy-config` accepts the serialized `polyedge_config::StrategyConfig` JSON shape. The exact bytes are hashed. Without the option, existing defaults apply. `regimes --profile-config` reads the frozen candidate registry and hashes the same bytes it parses.
 - `build-replay-index` binds every local normalized shard and the exhaustive raw-source inventory by SHA-256. It rejects missing, extra, or unbound files and remote paths. Its output is an input binding manifest, not a materialized feature database.
