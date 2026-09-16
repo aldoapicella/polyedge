@@ -4,6 +4,7 @@ const STATE_SCHEMA_V1 = "polyedge.protected_compounding_state.v1";
 const STATE_SCHEMA_V2 = "polyedge.protected_compounding_state.v2";
 const SESSION_SCHEMA_V2 = "polyedge.operator_funded_session.v2";
 const SESSION_SCHEMA_V3 = "polyedge.operator_funded_session.v3";
+export const UNBOUNDED_SESSION_SCHEMA = "polyedge.operator_funded_session.v4";
 const MONOTONIC_RESERVE_BASIS = "fully_reconciled_high_water_equity";
 const CURRENT_EQUITY_RESERVE_BASIS = "fully_reconciled_current_equity";
 const LOSS_RESIZE_POLICY = "resize_from_fully_reconciled_current_equity";
@@ -31,13 +32,20 @@ export function validateProtectedCompoundingManifest(manifest) {
     ? manifest.internal_settlements
     : [];
   const errors = [];
-  const currentEquityPolicy = manifest?.schema_version === SESSION_SCHEMA_V3;
+  const currentEquityPolicy = [SESSION_SCHEMA_V3, UNBOUNDED_SESSION_SCHEMA]
+    .includes(manifest?.schema_version);
+  const currentEquityPredecessor =
+    manifest?.schema_version === UNBOUNDED_SESSION_SCHEMA;
   const lossTolerantPolicy = currentEquityPolicy
     && (policy?.minimum_reserve !== undefined
       || policy?.target_order_ratio !== undefined);
   if (manifest?.schema_version !== undefined
-      && ![SESSION_SCHEMA_V2, SESSION_SCHEMA_V3].includes(manifest?.schema_version)) {
+      && ![SESSION_SCHEMA_V2, SESSION_SCHEMA_V3, UNBOUNDED_SESSION_SCHEMA]
+        .includes(manifest?.schema_version)) {
     errors.push("schema_version must be a protected capital session schema");
+  }
+  if (currentEquityPredecessor && manifest?.expires_at !== null) {
+    errors.push("unbounded funded sessions require expires_at null");
   }
   if (manifest?.allow_compounding !== true) errors.push("allow_compounding must be true");
   if (currentEquityPolicy) {
@@ -80,11 +88,14 @@ export function validateProtectedCompoundingManifest(manifest) {
     if (Number(policy?.target_order_ratio) !== LOSS_TOLERANT_TARGET_ORDER_RATIO) {
       errors.push(`capital_policy.target_order_ratio must equal ${LOSS_TOLERANT_TARGET_ORDER_RATIO}`);
     }
-    if (!normalizedSha256(policy?.prior_state_sha256)) {
-      errors.push("capital_policy.prior_state_sha256 is required for loss-tolerant sizing");
-    }
   } else if (Number(policy?.reserve_ratio) !== 0.3) {
     errors.push("capital_policy.reserve_ratio must equal 0.3");
+  }
+  if (lossTolerantPolicy && !normalizedSha256(policy?.prior_state_sha256)) {
+    errors.push("capital_policy.prior_state_sha256 is required for loss-tolerant sizing");
+  } else if (currentEquityPredecessor
+      && !normalizedSha256(policy?.prior_state_sha256)) {
+    errors.push("capital_policy.prior_state_sha256 is required for an unbounded rollover");
   }
   if (Number(policy?.operating_buffer_ratio) !== 0.01) {
     errors.push("capital_policy.operating_buffer_ratio must equal 0.01");
@@ -115,12 +126,13 @@ export function validateProtectedCompoundingManifest(manifest) {
     stateSchema: currentEquityPolicy ? STATE_SCHEMA_V2 : STATE_SCHEMA_V1,
     priorStateBlobName: currentEquityPolicy ? String(policy.prior_state_blob_name) : null,
     priorStateSessionId: currentEquityPolicy ? String(policy.prior_state_session_id) : null,
-    priorStateSha256: lossTolerantPolicy
+    priorStateSha256: lossTolerantPolicy || currentEquityPredecessor
       ? normalizedSha256(policy.prior_state_sha256)
       : null,
     minimumHistoricalHighWaterEquity: currentEquityPolicy
       ? Number(policy.minimum_historical_high_water_equity)
       : null,
+    ...(currentEquityPredecessor ? { currentEquityPredecessor: true } : {}),
     ...(lossTolerantPolicy ? {
       minimumReserve: LOSS_TOLERANT_MINIMUM_RESERVE,
       targetOrderRatio: LOSS_TOLERANT_TARGET_ORDER_RATIO
@@ -131,6 +143,55 @@ export function validateProtectedCompoundingManifest(manifest) {
 }
 
 export function validateProtectedCompoundingPredecessorState(state, policy, actualHash = null) {
+  if (policy?.currentEquityPredecessor === true) {
+    const equity = Number(state?.last_reconciled_equity);
+    const highWater = Number(state?.high_water_equity);
+    const historicalHighWater = Number(state?.historical_high_water_equity);
+    const protectedReserve = Number(state?.protected_reserve);
+    const operatingBuffer = Number(state?.operating_buffer);
+    const operableCapital = Number(state?.operable_capital);
+    const expectedReserve = money(Math.max(
+      Number(policy.minimumReserve || 0),
+      equity * Number(policy.reserveRatio)
+    ));
+    const expectedBuffer = money(equity * Number(policy.operatingBufferRatio));
+    if (state?.schema !== STATE_SCHEMA_V2
+        || state?.session_id !== policy?.priorStateSessionId
+        || state?.reconciliation_complete !== true
+        || state?.reserve_monotonic !== false
+        || state?.reserve_basis !== CURRENT_EQUITY_RESERVE_BASIS
+        || state?.loss_response !== LOSS_RESIZE_POLICY
+        || state?.continue_after_loss !== true
+        || Number(state?.reserve_ratio) !== policy.reserveRatio
+        || (policy.targetOrderRatio !== undefined
+          && (Number(state?.minimum_reserve) !== policy.minimumReserve
+            || Number(state?.target_order_ratio) !== policy.targetOrderRatio))
+        || (policy.targetOrderRatio === undefined
+          && (state?.minimum_reserve !== undefined
+            || state?.target_order_ratio !== undefined))
+        || Number(state?.operating_buffer_ratio) !== policy.operatingBufferRatio
+        || Number(state?.minimum_order_notional) !== policy.minimumOrderNotional
+        || ![equity, highWater, historicalHighWater, protectedReserve,
+          operatingBuffer, operableCapital, Number(state?.authorized_equity_ceiling)]
+          .every((value) => Number.isFinite(value) && value >= 0)
+        || !Number.isFinite(Number(state?.verified_realized_pnl))
+        || highWater + 1e-9 < Number(policy.minimumHistoricalHighWaterEquity)
+        || historicalHighWater + 1e-9 < highWater
+        || equity > Number(state.authorized_equity_ceiling) + 1e-9
+        || !moneyEqual(protectedReserve, expectedReserve)
+        || !moneyEqual(operatingBuffer, expectedBuffer)
+        || !moneyEqual(
+          operableCapital,
+          Math.max(0, equity - expectedReserve - expectedBuffer)
+        )
+        || !Array.isArray(state?.verified_settlement_ids)
+        || new Set(state.verified_settlement_ids).size !==
+          state.verified_settlement_ids.length
+        || normalizedSha256(actualHash) !== policy.priorStateSha256) {
+      throw new Error("fail closed: prior funded current-equity state is unavailable or incompatible");
+    }
+    return state;
+  }
   if (state?.schema !== STATE_SCHEMA_V1
       || state?.session_id !== policy?.priorStateSessionId
       || state?.reconciliation_complete !== true
@@ -144,6 +205,15 @@ export function validateProtectedCompoundingPredecessorState(state, policy, actu
     throw new Error("fail closed: prior funded high-water state is unavailable or incompatible");
   }
   return state;
+}
+
+export function fundedSessionExpiryMs(manifest) {
+  if (manifest?.schema_version === UNBOUNDED_SESSION_SCHEMA) {
+    return manifest?.expires_at === null ? Number.POSITIVE_INFINITY : Number.NaN;
+  }
+  return typeof manifest?.expires_at === "string"
+    ? Date.parse(manifest.expires_at)
+    : Number.NaN;
 }
 
 export async function verifyConfiguredInternalSettlements({
@@ -752,15 +822,20 @@ export async function migrateProtectedReserveState({
   openOrderCount,
   positionCount,
   unresolvedReservationCount,
+  sourceUnresolvedReservationCount,
   now = () => new Date()
 }) {
   const policy = validateProtectedCompoundingManifest(manifest);
+  const currentEquityTarget = policy.currentEquityPredecessor === true;
   const sourceHash = normalizedSha256(source?.sessionHash);
   const minimumHistoricalHighWaterEquity = Number(
     source?.minimumHistoricalHighWaterEquity
   );
-  if (!container || manifest?.schema_version !== SESSION_SCHEMA_V2 || !policy.reserveMonotonic) {
-    throw new Error("fail closed: protected reserve migration requires the monotonic target session");
+  if (!container || !(
+    (manifest?.schema_version === SESSION_SCHEMA_V2 && policy.reserveMonotonic)
+    || (manifest?.schema_version === UNBOUNDED_SESSION_SCHEMA && currentEquityTarget)
+  )) {
+    throw new Error("fail closed: protected reserve migration requires a supported target session");
   }
   if (!safeSessionId(source?.sessionId)
       || !safeBlobName(source?.sessionBlobName)
@@ -785,8 +860,11 @@ export async function migrateProtectedReserveState({
       || sourceManifest?.session_id !== source.sessionId
       || sourcePolicy.reserveMonotonic
       || sourcePolicy.stateBlobName !== source.stateBlobName
-      || sourcePolicy.priorStateSessionId !== manifest.session_id
-      || sourcePolicy.priorStateBlobName !== policy.stateBlobName) {
+      || (currentEquityTarget
+        ? (policy.priorStateSessionId !== source.sessionId
+          || policy.priorStateBlobName !== source.stateBlobName)
+        : (sourcePolicy.priorStateSessionId !== manifest.session_id
+          || sourcePolicy.priorStateBlobName !== policy.stateBlobName))) {
     throw new Error("fail closed: protected reserve migration source session is incompatible");
   }
 
@@ -827,6 +905,30 @@ export async function migrateProtectedReserveState({
     ...policy.internalSettlements,
     ...uniqueTargetLedger
   ]);
+  const sourceSettlementsToCopy = currentEquityTarget
+    ? uniqueSourceLedger
+    : uniqueSource;
+  const migratedSourceSettlements = sourceSettlementsToCopy.map((settlement) =>
+    migratedInternalSettlementValue({
+      settlement,
+      targetSessionId: manifest.session_id,
+      source,
+      sourceHash,
+      sourceStateEtag: sourceStateDocument.etag
+    }));
+  let checkpoint = initialTarget?.value;
+  const checkpointMigrationIds = new Set(
+    checkpoint?.migration_verified_settlement_ids || []
+  );
+  if (currentEquityTarget
+      && (policy.internalSettlements.some((configured) =>
+        !uniqueSource.some((row) => settlementAccountingEqual(row, configured)))
+        || uniqueTargetLedger.some((row) =>
+          (!checkpoint || checkpointMigrationIds.has(row.id))
+          && !migratedSourceSettlements.some((expected) =>
+            JSON.stringify(expected) === JSON.stringify(row))))) {
+    throw new Error("fail closed: unbounded rollover target ledger provenance is invalid");
+  }
   const sourceSettlementIds = uniqueSource.map((row) => row.id).sort();
   const sourceRealizedPnl = money(uniqueSource.reduce(
     (total, row) => total + Number(row.realized_pnl),
@@ -842,6 +944,13 @@ export async function migrateProtectedReserveState({
     sourceCeiling,
     minimumHistoricalHighWaterEquity
   );
+  if (currentEquityTarget) {
+    validateProtectedCompoundingPredecessorState(
+      sourceStateDocument.value,
+      policy,
+      sourceStateDocument.hash
+    );
+  }
 
   const stableSourceState = await readState(container, source.stateBlobName);
   if (stableSourceState?.etag !== sourceStateDocument.etag
@@ -849,8 +958,14 @@ export async function migrateProtectedReserveState({
     throw new Error("fail closed: protected reserve migration source state changed during verification");
   }
 
-  const checkpoint = initialTarget?.value;
   if (checkpoint?.migration_source_session_id !== undefined) {
+    if (currentEquityTarget
+        && (fullyReconciled !== true
+          || Number(openOrderCount) !== 0
+          || Number(positionCount) !== 0
+          || Number(sourceUnresolvedReservationCount) !== 0)) {
+      throw new Error("fail closed: unbounded rollover checkpoint requires a flat source account");
+    }
     const checkpointIds = checkpoint.migration_verified_settlement_ids;
     const checkpointSettlements = checkpointIds.map((id) =>
       uniqueTargetLedger.find((row) => row.id === id));
@@ -862,10 +977,45 @@ export async function migrateProtectedReserveState({
     const targetCeiling = money(
       Number(manifest.starting_collateral) + targetRealizedPnl
     );
+    const persistedSettlementIds = checkpoint.verified_settlement_ids;
+    const persistedSettlements = persistedSettlementIds.map((id) =>
+      uniqueTargetLedger.find((row) => row.id === id));
+    const persistedRealizedPnl = money(persistedSettlements.reduce(
+      (total, row) => total + Number(row?.realized_pnl || 0),
+      0
+    ));
+    const ledgerAhead = JSON.stringify(persistedSettlementIds) !==
+      JSON.stringify(targetSettlementIds);
+    if (persistedSettlements.some((row) => !row)
+        || !moneyEqual(checkpoint.verified_realized_pnl, persistedRealizedPnl)
+        || !moneyEqual(
+          checkpoint.authorized_equity_ceiling,
+          Number(manifest.starting_collateral) + persistedRealizedPnl
+        )
+        || (currentEquityTarget && ledgerAhead
+          && Number(unresolvedReservationCount) !== 0)) {
+      throw new Error("fail closed: persisted protected reserve migration checkpoint is invalid");
+    }
+    if (currentEquityTarget && ledgerAhead) {
+      checkpoint = await reconcileProtectedCompoundingState({
+        container,
+        manifest,
+        accountEquity,
+        fullyReconciled: true,
+        now
+      });
+    } else if (currentEquityTarget
+        && !moneyEqual(checkpoint.last_reconciled_equity, accountEquity)) {
+      throw new Error("fail closed: unbounded rollover checkpoint requires a flat source account");
+    }
     const currentHighWater = Number(checkpoint.high_water_equity);
     const historicalHighWater = Number(checkpoint.historical_high_water_equity);
     const lastEquity = Number(checkpoint.last_reconciled_equity);
     const protectedReserve = Number(checkpoint.protected_reserve);
+    const requiredReserve = currentEquityTarget
+      ? money(Math.max(Number(policy.minimumReserve || 0),
+        lastEquity * policy.reserveRatio))
+      : money(currentHighWater * policy.reserveRatio);
     const operatingBuffer = money(lastEquity * policy.operatingBufferRatio);
     const requiredSettlements = uniqueSettlements([
       ...policy.internalSettlements,
@@ -894,6 +1044,7 @@ export async function migrateProtectedReserveState({
           lastEquity
         )
         || historicalHighWater + 1e-9 < currentHighWater
+        || !moneyEqual(protectedReserve, requiredReserve)
         || !moneyEqual(checkpoint.operating_buffer, operatingBuffer)
         || !moneyEqual(
           checkpoint.operable_capital,
@@ -936,23 +1087,27 @@ export async function migrateProtectedReserveState({
   if (equity > authorizedEquityCeiling + Number(manifest.max_reconciliation_discrepancy) + 1e-9) {
     throw new Error("fail closed: protected reserve migration equity exceeds the verified ceiling");
   }
-  for (const settlement of uniqueSource) {
-    if (uniqueTarget.some((row) => row.id === settlement.id)) continue;
-    await putVerifiedInternalSettlement(container, {
-      ...settlement,
-      session_id: manifest.session_id,
-      ...(settlement.campaign_id ? { campaign_id: manifest.session_id } : {}),
-      migration_source_session_id: source.sessionId,
-      migration_source_session_blob_name: source.sessionBlobName,
-      migration_source_session_sha256: sourceHash,
-      migration_source_settlement_blob_name: internalSettlementBlobName(
-        source.sessionId,
-        settlement.transaction_hash,
-        settlement.condition_id
-      ),
-      migration_source_state_blob_name: source.stateBlobName,
-      migration_source_state_etag: sourceStateDocument.etag
-    });
+  for (const [index, settlement] of sourceSettlementsToCopy.entries()) {
+    if (!currentEquityTarget
+        && uniqueTarget.some((row) => row.id === settlement.id)) continue;
+    await putVerifiedInternalSettlement(
+      container,
+      currentEquityTarget ? migratedSourceSettlements[index] : {
+        ...settlement,
+        session_id: manifest.session_id,
+        ...(settlement.campaign_id ? { campaign_id: manifest.session_id } : {}),
+        migration_source_session_id: source.sessionId,
+        migration_source_session_blob_name: source.sessionBlobName,
+        migration_source_session_sha256: sourceHash,
+        migration_source_settlement_blob_name: internalSettlementBlobName(
+          source.sessionId,
+          settlement.transaction_hash,
+          settlement.condition_id
+        ),
+        migration_source_state_blob_name: source.stateBlobName,
+        migration_source_state_etag: sourceStateDocument.etag
+      }
+    );
   }
   const migratedLedger = await loadDurableInternalSettlements(container, manifest.session_id);
   const migratedSettlements = uniqueSettlements(migratedLedger);
@@ -960,7 +1115,10 @@ export async function migrateProtectedReserveState({
       || JSON.stringify(migratedSettlements.map((row) => row.id).sort()) !==
         JSON.stringify(settlementIds)
       || settlements.some((row) => !migratedSettlements.some((migrated) =>
-        settlementAccountingEqual(row, migrated)))) {
+        settlementAccountingEqual(row, migrated)))
+      || (currentEquityTarget && migratedSettlements.some((row) =>
+        !migratedSourceSettlements.some((expected) =>
+          JSON.stringify(expected) === JSON.stringify(row))))) {
     throw new Error("fail closed: protected reserve migration ledger read-back mismatch");
   }
 
@@ -980,11 +1138,14 @@ export async function migrateProtectedReserveState({
       Number(prior?.high_water_equity || 0),
       Number(prior?.historical_high_water_equity || 0)
     ));
-    const protectedReserve = money(Math.max(
-      highWater * policy.reserveRatio,
-      Number(sourceStateDocument.value.protected_reserve),
-      Number(prior?.protected_reserve || 0)
-    ));
+    const protectedReserve = currentEquityTarget
+      ? money(Math.max(Number(policy.minimumReserve || 0),
+        equity * policy.reserveRatio))
+      : money(Math.max(
+        highWater * policy.reserveRatio,
+        Number(sourceStateDocument.value.protected_reserve),
+        Number(prior?.protected_reserve || 0)
+      ));
     const operatingBuffer = money(equity * policy.operatingBufferRatio);
     const checkpointMatches = prior
       && prior.migration_source_session_id === source.sessionId
@@ -1012,12 +1173,19 @@ export async function migrateProtectedReserveState({
       verified_settlement_ids: settlementIds,
       reconciliation_complete: true,
       historical_high_water_equity: highWater,
-      prior_state_session_id: null,
-      prior_state_blob_name: null,
+      prior_state_session_id: policy.priorStateSessionId,
+      prior_state_blob_name: policy.priorStateBlobName,
+      ...(policy.priorStateSha256 ? {
+        prior_state_sha256: policy.priorStateSha256
+      } : {}),
       reserve_basis: policy.reserveBasis,
-      loss_response: null,
-      continue_after_loss: false,
-      reserve_monotonic: true,
+      loss_response: policy.lossResponse,
+      continue_after_loss: !policy.reserveMonotonic,
+      reserve_monotonic: policy.reserveMonotonic,
+      ...(policy.targetOrderRatio === undefined ? {} : {
+        minimum_reserve: policy.minimumReserve,
+        target_order_ratio: policy.targetOrderRatio
+      }),
       migration_source_session_id: source.sessionId,
       migration_source_session_blob_name: source.sessionBlobName,
       migration_source_session_sha256: sourceHash,
@@ -1033,6 +1201,7 @@ export async function migrateProtectedReserveState({
       created_at: prior?.created_at || now().toISOString(),
       updated_at: now().toISOString()
     };
+    assertCompatibleState(value, manifest, policy);
     if (prior && checkpointMatches && sameCapitalState(prior, value)) {
       return migrationResult(prior, sourceStateDocument, sourceHash, authorizedEquityCeiling);
     }
@@ -1230,15 +1399,7 @@ export async function putVerifiedInternalSettlement(container, settlement) {
     settlement.transaction_hash,
     settlement.condition_id
   );
-  const value = {
-    schema: "polyedge.verified_internal_settlement.v1",
-    ...settlement,
-    transaction_hash: normalizedHash(settlement.transaction_hash),
-    condition_id: normalizedHash(settlement.condition_id),
-    payout: money(settlement.payout),
-    principal: money(settlement.principal),
-    realized_pnl: money(settlement.realized_pnl)
-  };
+  const value = durableInternalSettlementValue(settlement);
   const bytes = Buffer.from(JSON.stringify(value, null, 2));
   try {
     await container.getBlockBlobClient(name).uploadData(bytes, {
@@ -1253,6 +1414,42 @@ export async function putVerifiedInternalSettlement(container, settlement) {
     }
   }
   return { blob_name: name, value };
+}
+
+function durableInternalSettlementValue(settlement) {
+  return {
+    schema: "polyedge.verified_internal_settlement.v1",
+    ...settlement,
+    transaction_hash: normalizedHash(settlement.transaction_hash),
+    condition_id: normalizedHash(settlement.condition_id),
+    payout: money(settlement.payout),
+    principal: money(settlement.principal),
+    realized_pnl: money(settlement.realized_pnl)
+  };
+}
+
+function migratedInternalSettlementValue({
+  settlement,
+  targetSessionId,
+  source,
+  sourceHash,
+  sourceStateEtag
+}) {
+  return durableInternalSettlementValue({
+    ...settlement,
+    session_id: targetSessionId,
+    ...(settlement.campaign_id ? { campaign_id: targetSessionId } : {}),
+    migration_source_session_id: source.sessionId,
+    migration_source_session_blob_name: source.sessionBlobName,
+    migration_source_session_sha256: sourceHash,
+    migration_source_settlement_blob_name: internalSettlementBlobName(
+      source.sessionId,
+      settlement.transaction_hash,
+      settlement.condition_id
+    ),
+    migration_source_state_blob_name: source.stateBlobName,
+    migration_source_state_etag: sourceStateEtag
+  });
 }
 
 export async function loadDurableInternalSettlements(container, sessionId) {
@@ -1333,7 +1530,10 @@ function assertMigrationSourceState(
         authorizedEquityCeiling,
         lastEquity
       )
-      || Math.abs(protectedReserve - lastEquity * policy.reserveRatio) > 0.0000011
+      || !moneyEqual(
+        protectedReserve,
+        Math.max(Number(policy.minimumReserve || 0), lastEquity * policy.reserveRatio)
+      )
       || Math.abs(operatingBuffer - lastEquity * policy.operatingBufferRatio) > 0.0000011
       || Math.abs(operableCapital - Math.max(
         0,
@@ -1348,9 +1548,20 @@ function assertMigrationSourceState(
 
 function assertMigrationTargetState(state, manifest, policy, source, sourceHash) {
   if (!state) return;
+  const checkpointSource = state?.migration_source_session_id;
+  if (policy.currentEquityPredecessor === true) {
+    assertCompatibleState(state, manifest, policy);
+    if (checkpointSource !== undefined
+        && (checkpointSource !== source.sessionId
+          || state.migration_source_session_blob_name !== source.sessionBlobName
+          || state.migration_source_session_sha256 !== sourceHash
+          || state.migration_source_state_blob_name !== source.stateBlobName)) {
+      throw new Error("fail closed: protected reserve migration target state is incompatible");
+    }
+    return;
+  }
   const highWater = Number(state?.high_water_equity);
   const protectedReserve = Number(state?.protected_reserve);
-  const checkpointSource = state?.migration_source_session_id;
   if (state?.schema !== STATE_SCHEMA_V1
       || state?.session_id !== manifest.session_id
       || state?.reconciliation_complete !== true
@@ -1481,6 +1692,8 @@ function assertMigrationCheckpoint(state) {
   const historicalHighWater = Number(state?.historical_high_water_equity);
   const protectedReserve = Number(state?.protected_reserve);
   const reserveRatio = Number(state?.reserve_ratio);
+  const lastEquity = Number(state?.last_reconciled_equity);
+  const minimumReserve = Number(state?.minimum_reserve || 0);
   const migrationCeiling = Number(state?.migration_verified_equity_ceiling);
   const currentCeiling = Number(state?.authorized_equity_ceiling);
   if (!safeSessionId(state?.migration_source_session_id)
@@ -1500,7 +1713,13 @@ function assertMigrationCheckpoint(state) {
       || historicalHighWater + 1e-9 < minimumHighWater
       || !Number.isFinite(reserveRatio)
       || !Number.isFinite(protectedReserve)
-      || protectedReserve + 0.0000011 < highWater * reserveRatio
+      || (state?.reserve_monotonic === true
+        ? protectedReserve + 0.0000011 < highWater * reserveRatio
+        : (!Number.isFinite(lastEquity)
+          || !moneyEqual(
+            protectedReserve,
+            Math.max(minimumReserve, lastEquity * reserveRatio)
+          )))
       || !Number.isFinite(migrationCeiling)
       || !Number.isFinite(currentCeiling)
       || migrationCeiling > currentCeiling + 1e-9

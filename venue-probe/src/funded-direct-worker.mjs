@@ -7,6 +7,8 @@ import {
   VENUE_GTD_SECURITY_BUFFER_MS
 } from "./canary-lib.mjs";
 import {
+  fundedSessionExpiryMs,
+  UNBOUNDED_SESSION_SCHEMA,
   validateProtectedCompoundingManifest,
   validateProtectedCompoundingPredecessorState
 } from "./compounding-risk.mjs";
@@ -61,8 +63,10 @@ export function loadFundedDirectConfig(env = process.env) {
   if (!config.enabled) errors.push("FUNDED_DIRECT_WORKER_ENABLED must be true");
   if (!config.allowed) errors.push("ALLOW_FUNDED_DIRECT must be true");
   if (!config.session) errors.push("FUNDED_DIRECT_SESSION_MANIFEST_JSON must be valid JSON");
-  if (config.preflightOnly && config.session?.schema_version !== SESSION_SCHEMA_V3) {
-    errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY requires an exact predecessor-bound v3 session");
+  if (config.preflightOnly &&
+      ![SESSION_SCHEMA_V3, UNBOUNDED_SESSION_SCHEMA]
+        .includes(config.session?.schema_version)) {
+    errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY requires an exact predecessor-bound session");
   }
   if (config.preflightOnly && env.FUNDED_DIRECT_DRY_RUN !== "true") {
     errors.push("FUNDED_DIRECT_PREFLIGHT_ONLY requires FUNDED_DIRECT_DRY_RUN=true");
@@ -687,10 +691,11 @@ async function selectedFromHandoff(
 function validateSession(config) {
   const value = config.session;
   const created = Date.parse(value?.created_at);
-  const expires = Date.parse(value?.expires_at);
+  const expires = fundedSessionExpiryMs(value);
   const expectedHash = sha256(Buffer.from(JSON.stringify(value, null, 2)));
   let capitalModeValid = false;
-  if ([SESSION_SCHEMA_V2, SESSION_SCHEMA_V3].includes(value?.schema_version)) {
+  if ([SESSION_SCHEMA_V2, SESSION_SCHEMA_V3, UNBOUNDED_SESSION_SCHEMA]
+      .includes(value?.schema_version)) {
     try {
       validateProtectedCompoundingManifest(value);
       capitalModeValid = value.allow_compounding === true;
@@ -710,7 +715,8 @@ function validateSession(config) {
     }
     capitalModeValid = value.allow_compounding === false && profitQuarantineValid;
   }
-  const valid = [SESSION_SCHEMA_V1, SESSION_SCHEMA_V2, SESSION_SCHEMA_V3]
+  const valid = [SESSION_SCHEMA_V1, SESSION_SCHEMA_V2, SESSION_SCHEMA_V3,
+    UNBOUNDED_SESSION_SCHEMA]
     .includes(value?.schema_version)
     && clean(value.session_id)
     && value.authorization_mode === "operator_direct"
@@ -742,8 +748,8 @@ function validateSession(config) {
     && hash(value.execution_model?.sha256)
     && clean(value.execution_model?.blob_uri)
     && Number.isFinite(created)
-    && Number.isFinite(expires)
-    && expires > created
+    && (expires === Number.POSITIVE_INFINITY ||
+      (Number.isFinite(expires) && expires > created))
     && expectedHash === config.sessionHash;
   if (!valid) throw new Error("funded_direct_worker blocked: operator-funded session contract is invalid or hash-mismatched");
 }
@@ -911,7 +917,7 @@ function qualificationRejection(
   const venueExpiryMs = Date.parse(intent?.gtd_expiry_ts);
   const marketEndMs = Date.parse(intent?.market_end_ts);
   const sessionStartMs = Date.parse(session.created_at);
-  const sessionExpiryMs = Date.parse(session.expires_at);
+  const sessionExpiryMs = fundedSessionExpiryMs(session);
   const nowMs = now.getTime();
   const price = Number(intent?.price);
   const shares = Number(intent?.shares);

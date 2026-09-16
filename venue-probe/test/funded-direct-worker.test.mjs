@@ -108,6 +108,23 @@ function preflightSession() {
   return value;
 }
 
+function unboundedSession() {
+  const value = preflightSession();
+  value.schema_version = "polyedge.operator_funded_session.v4";
+  value.session_id = "dynamic-quote-funded-test-v11";
+  value.expires_at = null;
+  value.capital_policy = {
+    ...value.capital_policy,
+    prior_state_session_id: "dynamic-quote-funded-test-v10",
+    prior_state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v10/capital-reserve-state.json",
+    prior_state_sha256: `sha256:${"c".repeat(64)}`,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v11/capital-reserve-state.json"
+  };
+  return value;
+}
+
 function preflightEnv(value = preflightSession(), overrides = {}) {
   return env({
     FUNDED_DIRECT_PREFLIGHT_ONLY: "true",
@@ -808,6 +825,45 @@ test("worker executes a fresh Dynamic Quote intent under the operator session", 
   assert.equal(calls, 1);
   assert.equal(output.status, "iteration_limit_reached");
   assert.equal(output.childInvocations, 1);
+});
+
+test("worker accepts short-lived intents under an explicitly unbounded v4 session", async () => {
+  const now = new Date("2030-07-27T12:00:00Z");
+  const value = intent(now);
+  const fundedSession = unboundedSession();
+  let childInvocations = 0;
+  const output = await runFundedDirectWorker({
+    env: env({
+      FUNDED_DIRECT_MAX_ITERATIONS: "1",
+      FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(fundedSession),
+      FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+        sha256(Buffer.from(JSON.stringify(fundedSession, null, 2)))
+    }),
+    containers: {
+      control: new Container(),
+      intents: new Container({
+        [`intents/${value.decision_id}.json`]: Buffer.from(JSON.stringify(value))
+      })
+    },
+    clock: () => now,
+    sleep: async () => {},
+    invokeChild: async () => {
+      childInvocations += 1;
+      return { exitCode: 0, error: "" };
+    }
+  });
+  assert.equal(output.childInvocations, 1);
+  assert.equal(childInvocations, 1);
+
+  fundedSession.expires_at = "9999-12-31T23:59:59.999Z";
+  assert.throws(
+    () => loadFundedDirectConfig(env({
+      FUNDED_DIRECT_SESSION_MANIFEST_JSON: JSON.stringify(fundedSession),
+      FUNDED_DIRECT_SESSION_MANIFEST_SHA256:
+        sha256(Buffer.from(JSON.stringify(fundedSession, null, 2)))
+    })),
+    /operator-funded session contract/
+  );
 });
 
 test("worker accepts a fifteen-second handoff with the reviewed seven-second margin", async () => {

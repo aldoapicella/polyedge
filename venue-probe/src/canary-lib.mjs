@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
-import { validateProtectedCompoundingManifest } from "./compounding-risk.mjs";
+import {
+  fundedSessionExpiryMs,
+  UNBOUNDED_SESSION_SCHEMA,
+  validateProtectedCompoundingManifest
+} from "./compounding-risk.mjs";
 import { validateProfitQuarantineManifest } from "./profit-quarantine.mjs";
 
 const EXECUTION_INTENT_SCHEMA = "polyedge.execution_intent.v1";
@@ -12,7 +16,8 @@ const OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA = "polyedge.operator_funded_se
 const OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA = "polyedge.operator_funded_session.v3";
 const OPERATOR_DIRECT_PROTECTED_CAPITAL_SCHEMAS = new Set([
   OPERATOR_DIRECT_COMPOUNDING_MANIFEST_SCHEMA,
-  OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA
+  OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA,
+  UNBOUNDED_SESSION_SCHEMA
 ]);
 export const VENUE_GTD_SECURITY_BUFFER_MS = 300_000;
 const VENUE_GTD_MINIMUM_LIFETIME_MS = 60_000;
@@ -374,8 +379,16 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
     if (manifest.promotion_allowed !== false || manifest.gate_metrics?.promotion_allowed !== true || manifest.human_authorization_required !== true) fail("promotion manifest gates are not passing or the research manifest is directly executable");
   }
   const manifestCreatedMs = Date.parse(manifest.created_at);
-  const manifestExpiresMs = Date.parse(manifest.expires_at);
-  if (!Number.isFinite(manifestCreatedMs) || !Number.isFinite(manifestExpiresMs) || manifestCreatedMs > nowMs || manifestExpiresMs <= nowMs || manifestExpiresMs <= manifestCreatedMs) fail("promotion manifest is expired or has an invalid validity window");
+  const manifestExpiresMs = operatorDirect
+    ? fundedSessionExpiryMs(manifest)
+    : Date.parse(manifest.expires_at);
+  if (!Number.isFinite(manifestCreatedMs)
+      || !(Number.isFinite(manifestExpiresMs) ||
+        manifestExpiresMs === Number.POSITIVE_INFINITY)
+      || manifestCreatedMs > nowMs || manifestExpiresMs <= nowMs
+      || manifestExpiresMs <= manifestCreatedMs) {
+    fail("promotion manifest is expired or has an invalid validity window");
+  }
   if (manifest.candidate?.name !== intent.candidate_name || manifest.candidate?.candidate_version !== intent.candidate_version || manifest.candidate?.config_hash !== intent.candidate_config_hash) fail("execution manifest candidate mismatch");
   if (manifest.execution_model?.blob_uri !== config.executionModelBlobUri || normalizeHash(manifest.execution_model?.sha256) !== config.executionModelHash || manifest.execution_model?.model_version !== config.requiredFillModelVersion) fail("execution manifest exact model artifact binding mismatch");
 
@@ -451,8 +464,10 @@ export function validateCanaryPreflight({ config, intent, manifest, authorizatio
       const minimumReserve = Number(manifest.capital_policy?.minimum_reserve || 0);
       const targetOrderRatio = Number(manifest.capital_policy?.target_order_ratio || 0);
       const lossTolerant = targetOrderRatio > 0;
-      const lossResizingEnabled =
-        manifest.schema_version === OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA;
+      const lossResizingEnabled = [
+        OPERATOR_DIRECT_LOSS_RESIZING_MANIFEST_SCHEMA,
+        UNBOUNDED_SESSION_SCHEMA
+      ].includes(manifest.schema_version);
       const reserveReconciled = lossResizingEnabled
         ? runtime.risk?.reserve_basis === "fully_reconciled_current_equity"
           && runtime.risk?.reserve_monotonic === false

@@ -400,9 +400,15 @@ async function migrateProtectedReserveAtStartup({ client, container, manifest })
     throw new Error("fail closed: protected reserve migration collateral is invalid");
   }
   const unresolvedReservations = new Map();
+  let sourceUnresolvedReservationCount = 0;
   for (const record of [...targetReservations, ...sourceReservations]) {
     if (!isRiskReservationResolved(record.reservation)) {
       unresolvedReservations.set(record.blob_name, record);
+    }
+  }
+  for (const record of sourceReservations) {
+    if (!isRiskReservationResolved(record.reservation)) {
+      sourceUnresolvedReservationCount += 1;
     }
   }
   return migrateProtectedReserveState({
@@ -421,7 +427,8 @@ async function migrateProtectedReserveAtStartup({ client, container, manifest })
       Number(manifest.max_reconciliation_discrepancy) + 1e-9,
     openOrderCount: openOrders.length,
     positionCount: positions.filter((row) => row.size > 1e-9).length,
-    unresolvedReservationCount: unresolvedReservations.size
+    unresolvedReservationCount: unresolvedReservations.size,
+    sourceUnresolvedReservationCount
   });
 }
 
