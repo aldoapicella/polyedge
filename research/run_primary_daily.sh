@@ -84,6 +84,7 @@ run_stage calibration polyedge-rs research calibration \
   --out "$STAGING/calibration.json" \
   --markdown "$STAGING/calibration.md"
 run_stage sample-size polyedge-rs research sample-size \
+  --fill-model queue_proxy_conservative \
   --results "$STAGING/baseline.json" \
   --out "$STAGING/sample_size.json" \
   --markdown "$STAGING/sample_size.md"

@@ -192,10 +192,16 @@ pub fn load_default_exclusions(path: &Path) -> Result<Vec<ExcludedTimeWindow>, R
 pub fn load_frozen_candidate_registry(
     path: &Path,
 ) -> Result<FrozenCandidateRegistry, ResearchError> {
+    load_frozen_candidate_registry_with_hash(path).map(|(registry, _)| registry)
+}
+
+pub fn load_frozen_candidate_registry_with_hash(
+    path: &Path,
+) -> Result<(FrozenCandidateRegistry, String), ResearchError> {
     let text = fs::read_to_string(path)?;
     let registry = parse_frozen_candidate_yaml(&text)?;
     registry.validate_required_candidates()?;
-    Ok(registry)
+    Ok((registry, sha256_prefixed(text.as_bytes())))
 }
 
 fn parse_exclusion_registry_yaml(text: &str) -> Result<ExclusionRegistry, ResearchError> {

@@ -2831,7 +2831,7 @@ mod tests {
         });
         assert_eq!(
             canonical_value_sha256(&semantic).as_deref(),
-            Some("sha256:62c236b142c0550926ba3349f657ca0d4f73b329a8677809ffc1ad3f9dfb8ddf")
+            Some("sha256:e1aee2c962e1e6c1821a609871e1b282f6066a48fe5a22fbef55d347f66275b5")
         );
         assert_eq!(
             sha256_prefixed(&fs::read(out.join(ORDER_FACT_FILE)).unwrap()),

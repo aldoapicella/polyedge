@@ -4,6 +4,7 @@ use chrono::NaiveDate;
 use sha2::{Digest, Sha256};
 
 mod config;
+pub(super) use config::load_frozen_candidate_registry_with_hash;
 pub use config::{
     load_default_exclusions, load_exclusion_registry, load_frozen_candidate_registry,
     ExclusionRegistry, ExclusionWindowRecord, FrozenCandidateRecord, FrozenCandidateRegistry,
@@ -843,25 +844,10 @@ pub fn run_build_replay_index(options: ReplayIndexOptions) -> Result<Value, Rese
     fs::create_dir_all(&options.out)?;
     let input_files = collect_replay_index_inputs(&options.input)?;
     let result = json!({
-        "status": "manifest_built",
+        "status": "normalized_input_bound",
         "input": options.input.to_string_lossy(),
         "out": options.out.to_string_lossy(),
         "input_files": input_files,
-        "index_contents": [
-            "market_truth_table",
-            "decision_time_features",
-            "book_touch_events_by_market_token",
-            "reference_series_by_market",
-            "order_lifecycle_events",
-            "settlement_labels",
-            "fair_value_series_by_market",
-            "regime_features_by_decision"
-        ],
-        "success_targets": {
-            "daily_report_runtime_minutes": 30,
-            "single_fill_model_replay_minutes": 10,
-            "regime_comparison_minutes": 30
-        },
         "excluded_time_windows": exclusion_windows_json(&options.exclude_windows),
         "research_only": true,
         "raw_data_mutated": false,
@@ -1934,7 +1920,48 @@ fn json_row(
     } = evidence;
     let source = merge_optional_reports([reports.final_report, reports.regimes, reports.baseline]);
     let sample = sample.unwrap_or(&source);
-    let fill_model = text_at(&source, &["/result/fill_model"]).unwrap_or("touch_after_250ms");
+    let sample_fill_model = text_at(sample, &["/result/fill_model"]);
+    let fill_model = reports
+        .regimes
+        .and_then(|r| text_at(r, &["/result/fill_model"]))
+        .or(sample_fill_model)
+        .unwrap_or("unknown");
+    let statistical_fill_model_matches = sample_fill_model == Some(fill_model);
+    let sample_profile = text_at(sample, &["/result/profile"]);
+    let statistical_source_matches = sample_profile
+        .and_then(|profile| {
+            let model_row = reports
+                .regimes
+                .and_then(|r| find_regime_profile(r, profile))
+                .filter(|_| sample_profile != Some("static"))
+                .or_else(|| {
+                    reports
+                        .baseline
+                        .and_then(|r| r.pointer("/result/fill_models"))
+                        .and_then(Value::as_array)
+                        .and_then(|rows| {
+                            rows.iter().find(|r| {
+                                r["fill_model"].as_str() == Some(fill_model)
+                                    && r["profile"].as_str() == Some(profile)
+                            })
+                        })
+                });
+            model_row
+                .and_then(|row| serde_json::to_vec(row).ok())
+                .map(|bytes| {
+                    sample
+                        .pointer("/result/selected_model_sha256")
+                        .and_then(Value::as_str)
+                        == Some(sha256_prefixed(&bytes).as_str())
+                })
+        })
+        .unwrap_or(false);
+    let statistical_evidence_valid = statistical_fill_model_matches
+        && statistical_source_matches
+        && sample
+            .pointer("/result/statistics/claim_input_eligible")
+            .and_then(Value::as_bool)
+            == Some(true);
     let queue_authorization_required = matches!(
         fill_model,
         "queue_proxy_conservative" | "queue_proxy_balanced"
@@ -2001,11 +2028,17 @@ fn json_row(
         .into_iter()
         .flatten()
         .max();
-    let ci_low = text_at(sample, &["/result/statistics/ci_low", "/statistics/ci_low"]);
-    let ci_high = text_at(
-        sample,
-        &["/result/statistics/ci_high", "/statistics/ci_high"],
-    );
+    let ci_low = statistical_evidence_valid
+        .then(|| text_at(sample, &["/result/statistics/ci_low", "/statistics/ci_low"]))
+        .flatten();
+    let ci_high = statistical_evidence_valid
+        .then(|| {
+            text_at(
+                sample,
+                &["/result/statistics/ci_high", "/statistics/ci_high"],
+            )
+        })
+        .flatten();
     let settled_markets = number_at(
         &source,
         &[
@@ -2033,15 +2066,37 @@ fn json_row(
         .cloned()
         .unwrap_or_else(|| json!("NOT_AVAILABLE"));
     let recommendation = prospective_recommendation(ci_low, ci_high, dynamic_net.as_deref());
-    let dynamic_gate =
-        prospective_decision_gate(quality, dynamic_net.as_deref(), dynamic_delta, ci_low);
-    let full_gate = prospective_decision_gate(quality, full_net.as_deref(), full_delta, ci_low);
-    let safety_gate =
-        prospective_decision_gate(quality, safety_net.as_deref(), safety_delta, ci_low);
+    let profile_ci = |profile| {
+        (sample_profile == Some(profile))
+            .then_some(ci_low)
+            .flatten()
+    };
+    let dynamic_gate = prospective_decision_gate(
+        quality,
+        dynamic_net.as_deref(),
+        dynamic_delta,
+        profile_ci("dynamic_quote_style"),
+    );
+    let full_gate = prospective_decision_gate(
+        quality,
+        full_net.as_deref(),
+        full_delta,
+        profile_ci("full_deterministic_profile"),
+    );
+    let safety_gate = prospective_decision_gate(
+        quality,
+        safety_net.as_deref(),
+        safety_delta,
+        profile_ci("dynamic_safety_only"),
+    );
     Ok(json!({
         "date": date,
         "settled_markets": settled_markets,
         "fill_model": fill_model,
+        "statistical_fill_model": sample_fill_model,
+        "statistical_profile": sample_profile,
+        "statistical_source_matches": statistical_source_matches,
+        "statistical_fill_model_matches": statistical_fill_model_matches,
         "queue_proxy_enabled": dynamic_profile.and_then(|profile| profile["queue_proxy_enabled"].as_bool()),
         "queue_proxy_eligibility_rate": dynamic_profile.and_then(|profile| profile.get("queue_proxy_eligibility_rate")).cloned(),
         "queue_proxy_pnl_eligible": queue_proxy_pnl_eligible,
@@ -3904,6 +3959,51 @@ mod wallet_metric_tests {
     }
 
     #[test]
+    fn statistical_bounds_cannot_cross_models_profiles_or_changed_sources() {
+        let baseline_row = json!({"fill_model":"trade_through","profile":"static","net_pnl":"1"});
+        let baseline = json!({"result":{"fill_models":[baseline_row.clone()]}});
+        let regimes = json!({"result":{"fill_model":"trade_through","profiles":[
+            {"profile":"static","net_pnl":"1"},{"profile":"dynamic_quote_style","net_pnl":"2"}]}});
+        let mut sample = json!({"result":{"fill_model":"trade_through","profile":"static",
+            "selected_model_sha256":sha256_prefixed(&serde_json::to_vec(&baseline_row).unwrap()),
+            "statistics":{"claim_input_eligible":true,"profitability_claim_allowed":true,"ci_low":"0.1","ci_high":"0.5"}}});
+        let quality = measured_quality(100, Decimal::ONE, Vec::new(), Vec::new());
+        let evaluate = |sample: &Value| {
+            json_row(
+                "2026-07-13",
+                DailyReportSources {
+                    final_report: None,
+                    regimes: Some(&regimes),
+                    baseline: Some(&baseline),
+                },
+                DailyRowEvidence {
+                    sample: Some(sample),
+                    audit: None,
+                    execution_quality: None,
+                    cumulative_wallet: None,
+                    manifest_quality: Some(&quality),
+                    runtime_role: None,
+                },
+            )
+            .unwrap()
+        };
+        let row = evaluate(&sample);
+        assert_eq!(row["ci_95_low"], "0.1");
+        assert_eq!(row["dynamic_quote_style_decision_gate"], "RESEARCH_ONLY");
+        sample["result"]["fill_model"] = json!("queue_proxy_conservative");
+        assert!(evaluate(&sample)["ci_95_low"].is_null());
+        sample["result"]["fill_model"] = json!("trade_through");
+        sample["result"]["selected_model_sha256"] = json!("sha256:changed");
+        assert!(evaluate(&sample)["ci_95_low"].is_null());
+        sample["result"]["selected_model_sha256"] =
+            json!(sha256_prefixed(&serde_json::to_vec(&baseline_row).unwrap()));
+        sample["result"]["statistics"]["ci_low"] = json!("-2");
+        sample["result"]["statistics"]["ci_high"] = json!("-1");
+        sample["result"]["statistics"]["profitability_claim_allowed"] = json!(false);
+        assert_eq!(evaluate(&sample)["ci_95_high"], "-1");
+    }
+
+    #[test]
     fn generic_positive_pnl_cannot_enter_profitability_without_queue_eligibility() {
         let regimes = json!({
             "result": {
@@ -4553,61 +4653,77 @@ mod wallet_metric_tests {
     }
 }
 
-fn collect_replay_index_inputs(input: &Path) -> Result<Value, ResearchError> {
+pub(super) fn collect_replay_index_inputs(input: &Path) -> Result<Value, ResearchError> {
     if input.to_string_lossy().starts_with("azure://") {
-        return Ok(json!({
-            "source": input.to_string_lossy(),
-            "listed_locally": false,
-            "files": []
-        }));
+        return Err(ResearchError::InvalidInput(
+            "build-replay-index requires a local normalized input with events_manifest.json"
+                .to_owned(),
+        ));
     }
-    if !input.exists() {
-        return Ok(json!({
-            "source": input.to_string_lossy(),
-            "listed_locally": false,
-            "files": [],
-            "warning": "input path does not exist"
-        }));
+    let manifest_bytes = fs::read(input.join("events_manifest.json"))?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes)?;
+    let inventory: RawSourceInventory =
+        serde_json::from_value(manifest["raw_source_inventory"].clone())?;
+    validate_raw_source_inventory(&inventory)?;
+    if !inventory.canonical.exhaustive_listing {
+        return Err(ResearchError::InvalidInput(
+            "build-replay-index requires an exhaustive raw-source inventory".to_owned(),
+        ));
     }
-    let mut files = Vec::new();
-    collect_event_files(input, &mut files)?;
-    files.sort();
-    let total_bytes = files
+    let files = manifest["files"].as_object().ok_or_else(|| {
+        ResearchError::InvalidInput("normalized manifest has no shard file map".to_owned())
+    })?;
+    let mut shards = Vec::new();
+    let mut bound_paths = BTreeSet::new();
+    for (event_type, entry) in files {
+        if entry.is_null() && event_type == "events" {
+            continue;
+        }
+        let recorded_path = entry.get("path").and_then(Value::as_str).ok_or_else(|| {
+            ResearchError::InvalidInput(format!("normalized shard {event_type} has no path"))
+        })?;
+        let name = Path::new(recorded_path).file_name().ok_or_else(|| {
+            ResearchError::InvalidInput(format!("invalid normalized shard path {recorded_path}"))
+        })?;
+        let path = input.join(name);
+        bound_paths.insert(fs::canonicalize(&path)?);
+        let mut file = File::open(&path)?;
+        let mut hasher = Sha256::new();
+        let bytes = std::io::copy(&mut file, &mut hasher)?;
+        shards.push(
+            json!({"event_type":event_type, "file":name.to_string_lossy(), "rows":entry["rows"],
+            "bytes":bytes, "sha256":format!("sha256:{:x}", hasher.finalize())}),
+        );
+    }
+    let mut actual_paths = Vec::new();
+    collect_jsonl_recursive(input, &mut actual_paths)?;
+    let actual_paths = actual_paths
         .iter()
-        .filter_map(|path| fs::metadata(path).ok().map(|metadata| metadata.len()))
-        .sum::<u64>();
-    Ok(json!({
-        "source": input.to_string_lossy(),
-        "listed_locally": true,
-        "file_count": files.len(),
-        "total_bytes": total_bytes,
-        "files": files.into_iter().take(500).map(|path| path.to_string_lossy().into_owned()).collect::<Vec<_>>()
-    }))
-}
-
-fn collect_event_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), ResearchError> {
-    if path.is_file() {
-        if is_event_data_path(path) {
-            files.push(path.to_path_buf());
-        }
-        return Ok(());
+        .map(fs::canonicalize)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if actual_paths != bound_paths {
+        return Err(ResearchError::InvalidInput(
+            "normalized manifest does not exhaustively bind the local event files".to_owned(),
+        ));
     }
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            collect_event_files(&path, files)?;
-        } else if is_event_data_path(&path) {
-            files.push(path);
-        }
+    if shards.is_empty() {
+        return Err(ResearchError::InvalidInput(
+            "normalized manifest contains no readable shards".to_owned(),
+        ));
     }
-    Ok(())
-}
-
-fn is_event_data_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".jsonl") || name.ends_with(".jsonl.gz"))
+    if fs::read(input.join("events_manifest.json"))? != manifest_bytes {
+        return Err(ResearchError::InvalidInput(
+            "normalized manifest changed while binding shards".to_owned(),
+        ));
+    }
+    Ok(
+        json!({"events_manifest_sha256":sha256_prefixed(&manifest_bytes),
+        "raw_source_inventory_sha256":inventory.canonical_sha256,
+        "source_kind":inventory.canonical.source_kind,
+        "source_blob_count":inventory.canonical.blob_count,
+        "source_total_bytes":inventory.canonical.total_bytes,
+        "normalized_shards":shards}),
+    )
 }
 
 fn validate_backfill_task(task: &str) -> Result<(), ResearchError> {

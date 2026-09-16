@@ -331,7 +331,6 @@ Command:
 polyedge-rs research replay \
   --input data/research/normalized \
   --markets data/research/markets.json \
-  --strategy-config research/configs/baseline.yaml \
   --fill-model touch_after_250ms \
   --out reports/research/replay_touch_after_250ms.json \
   --markdown reports/research/replay_touch_after_250ms.md
@@ -632,7 +631,7 @@ polyedge-rs research regimes \
   --input data/research/normalized \
   --markets data/research/markets.json \
   --fill-model touch_after_250ms \
-  --profile-config research/configs/regime_profiles.yaml \
+  --profile-config research/configs/frozen_candidates.yaml \
   --out reports/research/regime_profiles.json \
   --markdown reports/research/regime_profiles.md
 ```
@@ -791,6 +790,7 @@ Command:
 
 ```bash
 polyedge-rs research sample-size \
+  --fill-model queue_proxy_conservative \
   --results reports/research/<result>.json \
   --out reports/research/sample_size.json \
   --markdown reports/research/sample_size.md

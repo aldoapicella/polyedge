@@ -705,6 +705,12 @@ enum ResearchCommand {
         exclude_window: Vec<String>,
     },
     Sweep {
+        /// Sealed holdout events; never used during candidate selection.
+        #[arg(long)]
+        test_input: Option<PathBuf>,
+        /// Holdout-only market truth. Omit to derive truth from holdout events.
+        #[arg(long)]
+        test_markets: Option<PathBuf>,
         #[arg(long, default_value = "data/research/normalized")]
         input: PathBuf,
         #[arg(long, default_value = "data/research/markets.json")]
@@ -753,6 +759,8 @@ enum ResearchCommand {
         exclude_window: Vec<String>,
     },
     SampleSize {
+        #[arg(long)]
+        fill_model: Option<String>,
         #[arg(
             long,
             default_value = "reports/research/baseline_static_all_fill_models.json"
@@ -1502,6 +1510,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         })?,
         ResearchCommand::Sweep {
             input,
+            test_input,
+            test_markets,
             markets,
             search,
             split,
@@ -1511,6 +1521,8 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             exclude_file,
             exclude_window,
         } => run_sweep(SweepOptions {
+            test_input,
+            test_markets,
             input,
             markets: Some(markets),
             search,
@@ -1536,9 +1548,11 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
         })?,
         ResearchCommand::SampleSize {
             results,
+            fill_model,
             out,
             markdown,
         } => run_sample_size(SampleSizeOptions {
+            fill_model: fill_model.map(|value| value.parse()).transpose()?,
             results,
             out,
             markdown,
