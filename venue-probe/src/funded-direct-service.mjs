@@ -347,6 +347,13 @@ export async function runPersistentFundedDirectService({
         maxAutoLockRenewalDurationInMs: 300_000
       });
   let executor = null;
+  const processor = await createProcessor({
+    env,
+    executeCanary: (childEnv) => {
+      if (!executor) throw new Error("fail closed: persistent canary executor is unavailable");
+      return executor.execute(childEnv);
+    }
+  });
   let leaseHandoffAttempts = 0;
   while (!executor) {
     try {
@@ -363,10 +370,6 @@ export async function runPersistentFundedDirectService({
       await sleep(config.restartDelayMs);
     }
   }
-  const processor = await createProcessor({
-    env,
-    executeCanary: (childEnv) => executor.execute(childEnv)
-  });
   let processedMessages = 0;
   let failedMessages = 0;
   let failedAttempts = 0;

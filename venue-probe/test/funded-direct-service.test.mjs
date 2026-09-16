@@ -266,11 +266,13 @@ test("persistent service reuses one warm executor and processes warmup plus inte
   let executorCreations = 0;
   let warmups = 0;
   let executions = 0;
+  const startupOrder = [];
   const logs = [];
   const result = await runPersistentFundedDirectService({
     env: persistentEnv({ FUNDED_DIRECT_POLL_INTERVAL_MS: "1000" }),
     createBusClient: () => bus.client,
     createExecutor: async () => {
+      startupOrder.push("executor");
       executorCreations += 1;
       return {
         warmMarket: async () => { warmups += 1; },
@@ -279,28 +281,32 @@ test("persistent service reuses one warm executor and processes warmup plus inte
         close: async () => {}
       };
     },
-    createProcessor: async ({ executeCanary }) => ({
-      process: async () => {
-        await executeCanary({});
-        return {
-          execution: {
-            order_submission_attempted: true,
-            order_submitted: true,
-            lifecycle: {
-              order_id: "acknowledged-order",
-              send_wall_ms: Date.parse(decisionTs) + 750,
-              ack_wall_ms: Date.parse(decisionTs) + 751
+    createProcessor: async ({ executeCanary }) => {
+      startupOrder.push("processor");
+      return {
+        process: async () => {
+          await executeCanary({});
+          return {
+            execution: {
+              order_submission_attempted: true,
+              order_submitted: true,
+              lifecycle: {
+                order_id: "acknowledged-order",
+                send_wall_ms: Date.parse(decisionTs) + 750,
+                ack_wall_ms: Date.parse(decisionTs) + 751
+              }
             }
-          }
-        };
-      }
-    }),
+          };
+        }
+      };
+    },
     logger: (value) => logs.push(value)
   });
   assert.equal(result.status, "persistent_service_stopped");
   assert.equal(executorCreations, 1);
   assert.equal(warmups, 1);
   assert.equal(executions, 1);
+  assert.deepEqual(startupOrder, ["processor", "executor"]);
   assert.deepEqual(bus.completed, ["warmup", "decision"]);
   assert.deepEqual(bus.deadLettered, []);
   assert.equal(bus.receiveCalls.length, 2);

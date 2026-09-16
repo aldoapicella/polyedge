@@ -15,7 +15,7 @@ const env = Object.fromEntries(envText
   .filter((line) => line && !line.startsWith("#"))
   .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
 const session = JSON.parse(env.FUNDED_DIRECT_SESSION_MANIFEST_JSON);
-const source = JSON.parse(readFileSync("research/configs/funded_direct_dynamic_quote_2026-08-13_v10.json", "utf8"));
+const source = JSON.parse(readFileSync("research/configs/funded_direct_dynamic_quote_2026-09-16_v11.json", "utf8"));
 assert.deepEqual(session, source);
 assert.equal(`sha256:${createHash("sha256").update(JSON.stringify(session, null, 2)).digest("hex")}`, env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256);
 const expected = {
@@ -50,8 +50,13 @@ const expected = {
   FUNDED_DIRECT_AUTO_REDEMPTION_INTERVAL_MS: "60000",
   FUNDED_DIRECT_AUTO_REDEMPTION_MIN_SECONDS_TO_EXPIRY: "30",
   FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "300",
-  FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/session.json",
-  FUNDED_DIRECT_SESSION_MANIFEST_SHA256: "sha256:c516c052fc5c01eed5403842ff24bf4b08512d6c38e8260e2d064580c82322f8",
+  FUNDED_DIRECT_SESSION_MANIFEST_BLOB_NAME: "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-09-16-v11/session.json",
+  FUNDED_DIRECT_SESSION_MANIFEST_SHA256: "sha256:50d02e27dfb6652175f8515ed3437a1f716f83e490a578dce437e1ed0275a8a4",
+  FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_ID: "dynamic-quote-funded-2026-08-13-v10",
+  FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_BLOB_NAME: "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/session.json",
+  FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_SESSION_MANIFEST_SHA256: "sha256:c516c052fc5c01eed5403842ff24bf4b08512d6c38e8260e2d064580c82322f8",
+  FUNDED_DIRECT_RESERVE_MIGRATION_SOURCE_STATE_BLOB_NAME: "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/capital-reserve-state.json",
+  FUNDED_DIRECT_RESERVE_MIGRATION_MINIMUM_HISTORICAL_HIGH_WATER_EQUITY: "356.804993",
   FUNDED_DIRECT_CONTROL_PREFIX: "reports/funded/dynamic-quote",
   FUNDED_DIRECT_MAX_ITERATIONS: "2000",
   FUNDED_DIRECT_POLL_INTERVAL_MS: "1000",
@@ -74,7 +79,7 @@ const expected = {
   STRATEGY_CANARY_MAX_BOOK_AGE_MS: "1000",
   STRATEGY_CANARY_REST_SECONDS: "30",
   MAX_OPEN_ORDERS: "1",
-  VENUE_PROBE_FUNDED_CAMPAIGN_ID: "dynamic-quote-funded-2026-08-13-v10",
+  VENUE_PROBE_FUNDED_CAMPAIGN_ID: "dynamic-quote-funded-2026-09-16-v11",
   VENUE_PROBE_CAMPAIGN_BASELINE_EQUITY: "29.505501",
   VENUE_PROBE_CAMPAIGN_EQUITY_FLOOR: "0",
   VENUE_PROBE_MAX_CAMPAIGN_DRAWDOWN: "29.505501",

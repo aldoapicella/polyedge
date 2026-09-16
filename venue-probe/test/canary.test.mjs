@@ -36,6 +36,7 @@ import {
   selectFreshCachedSafetySnapshot,
   startSafetySnapshotCache,
   streamBookEvidence,
+  unresolvedAccountPositionCount,
   createAndPostFundedOrderWithinSignalToSendDeadline,
   waitForSafetySnapshotIdle,
   cachedSafetySnapshotStatus
@@ -297,6 +298,14 @@ test("protected-reserve startup rejects malformed or negative position amounts",
       }]
     }), new RegExp(`account position ${field} is invalid`));
   }
+});
+
+test("funded rollover ignores resolved zero-value shares but blocks economic positions", () => {
+  assert.equal(unresolvedAccountPositionCount([
+    { size: 30, currentValue: 0 },
+    { size: 5, currentValue: 0.000001 },
+    { size: 5, currentValue: 1.25 }
+  ]), 2);
 });
 
 test("protected-compounding startup skips settlement activity for an empty manifest ledger", async () => {
@@ -1815,6 +1824,33 @@ test("loss-resizing protected capital submits only the current-equity size bound
   assert.equal(reservation.principal_notional, 3.45);
   assert.equal(reservation.reserved_notional, 3.45);
   assert.deepEqual(controls.calls, { reserve: 1, consume: 1, execute: 1, finalize: 0 });
+
+  const unbounded = structuredClone(input);
+  unbounded.documents.manifest.schema_version =
+    "polyedge.operator_funded_session.v4";
+  unbounded.documents.manifest.session_id = "dynamic-quote-funded-test-v11";
+  unbounded.documents.manifest.expires_at = null;
+  unbounded.documents.manifest.capital_policy = {
+    ...unbounded.documents.manifest.capital_policy,
+    prior_state_session_id: "dynamic-quote-funded-test-v10",
+    prior_state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v10/capital-reserve-state.json",
+    prior_state_sha256: `sha256:${"d".repeat(64)}`,
+    state_blob_name:
+      "reports/funded/dynamic-quote/sessions/dynamic-quote-funded-test-v11/capital-reserve-state.json"
+  };
+  unbounded.documents.authorization.session_id =
+    unbounded.documents.manifest.session_id;
+  unbounded.runtime.risk.prior_state_session_id =
+    unbounded.documents.manifest.capital_policy.prior_state_session_id;
+  unbounded.runtime.risk.prior_state_blob_name =
+    unbounded.documents.manifest.capital_policy.prior_state_blob_name;
+  assert.doesNotThrow(() => validateCanaryPreflight({
+    config: unbounded.config,
+    ...unbounded.documents,
+    runtime: unbounded.runtime,
+    now
+  }));
 });
 
 test("operator-funded preflight blocks unexpected capital and cash-flow records before reservation", async (t) => {

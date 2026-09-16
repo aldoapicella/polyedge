@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   discoverVerifiedAutomaticInternalSettlements,
+  fundedSessionExpiryMs,
   internalSettlementBlobName,
   loadDurableInternalSettlements,
   migrateProtectedReserveState,
@@ -268,6 +269,97 @@ async function reserveMigrationFixture() {
   };
 }
 
+async function currentEquityRolloverFixture() {
+  const container = new Container();
+  const sourceManifest = lossTolerantManifest();
+  sourceManifest.expires_at = "2026-09-13T23:59:59.000Z";
+  const settlements = [
+    manualSettlement({
+      id: "manual-existing",
+      sessionId: sourceManifest.session_id,
+      transaction: "a",
+      condition: "b",
+      payout: 17.015,
+      principal: 10.209
+    }),
+    manualSettlement({
+      id: "manual-v8-profit",
+      sessionId: sourceManifest.session_id,
+      transaction: "c",
+      condition: "d",
+      payout: 57.997,
+      principal: 0
+    })
+  ];
+  for (const settlement of settlements) {
+    await putVerifiedInternalSettlement(container, settlement);
+  }
+  const sourceSessionBlobName =
+    `reports/funded/dynamic-quote/sessions/${sourceManifest.session_id}/session.json`;
+  const sourceSessionBytes = Buffer.from(JSON.stringify(sourceManifest, null, 2));
+  container.values.set(sourceSessionBlobName, sourceSessionBytes);
+  container.etags.set(sourceSessionBlobName, '"1"');
+  const sourceStateBlobName = sourceManifest.capital_policy.state_blob_name;
+  const sourceState = {
+    schema: "polyedge.protected_compounding_state.v2",
+    session_id: sourceManifest.session_id,
+    reserve_ratio: 0.1,
+    minimum_reserve: 2,
+    target_order_ratio: 0.05,
+    operating_buffer_ratio: 0.01,
+    minimum_order_notional: 1,
+    high_water_equity: 96.458501,
+    historical_high_water_equity: 96.458501,
+    protected_reserve: 4.98321,
+    last_reconciled_equity: 49.832101,
+    operating_buffer: 0.498321,
+    operable_capital: 44.35057,
+    authorized_equity_ceiling: 96.458501,
+    verified_realized_pnl: 64.803,
+    verified_settlement_ids: settlements.map((row) => row.id).sort(),
+    reconciliation_complete: true,
+    prior_state_session_id: sourceManifest.capital_policy.prior_state_session_id,
+    prior_state_blob_name: sourceManifest.capital_policy.prior_state_blob_name,
+    prior_state_sha256: sourceManifest.capital_policy.prior_state_sha256,
+    reserve_basis: "fully_reconciled_current_equity",
+    loss_response: "resize_from_fully_reconciled_current_equity",
+    continue_after_loss: true,
+    reserve_monotonic: false
+  };
+  const sourceStateBytes = Buffer.from(JSON.stringify(sourceState, null, 2));
+  container.values.set(sourceStateBlobName, sourceStateBytes);
+  container.etags.set(sourceStateBlobName, '"7"');
+  const targetManifest = structuredClone(sourceManifest);
+  targetManifest.schema_version = "polyedge.operator_funded_session.v4";
+  targetManifest.session_id = "dynamic-quote-funded-test-v11";
+  targetManifest.created_at = "2026-09-16T00:00:00.000Z";
+  targetManifest.expires_at = null;
+  targetManifest.internal_settlements = [];
+  targetManifest.capital_policy = {
+    ...targetManifest.capital_policy,
+    prior_state_session_id: sourceManifest.session_id,
+    prior_state_blob_name: sourceStateBlobName,
+    prior_state_sha256:
+      `sha256:${createHash("sha256").update(sourceStateBytes).digest("hex")}`,
+    minimum_historical_high_water_equity: 96.458501,
+    state_blob_name:
+      `reports/funded/dynamic-quote/sessions/${targetManifest.session_id}/capital-reserve-state.json`
+  };
+  return {
+    container,
+    targetManifest,
+    source: {
+      sessionId: sourceManifest.session_id,
+      sessionBlobName: sourceSessionBlobName,
+      sessionHash:
+        `sha256:${createHash("sha256").update(sourceSessionBytes).digest("hex")}`,
+      stateBlobName: sourceStateBlobName,
+      minimumHistoricalHighWaterEquity: 96.458501
+    },
+    settlements
+  };
+}
+
 test("v7-to-v5 migration preserves the fully reconciled high water and is idempotent", async () => {
   const fixture = await reserveMigrationFixture();
   const first = await migrateProtectedReserveState({
@@ -279,6 +371,7 @@ test("v7-to-v5 migration preserves the fully reconciled high water and is idempo
     openOrderCount: 0,
     positionCount: 0,
     unresolvedReservationCount: 0,
+    sourceUnresolvedReservationCount: 0,
     now: () => new Date("2026-08-06T03:00:00.000Z")
   });
   assert.equal(first.state.high_water_equity, 75.90162);
@@ -390,6 +483,101 @@ test("v7-to-v5 migration preserves the fully reconciled high water and is idempo
   assert.equal(fixture.container.etags.get(stateBlobName), stateEtag);
 });
 
+test("v10-to-unbounded rollover carries the exact ledger into current-equity state", async () => {
+  const fixture = await currentEquityRolloverFixture();
+  const input = {
+    container: fixture.container,
+    manifest: fixture.targetManifest,
+    source: fixture.source,
+    accountEquity: 49.832101,
+    fullyReconciled: true,
+    openOrderCount: 0,
+    positionCount: 0,
+    unresolvedReservationCount: 0,
+    sourceUnresolvedReservationCount: 0,
+    now: () => new Date("2026-09-16T00:05:00.000Z")
+  };
+  const first = await migrateProtectedReserveState(input);
+  assert.equal(first.state.reserve_basis, "fully_reconciled_current_equity");
+  assert.equal(first.state.reserve_monotonic, false);
+  assert.equal(first.state.protected_reserve, 4.98321);
+  assert.equal(first.state.high_water_equity, 96.458501);
+  assert.equal(first.state.authorized_equity_ceiling, 96.458501);
+  assert.equal(first.state.prior_state_sha256,
+    fixture.targetManifest.capital_policy.prior_state_sha256);
+  assert.deepEqual(first.state.verified_settlement_ids,
+    fixture.settlements.map((row) => row.id).sort());
+  assert.equal((await loadDurableInternalSettlements(
+    fixture.container,
+    fixture.targetManifest.session_id
+  )).length, fixture.settlements.length);
+
+  const nativeSettlement = manualSettlement({
+    id: "manual-v11-native",
+    sessionId: fixture.targetManifest.session_id,
+    transaction: "e",
+    condition: "f",
+    payout: 2,
+    principal: 1
+  });
+  await putVerifiedInternalSettlement(fixture.container, nativeSettlement);
+  const beforeRecoveryEtag = fixture.container.etags.get(
+    fixture.targetManifest.capital_policy.state_blob_name
+  );
+  const restartInput = {
+    ...input,
+    accountEquity: 48,
+    now: () => new Date("2026-09-16T00:06:00.000Z")
+  };
+  const recovered = await migrateProtectedReserveState(restartInput);
+  assert.ok(recovered.state.verified_settlement_ids.includes(nativeSettlement.id));
+  assert.equal(recovered.state.last_reconciled_equity, 48);
+  assert.notEqual(fixture.container.etags.get(
+    fixture.targetManifest.capital_policy.state_blob_name
+  ), beforeRecoveryEtag);
+
+  const targetEtag = fixture.container.etags.get(
+    fixture.targetManifest.capital_policy.state_blob_name
+  );
+  const second = await migrateProtectedReserveState({
+    ...restartInput,
+    unresolvedReservationCount: 1
+  });
+  assert.equal(second.state.migration_completed_at,
+    first.state.migration_completed_at);
+  for (const unsafe of [
+    { fullyReconciled: false },
+    { openOrderCount: 1 },
+    { positionCount: 1 },
+    { sourceUnresolvedReservationCount: 1 },
+    { accountEquity: 47 }
+  ]) {
+    await assert.rejects(migrateProtectedReserveState({
+      ...restartInput,
+      ...unsafe
+    }), /checkpoint requires a flat source account/);
+  }
+
+  const migratedBlobName = internalSettlementBlobName(
+    fixture.targetManifest.session_id,
+    fixture.settlements[0].transaction_hash,
+    fixture.settlements[0].condition_id
+  );
+  const exactBytes = fixture.container.values.get(migratedBlobName);
+  const tampered = JSON.parse(exactBytes);
+  tampered.unexpected_provenance = true;
+  fixture.container.values.set(migratedBlobName,
+    Buffer.from(JSON.stringify(tampered, null, 2)));
+  await assert.rejects(migrateProtectedReserveState({
+    ...restartInput,
+    unresolvedReservationCount: 1
+  }), /target ledger provenance is invalid/);
+  fixture.container.values.set(migratedBlobName, exactBytes);
+  assert.equal(fixture.container.etags.get(
+    fixture.targetManifest.capital_policy.state_blob_name
+  ), targetEtag);
+});
+
 test("reserve migration makes no target writes when reconciliation or source floor fails", async () => {
   for (const [name, mutate, expected] of [
     ["open order", (input) => { input.openOrderCount = 1; }, /zero orders/],
@@ -497,6 +685,73 @@ test("loss-tolerant predecessor validation requires exact durable bytes", () => 
   assert.throws(
     () => validateProtectedCompoundingManifest(manifest),
     /prior_state_sha256 is required for loss-tolerant sizing/
+  );
+});
+
+test("unbounded rollover requires null expiry and the exact reconciled current-equity predecessor", () => {
+  const source = {
+    schema: "polyedge.protected_compounding_state.v2",
+    session_id: "dynamic-quote-funded-test-v10",
+    reserve_ratio: 0.1,
+    minimum_reserve: 2,
+    target_order_ratio: 0.05,
+    operating_buffer_ratio: 0.01,
+    minimum_order_notional: 1,
+    high_water_equity: 356.804993,
+    historical_high_water_equity: 356.804993,
+    protected_reserve: 5.292177,
+    last_reconciled_equity: 52.921768,
+    operating_buffer: 0.529218,
+    operable_capital: 47.100373,
+    authorized_equity_ceiling: 356.804993,
+    verified_realized_pnl: 327.299492,
+    verified_settlement_ids: ["automatic-redeem-1"],
+    reconciliation_complete: true,
+    reserve_basis: "fully_reconciled_current_equity",
+    loss_response: "resize_from_fully_reconciled_current_equity",
+    continue_after_loss: true,
+    reserve_monotonic: false
+  };
+  const value = lossTolerantManifest();
+  value.schema_version = "polyedge.operator_funded_session.v4";
+  value.session_id = "dynamic-quote-funded-test-v11";
+  value.expires_at = null;
+  value.capital_policy = {
+    ...value.capital_policy,
+    prior_state_session_id: source.session_id,
+    prior_state_blob_name:
+      `reports/funded/dynamic-quote/sessions/${source.session_id}/capital-reserve-state.json`,
+    prior_state_sha256: documentHash(source),
+    minimum_historical_high_water_equity: source.high_water_equity,
+    state_blob_name:
+      `reports/funded/dynamic-quote/sessions/${value.session_id}/capital-reserve-state.json`
+  };
+  const policy = validateProtectedCompoundingManifest(value);
+  assert.equal(policy.currentEquityPredecessor, true);
+  assert.equal(fundedSessionExpiryMs(value), Number.POSITIVE_INFINITY);
+  assert.equal(
+    validateProtectedCompoundingPredecessorState(
+      source,
+      policy,
+      documentHash(source)
+    ),
+    source
+  );
+
+  value.expires_at = "9999-12-31T23:59:59.999Z";
+  assert.throws(
+    () => validateProtectedCompoundingManifest(value),
+    /unbounded funded sessions require expires_at null/
+  );
+  assert.equal(Number.isNaN(fundedSessionExpiryMs(value)), true);
+  const modified = { ...source, protected_reserve: 5.29 };
+  assert.throws(
+    () => validateProtectedCompoundingPredecessorState(
+      modified,
+      policy,
+      documentHash(modified)
+    ),
+    /prior funded current-equity state is unavailable or incompatible/
   );
 });
 
