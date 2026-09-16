@@ -1389,6 +1389,72 @@ test("persistent handoff seals a post-submit evidence failure only from exact te
   assert.equal(executions, 1);
 });
 
+test("deterministic no-ack release completes once only with exact zero-exposure evidence", async (t) => {
+  for (const change of ["valid", "reason", "submission", "trade", "run", "token", "order", "protocol", "order_missing", "matched_null", "matched_empty"]) {
+    await t.test(change, async () => {
+      const now = new Date("2026-07-27T12:00:00Z");
+      const value = intent(now, "8".repeat(64));
+      value.market_id = "btc-market"; value.condition_id = "condition"; value.token_id = "token-up";
+      const bytes = Buffer.from(JSON.stringify(value));
+      const control = new Container();
+      let executions = 0;
+      const processor = await createFundedDirectProcessor({
+        env: env({ FUNDED_DIRECT_ENGINE: "persistent_v1" }),
+        containers: { control, intents: new Container({ [`intents/${value.decision_id}.json`]: bytes }) },
+        clock: () => now,
+        executeCanary: async (childEnv) => {
+          executions += 1;
+          const reservation = {
+            schema_version: 1, evidence_protocol_version: 3, state: "released_no_order",
+            run_id: childEnv.STRATEGY_CANARY_RUN_ID, probe_id: `funded-direct-${value.decision_id}`,
+            market_id: value.market_id, condition_id: value.condition_id, token_id: value.token_id,
+            order_submission_intended: true, order_submitted: false, order_id: null,
+            matched_notional: 0, reconciliation_complete: true, zero_open_orders_confirmed: true,
+            updated_ts: now.toISOString(), reconciliation_reason: "post_only_crosses_book",
+            reconciliation_evidence: { source: "authenticated_clob_and_user_channel",
+              zero_open_orders: true, zero_unresolved_positions: true, post_send_authenticated_trade_count: 0 }
+          };
+          if (change === "reason") reservation.reconciliation_reason = "unknown_timeout";
+          if (change === "submission") reservation.order_submitted = null;
+          if (change === "trade") reservation.reconciliation_evidence.post_send_authenticated_trade_count = 1;
+          if (change === "run") reservation.run_id = "other";
+          if (change === "token") reservation.token_id = "other";
+          if (change === "order") reservation.order_id = `0x${"9".repeat(64)}`;
+          if (change === "protocol") reservation.evidence_protocol_version = 2;
+          if (change === "order_missing") delete reservation.order_id;
+          if (change === "matched_null") reservation.matched_notional = null;
+          if (change === "matched_empty") reservation.matched_notional = "";
+          control.values.set(`reports/research/venue-probe/risk-reservations/2026-07-27/funded-direct-${value.decision_id}.json`, Buffer.from(JSON.stringify(reservation)));
+          const error = new Error("venue rejected post-only crossing order");
+          error.orderSubmissionAttempted = true;
+          throw error;
+        }
+      });
+      const handoff = { schema: "polyedge.funded_intent_handoff.v1", decision_id: value.decision_id,
+        intent_blob_name: `intents/${value.decision_id}.json`, intent_sha256: sha256(bytes),
+        decision_ts: value.decision_ts, valid_until: value.valid_until };
+      const first = await processor.process(handoff);
+      if (change === "valid") {
+        assert.equal(first.status, "persistent_intent_completed");
+        assert.equal(first.execution.status, "terminal_no_order_evidence_degraded");
+        assert.equal(first.execution.order_submitted, false);
+        // A crash after reservation release but before completion uses the same classifier.
+        const completion = [...control.values.keys()].find((key) => key.includes("/completed/"));
+        assert.ok(completion);
+        control.values.delete(completion);
+      } else assert.equal(first.status, "paused_by_account_risk_state");
+      const duplicate = await processor.process(handoff);
+      assert.equal(duplicate.status, "already_completed_idempotent");
+      assert.equal(duplicate.completion.status, change === "valid" ? "child_completed" : "child_failed_closed_post_submission_unresolved");
+      if (change === "valid") {
+        assert.equal(duplicate.completion.order_submitted, false);
+        assert.equal(duplicate.completion.reconciliation_complete, true);
+      }
+      assert.equal(executions, 1);
+    });
+  }
+});
+
 test("persistent post-submit unresolved risk is accurately sealed and paused", async () => {
   const now = new Date("2026-07-27T12:00:00Z");
   const value = intent(now, "5".repeat(64));

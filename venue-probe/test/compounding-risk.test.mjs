@@ -1508,7 +1508,8 @@ test("multiple exact reservations and maker orders aggregate for one condition",
   assert.equal(settlement.reservation_matched_notional, 2);
 });
 
-test("one confirmed transaction redeeming multiple conditions creates separate records", async () => {
+for (const secondPayout of [5, 10]) {
+test(`one confirmed transaction creates separate records with second payout ${secondPayout}`, async () => {
   const reservations = [
     automaticReservation(),
     automaticReservation({
@@ -1526,15 +1527,15 @@ test("one confirmed transaction redeeming multiple conditions creates separate r
       conditionId: secondCondition,
       asset: secondToken,
       transactionHash: secondFillTransaction,
-      size: 5,
+      size: secondPayout,
       usdcSize: 2
     }),
     redeemActivity(),
-    redeemActivity({ conditionId: secondCondition, payout: 5 })
+    redeemActivity({ conditionId: secondCondition, payout: secondPayout })
   ];
   const receipt = confirmedReceipt([
     decodedRedemption(),
-    decodedRedemption({ conditionId: secondCondition, payout: 5, index_sets: [2] })
+    decodedRedemption({ conditionId: secondCondition, payout: secondPayout, index_sets: [2] })
   ]);
   let receiptCalls = 0;
   const settlements = await discoverVerifiedAutomaticInternalSettlements({
@@ -1550,8 +1551,8 @@ test("one confirmed transaction redeeming multiple conditions creates separate r
           conditionId: secondCondition,
           assetId: secondToken,
           transactionHash: secondFillTransaction,
-          size: 5,
-          price: 0.4
+          size: secondPayout,
+          price: 2 / secondPayout
         })],
     getTransactionReceipt: async () => { receiptCalls += 1; return receipt; }
   });
@@ -1563,6 +1564,21 @@ test("one confirmed transaction redeeming multiple conditions creates separate r
   ].sort());
   assert.equal(new Set(settlements.map((row) => row.id)).size, 2);
   assert.ok(settlements.every((row) => row.transaction_hash === automaticRedemption));
+});
+
+}
+
+test("same-amount batched redemption rejects missing or extra transfer legs", () => {
+  const receipt = confirmedReceipt([decodedRedemption(), decodedRedemption({conditionId: secondCondition, payout: 10, index_sets: [2]})]);
+  assert.equal(verifyAutomaticSettlementEvidence(verifyFixture({receipt})).payout, 10);
+  for (const [field, index] of [["erc20_transfers", 0], ["erc20_transfers", 1], ["erc20_transfers", 2], ["collateral_wraps", 0], ["ctf_transfers", 0], ["ctf_transfers", 1]]) {
+    for (const change of ["missing", "extra"]) {
+      const broken = structuredClone(receipt);
+      if (change === "missing") broken[field].splice(index, 1);
+      else broken[field].push(structuredClone(broken[field][index]));
+      assert.throws(() => verifyAutomaticSettlementEvidence(verifyFixture({receipt: broken})), /transfer chain/, `${change} ${field}[${index}]`);
+    }
+  }
 });
 
 test("automatic settlement fails closed on CLOB hash, asset, wallet, status, or receipt mismatch", () => {
