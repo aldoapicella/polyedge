@@ -4610,7 +4610,23 @@ fn validate_strategy_batch(
     if contains_secret_key(input_value) {
         return Err("secret_bearing_pipeline_input");
     }
-    let input = serde_json::from_value::<DecisionPipelineInputV3>(input_value.clone())
+    let mut decode_value = input_value.clone();
+    // Pre-OCI-bridge primary paper inputs lack this transport-only field. It
+    // cannot affect this lane with intent publication disabled. Preserve the
+    // recorded bytes/hashes and permit no other missing or unknown fields.
+    if contract_version == 4
+        && input_value["schema_version"] == 3
+        && input_value.pointer("/settings/deploy/runtime_role") == Some(&json!("primary"))
+        && input_value.pointer("/settings/live/execution_mode") == Some(&json!("paper"))
+        && input_value.pointer("/settings/azure/publish_strategy_canary_intents")
+            == Some(&json!(false))
+        && input_value
+            .pointer("/settings/azure/funded_direct_oci_queue_bridge_url")
+            .is_none()
+    {
+        decode_value["settings"]["azure"]["funded_direct_oci_queue_bridge_url"] = json!("");
+    }
+    let input = serde_json::from_value::<DecisionPipelineInputV3>(decode_value.clone())
         .map_err(|_| "pipeline_input_decode_failed")?;
     let recorded_output = serde_json::from_value::<DecisionPipelineOutputV3>(output_value.clone())
         .map_err(|_| "pipeline_output_decode_failed")?;
@@ -4685,7 +4701,7 @@ fn validate_strategy_batch(
     if serde_json::to_value(&input)
         .map_err(|_| "pipeline_input_roundtrip_failed")?
         .as_object()
-        != input_value.as_object()
+        != decode_value.as_object()
     {
         return Err("pipeline_input_roundtrip_mismatch");
     }
@@ -15480,6 +15496,101 @@ mod tests {
 
         let (batch, decisions) = decision_pipeline_v4_evidence(&input);
         assert!(batch["candidate"].is_null());
+        // Pre-OCI-bridge primary recordings omit this inactive transport setting.
+        let mut legacy = batch.clone();
+        legacy["pipeline_input"]["settings"]["azure"]
+            .as_object_mut()
+            .unwrap()
+            .remove("funded_direct_oci_queue_bridge_url");
+        let decode_error =
+            serde_json::from_value::<DecisionPipelineInputV3>(legacy["pipeline_input"].clone())
+                .unwrap_err();
+        assert!(decode_error
+            .to_string()
+            .contains("missing field `funded_direct_oci_queue_bridge_url`"));
+        let hash = canonical_value_sha256(&legacy["pipeline_input"]).unwrap();
+        legacy["pipeline_input_sha256"] = json!(hash);
+        legacy["batch_id"] = json!(format!(
+            "strategy-batch-{}",
+            hash.trim_start_matches("sha256:")
+        ));
+        let recorded_legacy = legacy.clone();
+        assert!(validate_strategy_batch(&legacy).is_ok());
+        assert_eq!(legacy, recorded_legacy);
+        let mut wrong_hash = legacy.clone();
+        wrong_hash["pipeline_input_sha256"] = batch["pipeline_input_sha256"].clone();
+        assert_eq!(
+            validate_strategy_batch(&wrong_hash).unwrap_err(),
+            "pipeline_input_hash_mismatch"
+        );
+        for pointer in [
+            "/pipeline_input/settings/azure/funded_direct_oci_queue_bridge_url",
+            "/pipeline_input/settings/strategy/enable_taker_orders",
+        ] {
+            let mut invalid = legacy.clone();
+            if pointer.ends_with("bridge_url") {
+                invalid["pipeline_input"]["settings"]["azure"]
+                    ["funded_direct_oci_queue_bridge_url"] = Value::Null;
+            } else {
+                *invalid.pointer_mut(pointer).unwrap() = Value::Null;
+            }
+            assert_eq!(
+                validate_strategy_batch(&invalid).unwrap_err(),
+                "pipeline_input_decode_failed"
+            );
+        }
+        let mut active_transport = legacy.clone();
+        active_transport["pipeline_input"]["settings"]["azure"]
+            ["publish_strategy_canary_intents"] = json!(true);
+        assert_eq!(
+            validate_strategy_batch(&active_transport).unwrap_err(),
+            "pipeline_input_decode_failed"
+        );
+        let mut unknown_field = legacy.clone();
+        unknown_field["pipeline_input"]["settings"]["azure"]["unknown_transport"] = json!("");
+        assert_eq!(
+            validate_strategy_batch(&unknown_field).unwrap_err(),
+            "pipeline_input_roundtrip_mismatch"
+        );
+        let mut live = legacy.clone();
+        live["pipeline_input"]["settings"]["live"]["allow_live"] = json!(true);
+        assert_eq!(
+            validate_strategy_batch(&live).unwrap_err(),
+            "unsafe_execution_settings"
+        );
+        let mut missing_other = legacy.clone();
+        missing_other["pipeline_input"]["settings"]["strategy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enable_taker_orders");
+        assert_eq!(
+            validate_strategy_batch(&missing_other).unwrap_err(),
+            "pipeline_input_decode_failed"
+        );
+        for (pointer, value) in [
+            (
+                "/pipeline_input/settings/deploy/runtime_role",
+                json!("profitability_shadow"),
+            ),
+            (
+                "/pipeline_input/settings/live/execution_mode",
+                json!("live"),
+            ),
+        ] {
+            let mut unsupported_lane = legacy.clone();
+            *unsupported_lane.pointer_mut(pointer).unwrap() = value;
+            assert_eq!(
+                validate_strategy_batch(&unsupported_lane).unwrap_err(),
+                "pipeline_input_decode_failed"
+            );
+        }
+        let mut older_contract = legacy;
+        older_contract["schema"] = json!("polyedge.strategy_decision_batch.v3");
+        older_contract["schema_version"] = json!(3);
+        assert_eq!(
+            validate_strategy_batch(&older_contract).unwrap_err(),
+            "pipeline_input_decode_failed"
+        );
         let mut audit = AuditAccumulator::default();
         audit.observe(&EventLine {
             event_type: "runtime_provenance".to_owned(),
