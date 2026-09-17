@@ -16,6 +16,10 @@ body=json.dumps(wrapper);half=len(body)//2
 rows=[record(body[:half],900,True),record(body[half:],900.1),record({"schema":"polyedge.funded_direct_alert.v1","status":"automatic_redemption_failed_closed","error":"fail closed: websocket reconnect reconciliation did not prove a coherent account"},901),record({"schema":"polyedge.funded_direct_service.v2","status":"persistent_service_heartbeat","redemption_failures":1},980)]
 prove=lambda records:module["prove"](records,invocation,container,950,1000)
 assert prove(rows)["failureCount"]==1
+assert module["prove"](rows,invocation,container,900.9999999999999,1000)["failureCount"]==1
+try:module["prove"](rows,invocation,container,900.999999,1000)
+except AssertionError:pass
+else:raise AssertionError("a later distinct microsecond was accepted")
 bad=[]
 changed=copy.deepcopy(rows);changed[0]["MESSAGE"]=changed[0]["MESSAGE"].replace('"dry_run": false','"dry_run": true');bad.append(changed)
 bad.append(rows[1:])

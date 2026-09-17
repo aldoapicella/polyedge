@@ -10,6 +10,9 @@ import sys
 def prove(records, invocation, container, clean_since, now):
     assert re.fullmatch(r"[0-9a-f]{32}", invocation) and re.fullmatch(r"[0-9a-f]{64}", container)
     assert 0 < clean_since < now
+    # The native proof divides journal microseconds twice through JS Number.
+    # Recover its microsecond boundary before comparing inclusive timestamps.
+    clean_boundary = round(clean_since * 1e6) / 1e6
     events, fragments, parts = [], [], []
     previous = 0
     for row in records:
@@ -45,7 +48,7 @@ def prove(records, invocation, container, clean_since, now):
     for index, item in enumerate(events):
         event = item["event"]
         if event.get("schema") == "polyedge.funded_direct_alert.v1":
-            assert item["last"] <= clean_since, "new alert after clean evidence"
+            assert item["last"] <= clean_boundary, "new alert after clean evidence"
         if event.get("status") != "automatic_redemption_failed_closed":
             continue
         assert event.get("schema") == "polyedge.funded_direct_alert.v1"
@@ -67,7 +70,7 @@ def prove(records, invocation, container, clean_since, now):
         assert re.fullmatch(r"venue-redemption-[0-9]{17}-[0-9a-f]{8}", run) and run not in used
         used.add(run)
         finished = datetime.datetime.fromisoformat(result["finished_ts"].replace("Z", "+00:00")).timestamp()
-        assert finished <= summary["first"] <= summary["last"] < item["first"] <= clean_since
+        assert finished <= summary["first"] <= summary["last"] < item["first"] <= clean_boundary
         assert item["last"] - finished <= 30
         failures.append({"runId": run, "finishedAtUtc": result["finished_ts"],
                          "summaryFirstEpoch": summary["first"], "summaryLastEpoch": summary["last"],
