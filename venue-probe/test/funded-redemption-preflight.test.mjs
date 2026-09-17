@@ -27,6 +27,19 @@ test("approved redemption preflight binds a complete stable inventory and exact 
   assert.equal(result.payout_base_units, "5000000");
   assert.equal(result.redemption_submitted, false);
 
+  let localTime = timestamp.getTime() - 673, waited = 0, readsBeforeClock = 0;
+  const future = { ...input, block: { ...input.block, timestamp: timestamp.getTime() / 1000 },
+    now: () => new Date(localTime), wait: async milliseconds => { waited = milliseconds; localTime += milliseconds; },
+    readOrders: async () => { assert(localTime >= timestamp.getTime()); readsBeforeClock++; return []; } };
+  const afterWait = await collectApprovedRedemptionPreflight(future);
+  assert.equal(waited, 673);
+  assert.equal(readsBeforeClock, 2);
+  assert.equal(afterWait.started_ts, timestamp.toISOString());
+  await assert.rejects(collectApprovedRedemptionPreflight({ ...future,
+    now: () => new Date(timestamp.getTime() - 673), wait: async () => {} }));
+  await assert.rejects(collectApprovedRedemptionPreflight({ ...future,
+    now: () => new Date(timestamp.getTime() - 1001), wait: async () => assert.fail("must not wait") }), /more than one second/);
+
   for (const override of [
     { readOrders: async () => [{}] },
     { readReservations: async () => [{}] },

@@ -45,7 +45,8 @@ export function validateTerminalRedemptionControl(value) {
 // runs redemption, acquires a campaign lease, or publishes control records.
 export async function collectApprovedRedemptionPreflight({
   condition, targetImage, targetRevision, readOrders, readPositions,
-  readReservations, discover, block, now = () => new Date()
+  readReservations, discover, block, now = () => new Date(),
+  wait = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds))
 }) {
   assert.match(condition, /^0x[0-9a-f]{64}$/);
   assert.match(targetImage, /^ghcr\.io\/aldoapicella\/polyedge-venue-probe@sha256:[0-9a-f]{64}$/);
@@ -53,8 +54,17 @@ export async function collectApprovedRedemptionPreflight({
   assert.equal(block.chain_id, 137);
   assert.match(block.hash, /^0x[0-9a-f]{64}$/);
   assert.match(block.number, /^\d+$/);
-  const started = now();
+  let started = now();
   assert(Number.isFinite(started.getTime()));
+  // A just-produced block can lead the local clock by a fraction of a second.
+  // Begin evidence only after its timestamp; never accept a future block.
+  const ahead = block.timestamp * 1000 - started.getTime();
+  if (ahead > 0) {
+    assert(ahead <= 1000, "block clock leads local time by more than one second");
+    await wait(Math.ceil(ahead));
+    started = now();
+    assert(Number.isFinite(started.getTime()));
+  }
   assert(block.timestamp <= started.getTime() / 1000 && block.timestamp >= started.getTime() / 1000 - 60);
   const snapshot = async () => {
     const [orders, positions, reservations] = await Promise.all([
