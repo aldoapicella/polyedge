@@ -65,8 +65,9 @@ if [ -n "$recovery_inputs" ]; then
     --arg image "$image" --arg revision "$revision" --arg invocation "$signer_invocation" --arg container "$signer_container" \
     '{bundle:($bundle|fromjson),bundleBytesBase64:($bundle|@base64),journal:$journal,runtime:{image:$image,revision:$revision,invocationId:$invocation,containerId:$container}}' >"$proof_input"
   # This image has only a federated storage identity; no wallet/signing secrets.
-  recovery_proof=$("$podman" run --rm -i --read-only --network host --user "$signer_user" \
-    --cap-drop ALL --security-opt no-new-privileges \
+  # Match the signer Quadlet: Podman 4.9 no-new-privileges breaks UDP/DNS here.
+  recovery_proof=$("$podman" run --rm -i --pull=never --read-only --network bridge --user "$signer_user" \
+    --cap-drop ALL \
     --volume "$token_file:/run/proof-token:ro" \
     --env "AZURE_TENANT_ID=$tenant" --env "AZURE_CLIENT_ID=$client" \
     --env AZURE_FEDERATED_TOKEN_FILE=/run/proof-token --env AZURE_STORAGE_ACCOUNT_NAME=stpolyedge6urdjr5nmwx7w \
