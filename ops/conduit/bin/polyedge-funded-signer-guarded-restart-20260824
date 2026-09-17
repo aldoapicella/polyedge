@@ -484,7 +484,9 @@ fi
 validate_evidence || die 'prior rollout or lifecycle evidence is not the approved immutable success evidence'
 if [ -n "$recording_recovery" ]; then
   validate_recording_recovery || die 'recording recovery does not bind this exact runtime and repair'
-  recovery_clean_since=$(jq -er '.proof.cleanSinceEpoch' "$recording_recovery")
+  # Compare both consumers at journald microsecond precision; the native JS
+  # proof serialized this boundary after two floating-point divisions.
+  recovery_clean_since=$(jq -er '.proof.cleanSinceEpoch * 1000000 | round | . / 1000000' "$recording_recovery")
 fi
 "$disk_guard" --assert-headroom
 [ ! -e "$pause_file" ] || die 'image pulls are paused'

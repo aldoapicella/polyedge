@@ -78,6 +78,9 @@ if [ "${FAKE_REPAIR_PRE:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = before ];
   alert=$(/usr/bin/jq -nc '{schema:"polyedge.funded_direct_alert.v1",status:"known_repair_trigger"}')
   /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$alert" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 fi
+if [ -f "$FAKE/cutoff-alert-micros" ] && [ "$(cat "$FAKE/state/phase")" = before ]; then
+  /usr/bin/jq -nc --arg ts "$(cat "$FAKE/cutoff-alert-micros")" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:"{\"schema\":\"polyedge.funded_direct_alert.v1\",\"status\":\"paused_by_account_risk_state\"}"}'
+fi
 if [ "${FAKE_LATE_ALERT:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = before ]; then
   /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:"{\"schema\":\"polyedge.funded_direct_alert.v1\",\"status\":\"later_failure\"}"}'
 fi
@@ -214,6 +217,17 @@ run_recovery() {
 prior_signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:cf701ac5ebdf1a66c10ed52feab9fbca3dfb6eb7937e2501c5a41f812a29f28f
 d=$root/recovery; recovery_fixture "$d"; run_recovery "$d"
 jq -e '.status=="validated" and .priorRollout==null and .recordingRecovery.path!=null and .producer.restored==true' "$d/ring/activation/receipt.json" >/dev/null
+# Native JS double division yields 1789617019.8176708 for this journal boundary.
+for offset in 0 1; do
+  d=$root/recovery-fractional-$offset; recovery_fixture "$d"
+  jq '.proof.cleanSinceEpoch=1789617019.8176708' "$d/recovery.json" >"$d/recovery.tmp"; mv "$d/recovery.tmp" "$d/recovery.json"; chmod 640 "$d/recovery.json"
+  printf '%s\n' "$((1789617019817671 + offset))" >"$d/cutoff-alert-micros"
+  if [ "$offset" = 0 ]; then run_recovery "$d"
+  else
+    if run_recovery "$d"; then echo 'alert one microsecond after clean evidence accepted' >&2; exit 1; fi
+    test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
+  fi
+done
 for mutation in '.createdAtUtc="2026-01-01T00:00:00Z"' '.proof.verifiedAtUtc="2026-01-01T00:00:00Z"' '.runtime.signer.containerId=("0"*64)' '.targetSigner.revision=("0"*40)' '.proof.sources.intent.etag="changed"' '.proof.sourceBundleSha256=("sha256:"+("0"*64))'; do
   d=$root/recovery-bad-$RANDOM; recovery_fixture "$d"; jq "$mutation" "$d/recovery.json" >"$d/mutated"; mv "$d/mutated" "$d/recovery.json"; chmod 640 "$d/recovery.json"
   if run_recovery "$d"; then echo "invalid recovery accepted: $mutation" >&2; exit 1; fi
