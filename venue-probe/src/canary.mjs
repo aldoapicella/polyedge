@@ -2675,7 +2675,8 @@ async function fetchJson(url) { const response = await fetch(url, { signal: Abor
 export async function loadAccountPositions({
   user,
   fetcher = fetchJson,
-  pageSize = 500
+  pageSize = 500,
+  dataUrl = "https://data-api.polymarket.com"
 }) {
   const wallet = normalizedAddress(user);
   const apiMaxOffset = 10_000;
@@ -2684,7 +2685,7 @@ export async function loadAccountPositions({
   }
   const values = [];
   for (let offset = 0; offset <= apiMaxOffset; offset += pageSize) {
-    const url = new URL("https://data-api.polymarket.com/positions");
+    const url = new URL("/positions", dataUrl);
     url.searchParams.set("user", wallet);
     url.searchParams.set("sizeThreshold", "0");
     url.searchParams.set("limit", String(pageSize));
