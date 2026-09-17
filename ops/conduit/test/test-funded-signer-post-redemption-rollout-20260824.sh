@@ -33,7 +33,7 @@ esac
 EOF
 cat >"$tmp/bin/journalctl" <<'EOF'
 #!/usr/bin/env bash
-now=$(( $(date +%s)*1000000 )); started='{"schema":"polyedge.funded_direct_service.v2","status":"persistent_service_started","automatic_redemption_enabled":true}'; heartbeat='{"schema":"polyedge.funded_direct_service.v2","status":"persistent_service_heartbeat","processed_messages":2,"failed_messages":0,"failed_attempts":0,"redemption_failures":0,"executor":{"busy":false,"user_channel_ready":true,"market_channel_ready":true,"user_channel_gaps":0,"market_channel_gaps":0,"user_channel_unparsed":0,"market_channel_unparsed":0,"reconnect_reconciliation_required":false,"safety_snapshot_cache_ready":true,"safety_snapshot_cache_age_ms":0,"safety_snapshot_open_order_count":0,"safety_snapshot_unresolved_position_count":0,"safety_snapshot_unresolved_risk_reservation_count":0,"safety_snapshot_cache_error":null,"risk_reservation_index_ready":true}}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$started" '{__REALTIME_TIMESTAMP:(($n-1000000)|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$heartbeat" '{__REALTIME_TIMESTAMP:($n|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'
+now=$(( $(date +%s)*1000000 )); started='{"schema":"polyedge.funded_direct_service.v2","status":"persistent_service_started","automatic_redemption_enabled":true}'; heartbeat='{"schema":"polyedge.funded_direct_service.v2","status":"persistent_service_heartbeat","processed_messages":2,"failed_messages":0,"failed_attempts":0,"redemption_failures":0,"executor":{"busy":false,"user_channel_ready":true,"market_channel_ready":true,"user_channel_gaps":0,"market_channel_gaps":0,"user_channel_unparsed":0,"market_channel_unparsed":0,"reconnect_reconciliation_required":false,"safety_snapshot_cache_ready":true,"safety_snapshot_cache_age_ms":0,"safety_snapshot_open_order_count":0,"safety_snapshot_unresolved_position_count":0,"safety_snapshot_unresolved_risk_reservation_count":0,"safety_snapshot_cache_error":null,"risk_reservation_index_ready":true}}'; heartbeat=$(jq --argjson failures "${FAKE_HISTORY_FAILURES:-0}" '.redemption_failures=$failures' <<<"$heartbeat"); /usr/bin/jq -cn --argjson n "$now" --arg m "$started" '{__REALTIME_TIMESTAMP:(($n-1000000)|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$heartbeat" '{__REALTIME_TIMESTAMP:($n|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'
 EOF
 cat >"$tmp/bin/runuser" <<'EOF'
 #!/usr/bin/env bash
@@ -86,7 +86,15 @@ jq -n --arg condition "$approved_condition" '{schema:"polyedge.approved_redempti
   target_image:("ghcr.io/aldoapicella/polyedge-venue-probe@sha256:"+("d"*64)),target_revision:("e"*40),
   open_order_count:0,unresolved_position_count:0,unresolved_reservation_count:0,position_inventory:{complete:true,readbacks:2},
   selection:{available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,selected:[{condition_id:$condition}]}}' >"$tmp/approved-preflight"
-run_approved(){ local output=$1; shift; run_recovery "$output" FAKE_APPROVED_PREFLIGHT="$tmp/approved-preflight" \
+cat >"$tmp/bin/maintenance" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+[ "${FAKE_MAINTENANCE_FAIL:-0}" = 0 ] || exit 1
+cat "$FAKE_MAINTENANCE_PROOF"
+EOF
+chmod 755 "$tmp/bin/maintenance"
+printf '%s\n' '{"schema":"polyedge.funded_maintenance_failure_proof.v1","failureCount":0,"pairs":[]}' >"$tmp/maintenance-proof"
+run_approved(){ local output=$1; shift; run_recovery "$output" FAKE_APPROVED_PREFLIGHT="$tmp/approved-preflight" FAKE_MAINTENANCE_PROOF="$tmp/maintenance-proof" POLYEDGE_POST_REDEMPTION_MAINTENANCE_PROOF_HELPER="$tmp/bin/maintenance" \
   POLYEDGE_POST_REDEMPTION_DRY_RUN= POLYEDGE_POST_REDEMPTION_APPROVED_AUTOMATIC_REDEMPTION_CONDITION="$approved_condition" \
   POLYEDGE_POST_REDEMPTION_REDEMPTION_PREFLIGHT_COLLECTOR="$root/ops/conduit/bin/polyedge-funded-redemption-preflight.mjs" "$@"; }
 run_approved "$tmp/out-approved" >/dev/null
@@ -97,11 +105,16 @@ jq -e --arg condition "$approved_condition" '.evidence.followUpDryRun==null and
 jq -se '.[0].approvedRedemptionPreflight==.[1].evidence.approvedRedemptionPreflight' \
   "$tmp/out-approved/recording-recovery-00000000000000000000000000000001.json" \
   "$tmp/out-approved/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json" >/dev/null
-for bad_env in FAKE_PREFLIGHT_FAIL=1 FAKE_PREFLIGHT_MUTATION=.unresolved_position_count=1 FAKE_PREFLIGHT_MUTATION=.position_inventory.complete=false POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_INPUTS=; do
+for bad_env in FAKE_MAINTENANCE_FAIL=1 FAKE_PREFLIGHT_FAIL=1 FAKE_PREFLIGHT_MUTATION=.unresolved_position_count=1 FAKE_PREFLIGHT_MUTATION=.position_inventory.complete=false POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_INPUTS=; do
   output=$tmp/out-approved-bad-$RANDOM
   if run_approved "$output" "$bad_env" >/dev/null 2>&1; then echo "unsafe active approved preflight attested: $bad_env" >&2; exit 1; fi
   test ! -e "$output/recording-recovery-00000000000000000000000000000001.json"
 done
+jq '.failureCount=3' "$tmp/maintenance-proof" >"$tmp/maintenance.tmp"; mv "$tmp/maintenance.tmp" "$tmp/maintenance-proof"
+run_approved "$tmp/out-maintenance" FAKE_HISTORY_FAILURES=3 >/dev/null
+jq -e '.heartbeat.redemptionFailures==3 and .evidence.maintenanceFailureBaseline.proof.failureCount==3' "$tmp/out-maintenance/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json" >/dev/null
+if run_approved "$tmp/out-maintenance-mismatch" FAKE_HISTORY_FAILURES=4 >/dev/null 2>&1; then echo 'unclassified maintenance failure attested' >&2; exit 1; fi
+jq '.failureCount=0' "$tmp/maintenance-proof" >"$tmp/maintenance.tmp"; mv "$tmp/maintenance.tmp" "$tmp/maintenance-proof"
 cat >"$tmp/bin/queue-snapshot" <<'EOF'
 #!/usr/bin/env bash
 [ "${FAKE_OCI_SNAPSHOT_FAIL:-0}" = 0 ] || exit 1

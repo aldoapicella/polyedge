@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 const wallet = "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8";
+const campaign = "dynamic-quote-funded-2026-09-16-v11";
 const digest = value => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
 export function validateClobRead(path, body) {
@@ -17,6 +18,27 @@ export function validateClobRead(path, body) {
     assert.equal(body.next_cursor, "LTE=", "incomplete open-order inventory");
   }
   return body;
+}
+
+export function validateTerminalRedemptionControl(value) {
+  assert.equal(value.schema_version, 1);
+  assert.equal(value.state, "confirmed_and_verified", "unresolved redemption control");
+  assert.equal(String(value.funder).toLowerCase(), wallet);
+  assert(value.recovery_journal_blob_name == null, "unfinished recovery publication");
+  assert.equal(value.submission_attempted, true);
+  assert(typeof value.transaction_id === "string" && value.transaction_id.trim());
+  assert.match(value.run_id, /^venue-redemption-[0-9]{17}-[0-9a-f]{8}$/);
+  assert.match(value.transaction_hash, /^0x[0-9a-f]{64}$/);
+  assert(Array.isArray(value.condition_ids) && value.condition_ids.length > 0);
+  for (const condition of value.condition_ids) assert.match(condition, /^0x[0-9a-f]{64}$/);
+  assert.equal(new Set(value.condition_ids).size, value.condition_ids.length);
+  assert(Array.isArray(value.internal_settlement_blobs) && value.internal_settlement_blobs.length > 0);
+  assert.equal(value.internal_settlement_blobs.length, value.condition_ids.length);
+  assert.equal(new Set(value.internal_settlement_blobs).size, value.internal_settlement_blobs.length);
+  for (const path of value.internal_settlement_blobs) {
+    assert.match(path, new RegExp(`^reports/funded/dynamic-quote/sessions/${campaign}/internal-settlements/[0-9a-f]{64}\\.json$`));
+  }
+  return value.state;
 }
 
 // Called through stdin in the current signer. This helper only reads; it never
@@ -97,7 +119,7 @@ async function main() {
   assert.equal(mode, "--collect"); assert.equal(extra.length, 0);
   assert(!process.env.AZURE_STORAGE_ACCOUNT_KEY, "storage keys forbidden");
   assert.equal(String(process.env.POLYMARKET_FUNDER_ADDRESS).toLowerCase(), wallet);
-  assert.equal(process.env.VENUE_PROBE_FUNDED_CAMPAIGN_ID, "dynamic-quote-funded-2026-09-16-v11");
+  assert.equal(process.env.VENUE_PROBE_FUNDED_CAMPAIGN_ID, campaign);
   assert.equal(process.env.AZURE_STORAGE_ACCOUNT_NAME, "stpolyedge6urdjr5nmwx7w");
   assert.equal(process.env.AZURE_STORAGE_CONTAINER_NAME, "polyedge-funded-evidence");
   const require = createRequire("/app/package.json");
@@ -105,11 +127,32 @@ async function main() {
   const { polygon } = require("viem/chains");
   const { venueClient } = await import("/app/src/reconcile-rejected-no-order.mjs");
   const { loadAccountPositions } = await import("/app/src/canary.mjs");
-  const { loadCampaignUnresolvedRiskReservationRecords } = await import("/app/src/lib.mjs");
+  const { loadCampaignUnresolvedRiskReservationRecords, storageContainer } = await import("/app/src/lib.mjs");
   const { discoverOnchainRedeemableConditions } = await import("/app/src/redeem.mjs");
   const { deriveLegacyUupsDepositWallet } = await import("/app/src/redemption.mjs");
   const clob = venueClient(process.env);
   assert.equal(deriveLegacyUupsDepositWallet(clob.signer.account.address).toLowerCase(), wallet);
+  const container = storageContainer({ storageAccount: process.env.AZURE_STORAGE_ACCOUNT_NAME,
+    storageContainer: process.env.AZURE_STORAGE_CONTAINER_NAME, azureClientId: process.env.AZURE_CLIENT_ID });
+  const controlPath = `reports/funded/dynamic-quote/sessions/${process.env.VENUE_PROBE_FUNDED_CAMPAIGN_ID}/control/redemption-state.json`;
+  const readControl = async etag => {
+    try {
+      const response = await container.getBlobClient(controlPath).download(0, undefined,
+        { ...(etag ? { conditions: { ifMatch: etag } } : {}), abortSignal: AbortSignal.timeout(20000) });
+      const parts = []; let size = 0;
+      for await (const chunk of response.readableStreamBody) {
+        size += chunk.length; assert(size <= 1048576); parts.push(chunk);
+      }
+      const body = Buffer.concat(parts), value = JSON.parse(body);
+      assert(response.etag);
+      return { path: controlPath, exists: true, state: validateTerminalRedemptionControl(value),
+        etag: response.etag, sha256: createHash("sha256").update(body).digest("hex") };
+    } catch (error) {
+      if (error.statusCode !== 404 || error.code !== "BlobNotFound" || etag) throw error;
+      return { path: controlPath, exists: false };
+    }
+  };
+  const controlBefore = await readControl();
   // Keep SDK authentication/query construction while preventing error logging of headers.
   clob.get = async (endpoint, options = {}) => {
     const url = new URL(endpoint);
@@ -140,6 +183,8 @@ async function main() {
     discover: positions => discoverOnchainRedeemableConditions(pinned, positions,
       { funderAddress: wallet, maxPayout: null, maxConditions: Number.MAX_SAFE_INTEGER })
   });
+  assert.deepEqual(await readControl(controlBefore.etag), controlBefore, "redemption control changed during preflight");
+  result.redemption_control = { ...controlBefore, terminal: true, readbacks: 2 };
   assert.equal((await rpc.getBlock({ blockNumber: block.number })).hash, block.hash, "block reorganized");
   process.stdout.write(JSON.stringify(result) + "\n");
 }

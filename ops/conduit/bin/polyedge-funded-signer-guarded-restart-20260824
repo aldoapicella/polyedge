@@ -60,6 +60,8 @@ stopped_binding=${POLYEDGE_GUARDED_RESTART_STOPPED_BINDING:-}
 stopped_binding_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256:-}
 approved_automatic_redemption_condition=${POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION:-}
 redemption_collector=${POLYEDGE_GUARDED_RESTART_REDEMPTION_PREFLIGHT_COLLECTOR:-/usr/local/libexec/polyedge-funded-redemption-preflight.mjs}
+maintenance_helper=${POLYEDGE_GUARDED_RESTART_MAINTENANCE_PROOF_HELPER:-/usr/local/libexec/polyedge-funded-maintenance-failure-proof}
+maintenance_count=0
 approved_preflight_before=null
 approved_preflight_after=null
 approved_payout=null
@@ -139,14 +141,27 @@ wait_producer() {
   return 1
 }
 
+maintenance_baseline_safe() {
+  local current since
+  secure_file "$maintenance_helper" 755 65536 || return 1
+  jq -e --arg path "$maintenance_helper" --arg sha "sha256:$(sha "$maintenance_helper")" \
+    '.maintenanceFailureBaseline.collector=={path:$path,sha256:$sha}' "$recording_recovery" >/dev/null || return 1
+  since=$(jq -er '.proof.cleanSinceEpoch' "$recording_recovery") || return 1
+  current=$("$journalctl" -u polyedge-funded-signer.service "_SYSTEMD_INVOCATION_ID=$(invocation polyedge-funded-signer)" \
+    "CONTAINER_ID_FULL=$(container_id polyedge-funded-signer)" -o json --all --no-pager |
+    "$maintenance_helper" "$(invocation polyedge-funded-signer)" "$(container_id polyedge-funded-signer)" "$since") || return 1
+  jq -e --argjson current "$current" '.maintenanceFailureBaseline.proof==$current' "$recording_recovery" >/dev/null || return 1
+  maintenance_count=$(jq -er '.failureCount' <<<"$current") || return 1
+}
 heartbeat_safe() {
   local readiness=$1 invocation_id container now
+  if [ "$readiness" = recording_recovery ] && [ -n "$approved_automatic_redemption_condition" ]; then maintenance_baseline_safe || return 1; fi
   invocation_id=$(invocation polyedge-funded-signer) || return 1
   container=$(container_id polyedge-funded-signer) || return 1
   now=$(date -u +%s)
   "$journalctl" -u polyedge-funded-signer.service "_SYSTEMD_INVOCATION_ID=$invocation_id" "CONTAINER_ID_FULL=$container" -o json --all --no-pager | jq -Rse \
     --arg invocation "$invocation_id" --arg container "$container" --argjson now "$now" --arg readiness "$readiness" \
-    --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" --argjson clean_since "$recovery_clean_since" '
+    --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" --argjson clean_since "$recovery_clean_since" --argjson maintenance_count "$maintenance_count" '
       def ready:
         .event.failed_attempts == 0 and .event.failed_messages == 0 and .event.redemption_failures == 0 and .event.executor.busy == false and
         .event.executor.user_channel_ready == true and .event.executor.market_channel_ready == true and
@@ -192,7 +207,7 @@ heartbeat_safe() {
          ([$events[] | select(.invocation == $invocation and .container == $container and ((.event.schema == "polyedge.funded_direct_alert.v1") or (.event.schema == "polyedge.funded_direct_service.v1" and .event.status == "failed_closed") or (.event.schema == "polyedge.funded_direct_service.v2" and .event.status == "persistent_message_failed_closed")))] | length) == 0
        end) and
       $h != null and $h.timestamp <= $now and $h.timestamp >= ($now - 75) and
-      (if $readiness == "ready" then ($h | ready) elif $readiness == "prestart" then ($h | ready or cold) elif $readiness == "repair" then ($h | repair) elif $readiness == "recording_recovery" then ($h.timestamp > $clean_since and ($h | ready)) else false end)'
+      (if $readiness == "ready" then ($h | ready) elif $readiness == "prestart" then ($h | ready or cold) elif $readiness == "repair" then ($h | repair) elif $readiness == "recording_recovery" then ($h.timestamp > $clean_since and $h.event.redemption_failures==$maintenance_count and ($h | .event.redemption_failures=0 | ready)) else false end)'
 }
 wait_signer() {
   local readiness=$1 expected_image=${2:-$signer_image}
@@ -291,6 +306,7 @@ validate_recording_recovery() {
       $r.targetSigner == {image:$target,revision:$revision} and $r.lifecycle == {path:$lifecycle,sha256:$sha} and
       $r.runtime == $l.runtime and $r.helperSha256 == $l.helperSha256 and
       $r.approvedRedemptionPreflight == $l.evidence.approvedRedemptionPreflight and
+      $r.maintenanceFailureBaseline == $l.evidence.maintenanceFailureBaseline and
       (if $condition == "" then $r.approvedRedemptionPreflight == null
        else $r.approvedRedemptionPreflight.proof.condition_id == $condition and $l.evidence.followUpDryRun == null end) and
       $l.schema == "polyedge.funded_signer_post_redemption_attestation.v1" and $l.status == "attested" and
@@ -316,6 +332,7 @@ validate_recording_recovery() {
     secure_file "$redemption_collector" 755 65536 || return 1
     jq -e --arg path "$redemption_collector" --arg sha "sha256:$(sha "$redemption_collector")" \
       '.approvedRedemptionPreflight.collector == {path:$path,sha256:$sha}' "$recording_recovery" >/dev/null || return 1
+    maintenance_baseline_safe || return 1
     validate_approved_preflight "$(jq -c '.approvedRedemptionPreflight.proof' "$recording_recovery")" || return 1
   fi
 }
@@ -330,6 +347,8 @@ validate_approved_preflight() {
     $start <= $end and $end <= $now and $start >= ($now-180) and ($end-$start) <= 120 and
     .block.chain_id==137 and (.block.number|test("^[0-9]+$")) and (.block.hash|test("^0x[0-9a-f]{64}$")) and
     .block.timestamp <= $start and .block.timestamp >= ($start-60) and
+    .redemption_control.terminal==true and .redemption_control.readbacks==2 and
+    (.redemption_control.exists==false or (.redemption_control.exists==true and .redemption_control.state=="confirmed_and_verified")) and
     .open_order_count==0 and .unresolved_position_count==0 and .unresolved_reservation_count==0 and
     .position_inventory.reader=="loadAccountPositions" and .position_inventory.complete==true and
     .position_inventory.readbacks==2 and (.position_inventory.rows|type=="number" and .>0 and .==floor) and
@@ -353,7 +372,7 @@ collect_approved_preflight() {
   [ "sha256:$(sha "$redemption_collector")" = "$certified_sha" ] || return 1
   validate_approved_preflight "$proof" || return 1
   jq -e --argjson proof "$proof" '.approvedRedemptionPreflight.proof |
-    .payout_base_units==$proof.payout_base_units and .selection==$proof.selection' "$recording_recovery" >/dev/null || return 1
+    .payout_base_units==$proof.payout_base_units and .selection==$proof.selection and .redemption_control==$proof.redemption_control' "$recording_recovery" >/dev/null || return 1
   printf '%s\n' "$proof"
 }
 validate_repair_evidence() {

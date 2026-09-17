@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { collectApprovedRedemptionPreflight, validateClobRead } from "../../ops/conduit/bin/polyedge-funded-redemption-preflight.mjs";
+import { collectApprovedRedemptionPreflight, validateClobRead, validateTerminalRedemptionControl } from "../../ops/conduit/bin/polyedge-funded-redemption-preflight.mjs";
 import { loadAccountPositions } from "../src/canary.mjs";
 
 test("approved redemption preflight binds a complete stable inventory and exact chain payout", async () => {
@@ -56,4 +56,18 @@ test("approved redemption preflight binds a complete stable inventory and exact 
   assert.throws(() => validateClobRead("/data/orders", { error: "auth failed", data: [], next_cursor: "LTE=" }), /CLOB error/);
   assert.throws(() => validateClobRead("/data/orders", { data: [], next_cursor: "next" }), /incomplete/);
   assert.throws(() => validateClobRead("/time", { timestamp: 1789620000 }), /invalid server time/);
+});
+
+test("redemption preflight rejects pending control and recovery publication", () => {
+  const value = {schema_version:1,state:"confirmed_and_verified",funder:"0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8",
+    submission_attempted:true,transaction_id:"verified-transaction",condition_ids:[`0x${"b".repeat(64)}`],
+    run_id:"venue-redemption-20260917024026119-737e056f",transaction_hash:`0x${"a".repeat(64)}`,
+    internal_settlement_blobs:[`reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-09-16-v11/internal-settlements/${"a".repeat(64)}.json`]};
+  assert.equal(validateTerminalRedemptionControl(value), "confirmed_and_verified");
+  assert.throws(() => validateTerminalRedemptionControl({...value,state:"submission_attempted"}));
+  assert.throws(() => validateTerminalRedemptionControl({...value,recovery_journal_blob_name:"pending"}));
+  for (const mutation of [{submission_attempted:false},{transaction_id:""},{condition_ids:[]},
+    {internal_settlement_blobs:[null]},{recovery_journal_blob_name:false}]) {
+    assert.throws(() => validateTerminalRedemptionControl({...value,...mutation}));
+  }
 });

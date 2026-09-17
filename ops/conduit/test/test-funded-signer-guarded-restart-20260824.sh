@@ -68,7 +68,7 @@ set -euo pipefail
 attempts=0; failed_messages=0
 if [ "$(cat "$FAKE/state/phase")" = before ]; then attempts=${FAKE_FAILED_ATTEMPTS:-0}; failed_messages=${FAKE_FAILED_MESSAGES:-0}; fi
 [ "${FAKE_BAD_POST:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = after ] && attempts=$((attempts + 1))
-redemption_failures=0; [ "${FAKE_REPAIR_PRE:-0}" != 1 ] || [ "$(cat "$FAKE/state/phase")" = after ] || redemption_failures=2
+redemption_failures=0; [ "$(cat "$FAKE/state/phase")" = after ] || redemption_failures=${FAKE_HISTORY_FAILURES:-0}; [ "${FAKE_REPAIR_PRE:-0}" != 1 ] || [ "$(cat "$FAKE/state/phase")" = after ] || redemption_failures=2
 partial=false; [ "${FAKE_PRESTART_PARTIAL:-0}" != 1 ] || [ "$(cat "$FAKE/state/producer-active")" = 1 ] || partial=true
 if [ "${FAKE_COLD_AFTER_REPAIR:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = after ] && [ "$(cat "$FAKE/state/producer-active")" = 0 ]; then partial=true; fi
 message=$(/usr/bin/jq -nc --argjson attempts "$attempts" --argjson failed_messages "$failed_messages" --argjson redemption_failures "$redemption_failures" --argjson partial "$partial" '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",failed_attempts:$attempts,failed_messages:$failed_messages,redemption_failures:$redemption_failures,processed_messages:0,executor:{busy:false,user_channel_ready:true,market_channel_ready:($partial|not),user_channel_gaps:0,market_channel_gaps:0,user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,safety_snapshot_cache_ready:($partial|not),safety_snapshot_cache_age_ms:(if $partial then null else 1 end),safety_snapshot_open_order_count:(if $partial then null else 0 end),safety_snapshot_unresolved_position_count:(if $partial then null else 0 end),safety_snapshot_unresolved_risk_reservation_count:(if $partial then null else 0 end),safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
@@ -238,7 +238,7 @@ approved_recovery_fixture() {
      funder:"0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8",condition_id:$condition,target_image:$image,target_revision:$revision,
      started_ts:($now|todateiso8601),finished_ts:($now|todateiso8601),block:{chain_id:137,number:"99",hash:("0x"+("d"*64)),timestamp:($now-2)},
      open_order_count:0,unresolved_position_count:0,unresolved_reservation_count:0,
-     position_inventory:{reader:"loadAccountPositions",complete:true,readbacks:2,rows:131,sha256:("a"*64)},payout_base_units:"5000000",
+     redemption_control:{terminal:true,readbacks:2,exists:false},position_inventory:{reader:"loadAccountPositions",complete:true,readbacks:2,rows:131,sha256:("a"*64)},payout_base_units:"5000000",
      selection:{payout_source:"onchain_balances_and_payout_vector",available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,
        selected:[{condition_id:$condition,asset_ids:["11","22"],onchain_balances_base_units:["5000000","0"],payout_numerators:["1","0"],
                   payout_denominator:"1",onchain_expected_payout:5,gross_payout:5}]}}
@@ -247,20 +247,32 @@ approved_recovery_fixture() {
     '.evidence.followUpDryRun=null | .evidence.approvedRedemptionPreflight={collector:{path:$path,sha256:$sha},proof:$proof[0]}' "$d/lifecycle.json" >"$d/lifecycle.tmp"; mv "$d/lifecycle.tmp" "$d/lifecycle.json"
   jq --slurpfile life "$d/lifecycle.json" --arg sha "sha256:$(sha256sum "$d/lifecycle.json"|cut -d' ' -f1)" \
     '.lifecycle.sha256=$sha | .approvedRedemptionPreflight=$life[0].evidence.approvedRedemptionPreflight' "$d/recovery.json" >"$d/recovery.tmp"; mv "$d/recovery.tmp" "$d/recovery.json"
+  cat >"$d/bin/maintenance" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null
+[ "${FAKE_MAINTENANCE_FAIL:-0}" = 0 ] || exit 1
+if [ "$(cat "$FAKE/state/producer-active")" = 0 ] && [ -n "${FAKE_MAINTENANCE_AFTER_STOP_COUNT:-}" ]; then jq --argjson count "$FAKE_MAINTENANCE_AFTER_STOP_COUNT" ".failureCount=\$count" "$FAKE/maintenance-proof.json"; else cat "$FAKE/maintenance-proof.json"; fi
+EOF
+  chmod 755 "$d/bin/maintenance"
+  jq '{schema:"polyedge.funded_maintenance_failure_proof.v1",failureCount:0,pairs:[],invocationId:.runtime.signer.invocationId,containerId:.runtime.signer.containerId,cleanSinceEpoch:.proof.cleanSinceEpoch}' "$d/recovery.json" >"$d/maintenance-proof.json"
+  jq --slurpfile proof "$d/maintenance-proof.json" --arg path "$d/bin/maintenance" --arg sha "sha256:$(sha256sum "$d/bin/maintenance"|cut -d' ' -f1)" \
+    '.evidence.maintenanceFailureBaseline={collector:{path:$path,sha256:$sha},proof:$proof[0]}' "$d/lifecycle.json" >"$d/lifecycle.tmp"; mv "$d/lifecycle.tmp" "$d/lifecycle.json"
+  jq --slurpfile life "$d/lifecycle.json" --arg sha "sha256:$(sha256sum "$d/lifecycle.json"|cut -d' ' -f1)" \
+    '.lifecycle.sha256=$sha | .maintenanceFailureBaseline=$life[0].evidence.maintenanceFailureBaseline' "$d/recovery.json" >"$d/recovery.tmp"; mv "$d/recovery.tmp" "$d/recovery.json"
   chmod 640 "$d/lifecycle.json" "$d/recovery.json" "$d/approved-preflight.json"
 }
 run_approved_recovery() {
   local d=$1; shift
   run_recovery "$d" FAKE_APPROVED_CONDITION="$approved_condition" FAKE_AUTOMATIC_REDEMPTION=1 \
     POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION="$approved_condition" \
-    POLYEDGE_GUARDED_RESTART_REDEMPTION_PREFLIGHT_COLLECTOR="$d/bin/collector" "$@"
+    POLYEDGE_GUARDED_RESTART_REDEMPTION_PREFLIGHT_COLLECTOR="$d/bin/collector" POLYEDGE_GUARDED_RESTART_MAINTENANCE_PROOF_HELPER="$d/bin/maintenance" "$@"
 }
 d=$root/approved-recovery; approved_recovery_fixture "$d"; run_approved_recovery "$d" FAKE_COLD_AFTER_REPAIR=1
 jq -e --arg condition "$approved_condition" '.status=="validated" and .recordingRecovery!=null and .priorRollout==null and
   .approvedAutomaticRedemptionCondition==$condition and .automaticRedemption.conditionId==$condition and .automaticRedemption.grossPayout==5 and
   .approvedRedemptionPreflight.beforeProducerStop.position_inventory.complete==true and
   .approvedRedemptionPreflight.afterProducerStop.unresolved_reservation_count==0 and .producer.restored==true' "$d/ring/activation/receipt.json" >/dev/null
-for mutation in '.unresolved_position_count=1' '.unresolved_reservation_count=1' '.open_order_count=1' '.position_inventory.complete=false' \
+for mutation in '.redemption_control.terminal=false' '.redemption_control.readbacks=1' '.unresolved_position_count=1' '.unresolved_reservation_count=1' '.open_order_count=1' '.position_inventory.complete=false' \
   '.selection.available_winner_conditions=2' '.condition_id=("0x"+("b"*64))' '.target_revision=("0"*40)' \
   '.started_ts="2026-01-01T00:00:00Z"' '.payout_base_units="6000000" | .selection.selected_gross_payout=6 | .selection.selected[0].gross_payout=6 | .selection.selected[0].onchain_expected_payout=6'; do
   d=$root/approved-bad-$RANDOM; approved_recovery_fixture "$d"
@@ -280,6 +292,22 @@ for bad_env in FAKE_AUTOMATIC_REDEMPTION=0 FAKE_AUTOMATIC_PAYOUT=6 POLYEDGE_GUAR
   if [ "$bad_env" = POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION= ]; then test "$(cat "$d/state/phase")" = before
   else test "$(cat "$d/state/producer-active")" = 0; test "$(cat "$d/state/signer-active")" = 0; grep -Fx "Image=$prior_signer_image" "$d/quadlet" >/dev/null; fi
 done
+maintenance_recovery_fixture() {
+  local d=$1
+  approved_recovery_fixture "$d"
+  jq '.failureCount=3' "$d/maintenance-proof.json" >"$d/proof.tmp"; mv "$d/proof.tmp" "$d/maintenance-proof.json"
+  jq --slurpfile proof "$d/maintenance-proof.json" '.evidence.maintenanceFailureBaseline.proof=$proof[0]' "$d/lifecycle.json" >"$d/lifecycle.tmp"; mv "$d/lifecycle.tmp" "$d/lifecycle.json"
+  jq --slurpfile life "$d/lifecycle.json" --arg sha "sha256:$(sha256sum "$d/lifecycle.json"|cut -d' ' -f1)" '.lifecycle.sha256=$sha | .maintenanceFailureBaseline=$life[0].evidence.maintenanceFailureBaseline' "$d/recovery.json" >"$d/recovery.tmp"; mv "$d/recovery.tmp" "$d/recovery.json"
+  chmod 640 "$d/lifecycle.json" "$d/recovery.json"
+}
+d=$root/maintenance-recovery; maintenance_recovery_fixture "$d"; run_approved_recovery "$d" FAKE_HISTORY_FAILURES=3
+jq -e '.signer.redemptionFailures==0 and .producer.restored==true' "$d/ring/activation/receipt.json" >/dev/null
+d=$root/maintenance-mismatch; maintenance_recovery_fixture "$d"
+if run_approved_recovery "$d" FAKE_HISTORY_FAILURES=4; then echo 'unclassified cumulative failure accepted' >&2; exit 1; fi
+test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
+d=$root/maintenance-after-stop; maintenance_recovery_fixture "$d"
+if run_approved_recovery "$d" FAKE_HISTORY_FAILURES=3 FAKE_MAINTENANCE_AFTER_STOP_COUNT=4; then echo 'changed maintenance history accepted' >&2; exit 1; fi
+test "$(cat "$d/state/producer-active")" = 0; test "$(cat "$d/state/phase")" = before
 oci_recovery_fixture() {
   local d=$1
   approved_recovery_fixture "$d"
