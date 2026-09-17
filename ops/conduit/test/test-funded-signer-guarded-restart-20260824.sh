@@ -51,7 +51,15 @@ case "$1" in
     if [ "${FAKE_PRODUCER_HEALTH_FIRST:-}" = starting ] && [ ! -e "$FAKE/state/producer-health-seen" ]; then touch "$FAKE/state/producer-health-seen"; health=starting; fi
     printf '%s|%s|running|%s\n' "$FAKE_PRODUCER_IMAGE" "$FAKE_USER" "$health"
   fi ;;
- exec) [[ "${6:-}" == *loadCampaignUnresolvedRiskReservationRecords* ]]; cat "$FAKE/state/binding" ;;
+ exec)
+  if [ "$2" = -i ]; then
+    test "$3:$4:$5:$6:$7:$8:$9" = '--workdir:/app:polyedge-funded-signer:node:--input-type=module:-:--collect'
+    test "${10}:${11}:${12}" = "$FAKE_APPROVED_CONDITION:$FAKE_SIGNER_IMAGE:$FAKE_SIGNER_REVISION"
+    cat >/dev/null
+    mutation='.'
+    if [ "${FAKE_PREFLIGHT_MUTATE_AFTER_STOP:-0}" != 1 ] || [ "$(cat "$FAKE/state/producer-active")" = 0 ]; then mutation=${FAKE_PREFLIGHT_MUTATION:-.}; fi
+    jq "$mutation" "$FAKE/approved-preflight.json"
+  else [[ "${6:-}" == *loadCampaignUnresolvedRiskReservationRecords* ]]; cat "$FAKE/state/binding"; fi ;;
 esac
 EOF
   cat >"$d/bin/journalctl" <<'EOF'
@@ -62,6 +70,7 @@ if [ "$(cat "$FAKE/state/phase")" = before ]; then attempts=${FAKE_FAILED_ATTEMP
 [ "${FAKE_BAD_POST:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = after ] && attempts=$((attempts + 1))
 redemption_failures=0; [ "${FAKE_REPAIR_PRE:-0}" != 1 ] || [ "$(cat "$FAKE/state/phase")" = after ] || redemption_failures=2
 partial=false; [ "${FAKE_PRESTART_PARTIAL:-0}" != 1 ] || [ "$(cat "$FAKE/state/producer-active")" = 1 ] || partial=true
+if [ "${FAKE_COLD_AFTER_REPAIR:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = after ] && [ "$(cat "$FAKE/state/producer-active")" = 0 ]; then partial=true; fi
 message=$(/usr/bin/jq -nc --argjson attempts "$attempts" --argjson failed_messages "$failed_messages" --argjson redemption_failures "$redemption_failures" --argjson partial "$partial" '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_heartbeat",failed_attempts:$attempts,failed_messages:$failed_messages,redemption_failures:$redemption_failures,processed_messages:0,executor:{busy:false,user_channel_ready:true,market_channel_ready:($partial|not),user_channel_gaps:0,market_channel_gaps:0,user_channel_unparsed:0,market_channel_unparsed:0,reconnect_reconciliation_required:false,safety_snapshot_cache_ready:($partial|not),safety_snapshot_cache_age_ms:(if $partial then null else 1 end),safety_snapshot_open_order_count:(if $partial then null else 0 end),safety_snapshot_unresolved_position_count:(if $partial then null else 0 end),safety_snapshot_unresolved_risk_reservation_count:(if $partial then null else 0 end),safety_snapshot_cache_error:null,risk_reservation_index_ready:true}}')
 started=$(/usr/bin/jq -nc --argjson enabled "${FAKE_AUTO_REDEMPTION_ENABLED:-true}" '{schema:"polyedge.funded_direct_service.v2",status:"persistent_service_started",automatic_redemption_enabled:$enabled}')
 ts="$(( $(date -u +%s) - 1 ))000000"
@@ -75,7 +84,7 @@ fi
 /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$started" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$message" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 if [ "${FAKE_AUTOMATIC_REDEMPTION:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = after ]; then
-  summary=$(/usr/bin/jq -nc --arg condition "$FAKE_APPROVED_CONDITION" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%S).123Z" '{schema:"polyedge.funded_redemption_service.v1",status:"redemption_worker_summary",redemption:{schema_version:1,run_id:"venue-redemption-20260826190000000-abcdef12",status:"redeemed_and_verified",finished_ts:$finished,redemption_submitted:true,transaction_id:"automatic-test",transaction_hash:("0x" + ("f" * 64)),zero_open_orders_confirmed:true,selection:{selected_gross_payout:5,selected:[{condition_id:$condition,gross_payout:5}]},internal_settlement_blobs:["reports/funded/internal-settlement.json"]}}')
+  summary=$(/usr/bin/jq -nc --arg condition "$FAKE_APPROVED_CONDITION" --argjson payout "${FAKE_AUTOMATIC_PAYOUT:-5}" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%S).123Z" '{schema:"polyedge.funded_redemption_service.v1",status:"redemption_worker_summary",redemption:{schema_version:1,run_id:"venue-redemption-20260826190000000-abcdef12",status:"redeemed_and_verified",finished_ts:$finished,redemption_submitted:true,transaction_id:"automatic-test",transaction_hash:("0x" + ("f" * 64)),zero_open_orders_confirmed:true,selection:{selected_gross_payout:$payout,selected:[{condition_id:$condition,gross_payout:$payout}]},internal_settlement_blobs:["reports/funded/internal-settlement.json"]}}')
   cycle=$(/usr/bin/jq -nc '{schema:"polyedge.funded_redemption_service.v1",status:"automatic_redemption_cycle_completed",redemption_status:"redeemed_and_verified",redemption_submitted:true}')
   first=${summary:0:127}; second=${summary:127}
   /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$first" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
@@ -218,4 +227,57 @@ done
 d=$root/recovery-runtime-change; recovery_fixture "$d"
 if run_recovery "$d" FAKE_RUNTIME_CHANGE=1; then echo 'runtime change unexpectedly deployed' >&2; exit 1; fi
 test "$(cat "$d/state/phase")" = before; test "$(cat "$d/state/producer-active")" = 0; test ! -e "$d/ring/activation/receipt.json"
+# Active recovery uses a complete, twice-read chain preflight instead of the old
+# first-page nothing_to_redeem summary, and keeps the producer off on uncertainty.
+approved_recovery_fixture() {
+  local d=$1
+  recovery_fixture "$d"
+  cp "$repo/ops/conduit/bin/polyedge-funded-redemption-preflight.mjs" "$d/bin/collector"; chmod 755 "$d/bin/collector"
+  jq -n --arg condition "$approved_condition" --arg image "$signer_image" --arg revision "$signer_revision" --argjson now "$(date -u +%s)" '
+    {schema:"polyedge.approved_redemption_preflight.v1",status:"approved_redemption_ready",read_only:true,redemption_submitted:false,
+     funder:"0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8",condition_id:$condition,target_image:$image,target_revision:$revision,
+     started_ts:($now|todateiso8601),finished_ts:($now|todateiso8601),block:{chain_id:137,number:"99",hash:("0x"+("d"*64)),timestamp:($now-2)},
+     open_order_count:0,unresolved_position_count:0,unresolved_reservation_count:0,
+     position_inventory:{reader:"loadAccountPositions",complete:true,readbacks:2,rows:131,sha256:("a"*64)},payout_base_units:"5000000",
+     selection:{payout_source:"onchain_balances_and_payout_vector",available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,
+       selected:[{condition_id:$condition,asset_ids:["11","22"],onchain_balances_base_units:["5000000","0"],payout_numerators:["1","0"],
+                  payout_denominator:"1",onchain_expected_payout:5,gross_payout:5}]}}
+  ' >"$d/approved-preflight.json"
+  jq --slurpfile proof "$d/approved-preflight.json" --arg path "$d/bin/collector" --arg sha "sha256:$(sha256sum "$d/bin/collector"|cut -d' ' -f1)" \
+    '.evidence.followUpDryRun=null | .evidence.approvedRedemptionPreflight={collector:{path:$path,sha256:$sha},proof:$proof[0]}' "$d/lifecycle.json" >"$d/lifecycle.tmp"; mv "$d/lifecycle.tmp" "$d/lifecycle.json"
+  jq --slurpfile life "$d/lifecycle.json" --arg sha "sha256:$(sha256sum "$d/lifecycle.json"|cut -d' ' -f1)" \
+    '.lifecycle.sha256=$sha | .approvedRedemptionPreflight=$life[0].evidence.approvedRedemptionPreflight' "$d/recovery.json" >"$d/recovery.tmp"; mv "$d/recovery.tmp" "$d/recovery.json"
+  chmod 640 "$d/lifecycle.json" "$d/recovery.json" "$d/approved-preflight.json"
+}
+run_approved_recovery() {
+  local d=$1; shift
+  run_recovery "$d" FAKE_APPROVED_CONDITION="$approved_condition" FAKE_AUTOMATIC_REDEMPTION=1 \
+    POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION="$approved_condition" \
+    POLYEDGE_GUARDED_RESTART_REDEMPTION_PREFLIGHT_COLLECTOR="$d/bin/collector" "$@"
+}
+d=$root/approved-recovery; approved_recovery_fixture "$d"; run_approved_recovery "$d" FAKE_COLD_AFTER_REPAIR=1
+jq -e --arg condition "$approved_condition" '.status=="validated" and .recordingRecovery!=null and .priorRollout==null and
+  .approvedAutomaticRedemptionCondition==$condition and .automaticRedemption.conditionId==$condition and .automaticRedemption.grossPayout==5 and
+  .approvedRedemptionPreflight.beforeProducerStop.position_inventory.complete==true and
+  .approvedRedemptionPreflight.afterProducerStop.unresolved_reservation_count==0 and .producer.restored==true' "$d/ring/activation/receipt.json" >/dev/null
+for mutation in '.unresolved_position_count=1' '.unresolved_reservation_count=1' '.open_order_count=1' '.position_inventory.complete=false' \
+  '.selection.available_winner_conditions=2' '.condition_id=("0x"+("b"*64))' '.target_revision=("0"*40)' \
+  '.started_ts="2026-01-01T00:00:00Z"' '.payout_base_units="6000000" | .selection.selected_gross_payout=6 | .selection.selected[0].gross_payout=6 | .selection.selected[0].onchain_expected_payout=6'; do
+  d=$root/approved-bad-$RANDOM; approved_recovery_fixture "$d"
+  if run_approved_recovery "$d" "FAKE_PREFLIGHT_MUTATION=$mutation"; then echo "unsafe approved preflight accepted: $mutation" >&2; exit 1; fi
+  test "$(cat "$d/state/phase")" = before; test "$(cat "$d/state/producer-active")" = 1; test ! -e "$d/ring/activation/receipt.json"
+done
+d=$root/approved-changed-after-stop; approved_recovery_fixture "$d"
+if run_approved_recovery "$d" FAKE_PREFLIGHT_MUTATION=.unresolved_reservation_count=1 FAKE_PREFLIGHT_MUTATE_AFTER_STOP=1; then exit 1; fi
+test "$(cat "$d/state/phase")" = before; test "$(cat "$d/state/producer-active")" = 0; test "$(cat "$d/state/signer-active")" = 1
+d=$root/approved-collector-changed; approved_recovery_fixture "$d"; printf '\n' >>"$d/bin/collector"
+if run_approved_recovery "$d"; then exit 1; fi
+test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
+for bad_env in FAKE_AUTOMATIC_REDEMPTION=0 FAKE_AUTOMATIC_PAYOUT=6 POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION=; do
+  d=$root/approved-incomplete-$RANDOM; approved_recovery_fixture "$d"
+  if run_approved_recovery "$d" "$bad_env"; then echo "incomplete redemption accepted: $bad_env" >&2; exit 1; fi
+  test ! -e "$d/ring/activation/receipt.json"
+  if [ "$bad_env" = POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION= ]; then test "$(cat "$d/state/phase")" = before
+  else test "$(cat "$d/state/producer-active")" = 0; test "$(cat "$d/state/signer-active")" = 0; grep -Fx "Image=$prior_signer_image" "$d/quadlet" >/dev/null; fi
+done
 printf 'funded guarded signer restart tests passed\n'

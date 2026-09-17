@@ -12,7 +12,14 @@ cat >"$tmp/bin/podman" <<'EOF'
 if [ "${FAKE_RECOVERY_TEST:-0}" = 1 ]; then
   case "$1" in
     run) /usr/bin/jq -e '.bundle==(.bundleBytesBase64|@base64d|fromjson) and .runtime.invocationId!=null and (.journal|length)>0' >/dev/null; cat "$FAKE_RECOVERY_PROOF"; exit;;
-    exec) case "${6:-}" in *tenant*) echo '{"tenant":"11111111-1111-1111-1111-111111111111","client":"22222222-2222-2222-2222-222222222222"}';; *) echo "${FAKE_UNRESOLVED:-0}";; esac; exit;;
+    exec)
+      if [ "$2" = -i ]; then
+        test "$3:$4:$5:$6:$7:$8:$9" = '--workdir:/app:polyedge-funded-signer:node:--input-type=module:-:--collect' || exit 1
+        test "${10}:${11}:${12}" = "$POLYEDGE_POST_REDEMPTION_APPROVED_AUTOMATIC_REDEMPTION_CONDITION:$POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_IMAGE:$POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_REVISION" || exit 1
+        cat >/dev/null
+        [ "${FAKE_PREFLIGHT_FAIL:-0}" = 0 ] || exit 1
+        jq "${FAKE_PREFLIGHT_MUTATION:-.}" "$FAKE_APPROVED_PREFLIGHT"
+      else case "${6:-}" in *tenant*) echo '{"tenant":"11111111-1111-1111-1111-111111111111","client":"22222222-2222-2222-2222-222222222222"}';; *) echo "${FAKE_UNRESOLVED:-0}";; esac; fi; exit;;
     image) if [[ "${4:-}" == *'{{.Os}}/{{.Architecture}}|'* ]]; then echo "linux/arm64|$POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_REVISION"; exit; fi;;
   esac
 fi
@@ -73,6 +80,28 @@ if run_recovery "$tmp/out-unresolved" FAKE_UNRESOLVED=1 >/dev/null 2>&1; then ec
 jq '.finished_ts="2026-01-01T00:00:00Z"' "$tmp/dry" >"$tmp/dry-stale"; mv "$tmp/dry-stale" "$tmp/dry"; chmod 640 "$tmp/dry"
 if run_recovery "$tmp/out-stale" >/dev/null 2>&1; then echo 'stale follow-up unexpectedly attested' >&2; exit 1; fi
 jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.finished_ts=$ts' "$tmp/dry" >"$tmp/dry-fresh"; mv "$tmp/dry-fresh" "$tmp/dry"; chmod 640 "$tmp/dry"
+approved_condition=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+jq -n --arg condition "$approved_condition" '{schema:"polyedge.approved_redemption_preflight.v1",status:"approved_redemption_ready",
+  read_only:true,redemption_submitted:false,condition_id:$condition,
+  target_image:("ghcr.io/aldoapicella/polyedge-venue-probe@sha256:"+("d"*64)),target_revision:("e"*40),
+  open_order_count:0,unresolved_position_count:0,unresolved_reservation_count:0,position_inventory:{complete:true,readbacks:2},
+  selection:{available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,selected:[{condition_id:$condition}]}}' >"$tmp/approved-preflight"
+run_approved(){ local output=$1; shift; run_recovery "$output" FAKE_APPROVED_PREFLIGHT="$tmp/approved-preflight" \
+  POLYEDGE_POST_REDEMPTION_DRY_RUN= POLYEDGE_POST_REDEMPTION_APPROVED_AUTOMATIC_REDEMPTION_CONDITION="$approved_condition" \
+  POLYEDGE_POST_REDEMPTION_REDEMPTION_PREFLIGHT_COLLECTOR="$root/ops/conduit/bin/polyedge-funded-redemption-preflight.mjs" "$@"; }
+run_approved "$tmp/out-approved" >/dev/null
+jq -e --arg condition "$approved_condition" '.evidence.followUpDryRun==null and
+  .evidence.approvedRedemptionPreflight.proof.condition_id==$condition and
+  (.evidence.approvedRedemptionPreflight.collector.sha256|test("^sha256:[0-9a-f]{64}$")) and .servicesMutated==false' \
+  "$tmp/out-approved/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json" >/dev/null
+jq -se '.[0].approvedRedemptionPreflight==.[1].evidence.approvedRedemptionPreflight' \
+  "$tmp/out-approved/recording-recovery-00000000000000000000000000000001.json" \
+  "$tmp/out-approved/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json" >/dev/null
+for bad_env in FAKE_PREFLIGHT_FAIL=1 FAKE_PREFLIGHT_MUTATION=.unresolved_position_count=1 FAKE_PREFLIGHT_MUTATION=.position_inventory.complete=false POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_INPUTS=; do
+  output=$tmp/out-approved-bad-$RANDOM
+  if run_approved "$output" "$bad_env" >/dev/null 2>&1; then echo "unsafe active approved preflight attested: $bad_env" >&2; exit 1; fi
+  test ! -e "$output/recording-recovery-00000000000000000000000000000001.json"
+done
 cat >>"$tmp/bin/journalctl" <<'EOF'
 alert='{"schema":"polyedge.funded_direct_alert.v1","status":"websocket_gap_or_reconciliation_required"}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$alert" '{__REALTIME_TIMESTAMP:($n|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'
 EOF
