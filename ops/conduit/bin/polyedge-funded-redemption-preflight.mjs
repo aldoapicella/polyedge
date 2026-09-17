@@ -123,7 +123,7 @@ async function main() {
     assert(response.ok, "authenticated order read failed");
     return validateClobRead(url.pathname, await response.json());
   };
-  const rpc = createPublicClient({ chain: polygon,
+  const rpc = createPublicClient({ chain: polygon, batch: { multicall: true },
     transport: http("https://polygon-bor-rpc.publicnode.com", { timeout: 15000, retryCount: 1 }) });
   assert.equal(await rpc.getChainId(), 137);
   const block = await rpc.getBlock();
