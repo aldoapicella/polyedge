@@ -191,5 +191,9 @@ async function main() {
 
 if ((process.argv[1] === "-" && process.argv[2] === "--collect") ||
     (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)) {
-  main().catch(error => { console.error(`approved redemption preflight failed: ${error.name}`); process.exitCode = 1; });
+  main().catch(error => {
+    const location = String(error.stack).match(/(?:\[eval1\]|file:\/\/\/app\/[^\s:]+):[0-9]+:[0-9]+/)?.[0] ?? "unavailable";
+    console.error(`approved redemption preflight failed: ${error.name} at ${location}`);
+    process.exitCode = 1;
+  });
 }
