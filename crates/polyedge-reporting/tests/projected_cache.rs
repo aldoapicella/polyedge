@@ -314,6 +314,7 @@ fn build_markets(input: &Path, out: &Path) -> Value {
 
 fn regimes(input: &Path, markets: &Path, out: &Path) -> Value {
     run_regimes(RegimesOptions {
+        wallet_config: None,
         input: input.to_path_buf(),
         markets: Some(markets.to_path_buf()),
         fill_model: FillModel::QueueProxyConservative,

@@ -44,7 +44,7 @@ import {
   loadDurableInternalSettlements,
   putVerifiedInternalSettlement
 } from "./compounding-risk.mjs";
-import { decodeSettlementReceiptEvidence } from "./canary.mjs";
+import { decodeSettlementReceiptEvidence, loadAccountPositions } from "./canary.mjs";
 import { tradeFillsFromRest } from "./canary-lifecycle-lib.mjs";
 import { sha256 } from "./canary-lib.mjs";
 
@@ -174,7 +174,7 @@ async function run() {
   if (openOrders.length) throw new Error(`fail closed: account has ${openOrders.length} open order(s)`);
 
   const [positions, balance, activity, initialRedemptionControl, unresolvedReservations] = await Promise.all([
-    fetchPositions(),
+    fetchRedemptionPositions(config),
     clob.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetchActivity(),
     readRedemptionControl(),
@@ -272,7 +272,7 @@ async function run() {
   const finalOrders = await clob.getOpenOrders(undefined, true);
   if (!Array.isArray(finalOrders) || finalOrders.length) throw new Error("fail closed: open-order state changed before redemption");
   const [finalPositions, finalReservations] = await Promise.all([
-    fetchPositions(),
+    fetchRedemptionPositions(config),
     config.dustRedemptionEnabled
       ? loadCampaignUnresolvedRiskReservationRecords(config)
       : []
@@ -799,7 +799,7 @@ async function waitForRecoveredSettlementState({
   while (Date.now() < deadline) {
     const [positions, balance, openOrders, onchainLiquid, tokenBalances, approvals] =
       await Promise.all([
-        fetchPositions(),
+        fetchRedemptionPositions(config),
         clob.getBalanceAllowance({
           asset_type: AssetType.COLLATERAL,
           signature_type: config.signatureType
@@ -1222,16 +1222,19 @@ async function checkOrigin(stage) {
   return result;
 }
 
-async function fetchPositions() {
-  const url = new URL("/positions", config.dataUrl);
-  url.searchParams.set("user", config.funderAddress);
-  url.searchParams.set("sizeThreshold", "0");
-  url.searchParams.set("limit", "100");
-  const response = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(20_000) });
-  if (!response.ok) throw new Error(`Data API positions returned HTTP ${response.status}`);
-  const positions = await response.json();
-  if (!Array.isArray(positions)) throw new Error("Data API positions response is not an array");
-  return positions;
+export async function fetchRedemptionPositions(config, { fetcher = fetch } = {}) {
+  return loadAccountPositions({
+    user: config.funderAddress,
+    dataUrl: config.dataUrl,
+    fetcher: async (url) => {
+      const response = await fetcher(url, {
+        headers: { accept: "application/json" },
+        signal: AbortSignal.timeout(20_000)
+      });
+      if (!response.ok) throw new Error(`Data API positions returned HTTP ${response.status}`);
+      return response.json();
+    }
+  });
 }
 
 async function fetchActivity() {
@@ -1342,7 +1345,7 @@ async function waitForSettlementVerification(clob, publicClient, selection, init
   const deadline = Date.now() + 120_000;
   while (Date.now() < deadline) {
     const [positions, balance, openOrders, onchainLiquid, tokenBalances, approvals] = await Promise.all([
-      fetchPositions(),
+      fetchRedemptionPositions(config),
       clob.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
       clob.getOpenOrders(undefined, true),
       readPusdBalance(publicClient),

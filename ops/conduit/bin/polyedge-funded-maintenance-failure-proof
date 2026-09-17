@@ -1,0 +1,98 @@
+#!/usr/bin/python3 -I
+"""Classify past maintenance failures from complete, runtime-bound journal records."""
+import datetime
+import hashlib
+import json
+import re
+import sys
+
+
+def prove(records, invocation, container, clean_since, now):
+    assert re.fullmatch(r"[0-9a-f]{32}", invocation) and re.fullmatch(r"[0-9a-f]{64}", container)
+    assert 0 < clean_since < now
+    # The native proof divides journal microseconds twice through JS Number.
+    # Recover its microsecond boundary before comparing inclusive timestamps.
+    clean_boundary = round(clean_since * 1e6) / 1e6
+    events, fragments, parts = [], [], []
+    previous = 0
+    for row in records:
+        assert row["_SYSTEMD_INVOCATION_ID"] == invocation and row["CONTAINER_ID_FULL"] == container
+        timestamp = int(row["__REALTIME_TIMESTAMP"]) / 1e6
+        assert previous <= timestamp <= now
+        previous = timestamp
+        message = row["MESSAGE"]
+        assert isinstance(message, str)
+        if not fragments and row.get("CONTAINER_PARTIAL_MESSAGE") != "true":
+            try:
+                event = json.loads(message)
+            except ValueError:
+                assert not message.startswith("{"), "malformed journal event"
+                event = {"unparsedJournalRecord": True}
+            parts = [row]
+        else:
+            fragments.append(message)
+            parts.append(row)
+            assert sum(len(part) for part in fragments) <= 1048576
+            assert timestamp - int(parts[0]["__REALTIME_TIMESTAMP"]) / 1e6 <= 1
+            if row.get("CONTAINER_PARTIAL_MESSAGE") == "true":
+                continue
+            event = json.loads("".join(fragments))
+        assert isinstance(event, dict)
+        source = json.dumps(parts, sort_keys=True, separators=(",", ":")).encode()
+        events.append({"event": event, "first": int(parts[0]["__REALTIME_TIMESTAMP"]) / 1e6,
+                       "last": timestamp, "sourceSha256": hashlib.sha256(source).hexdigest()})
+        fragments, parts = [], []
+    assert not fragments, "unterminated journal fragment"
+    failures = []
+    used = set()
+    for index, item in enumerate(events):
+        event = item["event"]
+        if event.get("schema") == "polyedge.funded_direct_alert.v1":
+            assert item["last"] <= clean_boundary, "new alert after clean evidence"
+        if event.get("status") != "automatic_redemption_failed_closed":
+            continue
+        assert event.get("schema") == "polyedge.funded_direct_alert.v1"
+        assert event.get("error") == "fail closed: websocket reconnect reconciliation did not prove a coherent account"
+        assert index > 0
+        summary = events[index - 1]
+        wrapper = summary["event"]
+        assert wrapper.get("schema") == "polyedge.funded_redemption_service.v1" and wrapper.get("status") == "redemption_worker_summary"
+        result = wrapper["redemption"]
+        assert type(result.get("schema_version")) is int and result["schema_version"] == 1 and result.get("status") == "nothing_to_redeem"
+        assert result.get("dry_run") is False and result.get("redemption_enabled") is True
+        assert result.get("research_only") is False and result.get("live_strategy_enabled") is True
+        assert result.get("redemption_submitted") is False and result.get("zero_open_orders_confirmed") is True
+        assert result["selection"]["selected"] == []
+        assert type(result["selection"]["selected_gross_payout"]) in (int, float) and result["selection"]["selected_gross_payout"] == 0
+        assert result.get("planned_calls") == []
+        assert not any(result.get(key) for key in ("transaction_id", "transaction_hash", "internal_settlement_blobs"))
+        run = result["run_id"]
+        assert re.fullmatch(r"venue-redemption-[0-9]{17}-[0-9a-f]{8}", run) and run not in used
+        used.add(run)
+        finished = datetime.datetime.fromisoformat(result["finished_ts"].replace("Z", "+00:00")).timestamp()
+        assert finished <= summary["first"] <= summary["last"] < item["first"] <= clean_boundary
+        assert item["last"] - finished <= 30
+        failures.append({"runId": run, "finishedAtUtc": result["finished_ts"],
+                         "summaryFirstEpoch": summary["first"], "summaryLastEpoch": summary["last"],
+                         "summaryJournalSha256": summary["sourceSha256"], "alertEpoch": item["last"],
+                         "alertJournalSha256": item["sourceSha256"]})
+    heartbeats = [item for item in events if item["event"].get("schema") == "polyedge.funded_direct_service.v2"
+                  and item["event"].get("status") == "persistent_service_heartbeat"]
+    assert heartbeats and now - 75 <= heartbeats[-1]["last"] <= now
+    count = heartbeats[-1]["event"].get("redemption_failures")
+    assert type(count) is int and count == len(failures)
+    return {"schema": "polyedge.funded_maintenance_failure_proof.v1", "readOnly": True,
+            "classification": "nothing_to_redeem_then_reconnect_rejection", "invocationId": invocation,
+            "containerId": container, "cleanSinceEpoch": clean_since, "failureCount": len(failures), "pairs": failures}
+
+
+if __name__ == "__main__":
+    try:
+        assert len(sys.argv) == 4
+        raw = sys.stdin.read(64 * 1024 * 1024 + 1)
+        assert len(raw) <= 64 * 1024 * 1024
+        result = prove([json.loads(line) for line in raw.splitlines()], sys.argv[1], sys.argv[2],
+                       float(sys.argv[3]), datetime.datetime.now(datetime.timezone.utc).timestamp())
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    except Exception as error:
+        raise SystemExit(f"maintenance failure proof rejected: {type(error).__name__}") from None

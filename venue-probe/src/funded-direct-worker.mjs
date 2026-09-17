@@ -366,7 +366,7 @@ async function executeSelectedIntent({
   childInvocations += 1;
   if (child.exitCode !== 0) {
     if (child.orderSubmissionAttempted === true) {
-      const terminalReservation = await loadTerminalNoFillReservation(
+      const terminalReservation = await loadTerminalNoExposureReservation(
         clients.control,
         selected,
         authorization,
@@ -376,11 +376,12 @@ async function executeSelectedIntent({
         await writeCompletion(clients.control, config, selected, authorization, childRunId, clock(), {
           status: "child_completed",
           order_submission_attempted: true,
+          order_submitted: terminalReservation.order_submitted,
           authorization_consumed: true,
           risk_reservation_created: true,
           evidence_upload_status: "degraded_post_submission",
           terminal_risk_state: terminalReservation.state,
-          order_id: terminalReservation.order_id,
+          order_id: terminalReservation.order_id || null,
           matched_notional: 0,
           reconciliation_complete: true,
           zero_open_orders_confirmed: true,
@@ -392,11 +393,12 @@ async function executeSelectedIntent({
           childInvocations,
           result: null,
           execution: {
-            status: "terminal_no_fill_evidence_degraded",
+            status: terminalReservation.order_submitted
+              ? "terminal_no_fill_evidence_degraded" : "terminal_no_order_evidence_degraded",
             order_submission_attempted: true,
-            order_submitted: true,
+            order_submitted: terminalReservation.order_submitted,
             lifecycle: {
-              order_id: terminalReservation.order_id,
+              order_id: terminalReservation.order_id || null,
               send_wall_ms: null,
               matched_notional: 0,
               reconciliation_complete: true,
@@ -630,7 +632,7 @@ async function selectedFromHandoff(
       blobName,
       hash: actualHash
     });
-    const terminalReservation = await loadTerminalNoFillReservation(
+    const terminalReservation = await loadTerminalNoExposureReservation(
       clients.control,
       { value, blobName, hash: actualHash },
       authorization,
@@ -647,11 +649,12 @@ async function selectedFromHandoff(
         {
           status: "child_completed",
           order_submission_attempted: true,
+          order_submitted: terminalReservation.order_submitted,
           authorization_consumed: true,
           risk_reservation_created: true,
           evidence_upload_status: "degraded_post_submission",
           terminal_risk_state: terminalReservation.state,
-          order_id: terminalReservation.order_id,
+          order_id: terminalReservation.order_id || null,
           matched_notional: 0,
           reconciliation_complete: true,
           zero_open_orders_confirmed: true,
@@ -1161,7 +1164,7 @@ async function writeBusyCompletion(container, config, selected, now) {
   });
 }
 
-function assertExistingAuthorizationBinding(authorization, config, session, selected) {
+export function assertExistingAuthorizationBinding(authorization, config, session, selected) {
   const value = authorization?.value;
   if (authorization?.blobName !== authorizationBlobName(config, session, selected.value) ||
       value?.schema !== AUTHORIZATION_SCHEMA ||
@@ -1178,7 +1181,7 @@ function assertExistingAuthorizationBinding(authorization, config, session, sele
   }
 }
 
-async function loadTerminalNoFillReservation(container, selected, authorization, now) {
+export async function loadTerminalNoExposureReservation(container, selected, authorization, now) {
   const decisionId = selected.value.decision_id;
   const probeId = `funded-direct-${decisionId}`;
   const dates = [...new Set([
@@ -1190,6 +1193,19 @@ async function loadTerminalNoFillReservation(container, selected, authorization,
     if (!await container.getBlobClient(blobName).exists()) continue;
     const reservation = await readJsonBlob(container, blobName);
     const updatedMs = Date.parse(reservation?.updated_ts);
+    const evidence = reservation?.reconciliation_evidence;
+    const acknowledgedNoFill = reservation?.order_submitted === true &&
+      reservation?.state === "finalized_no_fill" &&
+      /^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || ""));
+    const deterministicNoOrder = reservation?.evidence_protocol_version === 3 &&
+      reservation?.order_submitted === false && reservation?.order_id === null &&
+      reservation?.matched_notional === 0 &&
+      reservation?.state === "released_no_order" &&
+      ["invalid_gtd_expiration", "post_only_crosses_book", "trading_disabled"]
+        .includes(reservation?.reconciliation_reason) &&
+      evidence?.source === "authenticated_clob_and_user_channel" &&
+      evidence?.zero_open_orders === true && evidence?.zero_unresolved_positions === true &&
+      evidence?.post_send_authenticated_trade_count === 0;
     if (reservation?.schema_version === 1 &&
         reservation?.probe_id === probeId &&
         reservation?.run_id === authorization.value.child_run_id &&
@@ -1197,9 +1213,7 @@ async function loadTerminalNoFillReservation(container, selected, authorization,
         reservation?.condition_id === selected.value.condition_id &&
         reservation?.token_id === selected.value.token_id &&
         reservation?.order_submission_intended === true &&
-        reservation?.order_submitted === true &&
-        reservation?.state === "finalized_no_fill" &&
-        /^0x[0-9a-f]{64}$/i.test(String(reservation?.order_id || "")) &&
+        (acknowledgedNoFill || deterministicNoOrder) &&
         Number(reservation?.matched_notional) === 0 &&
         reservation?.reconciliation_complete === true &&
         reservation?.zero_open_orders_confirmed === true &&
@@ -1216,7 +1230,7 @@ async function readJsonBlob(container, blobName) {
   return (await readJsonBlobDocument(container, blobName)).value;
 }
 
-async function authorizationWasConsumed(container, authorization, selected) {
+export async function authorizationWasConsumed(container, authorization, selected) {
   const authorizationId = clean(authorization.value?.authorization_id);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(authorizationId)) return false;
   const blobName = `reports/research/venue-probe/control/strategy-canary/consumed/${authorizationId}.json`;

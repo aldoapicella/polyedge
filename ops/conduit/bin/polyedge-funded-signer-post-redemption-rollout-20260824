@@ -12,14 +12,33 @@ readonly liquid_after=${POLYEDGE_POST_REDEMPTION_LIQUID_AFTER:-29.928437}
 readonly payout=${POLYEDGE_POST_REDEMPTION_PAYOUT:-0.02}
 readonly min_disk=16106127360
 test "$#" -eq 0
-: "$POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY" "$POLYEDGE_POST_REDEMPTION_DRY_RUN" "$POLYEDGE_POST_REDEMPTION_SETTLEMENT" "$POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR"
-live=$POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY; dry=$POLYEDGE_POST_REDEMPTION_DRY_RUN; settlement=$POLYEDGE_POST_REDEMPTION_SETTLEMENT; out=$POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR
+: "$POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY" "$POLYEDGE_POST_REDEMPTION_SETTLEMENT" "$POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR"
+live=$POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY; dry=${POLYEDGE_POST_REDEMPTION_DRY_RUN:-}; settlement=$POLYEDGE_POST_REDEMPTION_SETTLEMENT; out=$POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR
+recovery_inputs=${POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_INPUTS:-}
+recovery_image=${POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_IMAGE:-}
+recovery_revision=${POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_REVISION:-}
+recovery_proof=null
+approved_condition=${POLYEDGE_POST_REDEMPTION_APPROVED_AUTOMATIC_REDEMPTION_CONDITION:-}
+collector=${POLYEDGE_POST_REDEMPTION_REDEMPTION_PREFLIGHT_COLLECTOR:-/usr/local/libexec/polyedge-funded-redemption-preflight.mjs}
+maintenance_helper=${POLYEDGE_POST_REDEMPTION_MAINTENANCE_PROOF_HELPER:-/usr/local/libexec/polyedge-funded-maintenance-failure-proof}
+maintenance_baseline=null; maintenance_count=0; maintenance_sha=
+approved_preflight=null; collector_sha=; dry_sha=
+queue_backend=${POLYEDGE_POST_REDEMPTION_QUEUE_BACKEND:-azure}
+queue_helper=${POLYEDGE_POST_REDEMPTION_QUEUE_SNAPSHOT_HELPER:-/usr/local/libexec/polyedge-funded-oci-queue-snapshot}
+case "$queue_backend" in azure|oci) :;; *) exit 1;; esac
+if [ -n "$approved_condition" ]; then
+  test -n "$recovery_inputs"
+  printf '%s\n' "$approved_condition" | /usr/bin/grep -Eq '^0x[0-9a-f]{64}$'
+  dry=
+else
+  test -n "$dry"
+fi
 systemctl=/usr/bin/systemctl; podman=/usr/bin/podman; journalctl=/usr/bin/journalctl; runuser=/usr/sbin/runuser; az=/usr/bin/az; guard=/usr/local/libexec/polyedge-boot-disk-guard; uid=0; gid=0; lock=/run/polyedge/utility.lock
 if [ "${POLYEDGE_TEST_ALLOW_UNPRIVILEGED:-0}" = 1 ]; then systemctl=$POLYEDGE_TEST_SYSTEMCTL; podman=$POLYEDGE_TEST_PODMAN; journalctl=$POLYEDGE_TEST_JOURNALCTL; runuser=$POLYEDGE_TEST_RUNUSER; az=$POLYEDGE_TEST_AZ; guard=$POLYEDGE_TEST_DISK_GUARD; uid=$POLYEDGE_TEST_UID; gid=$POLYEDGE_TEST_GID; lock=$POLYEDGE_TEST_LOCK_FILE; else test "$(/usr/bin/id -u)" -eq 0; fi
 sha(){ /usr/bin/sha256sum "$1"|/usr/bin/cut -d" " -f1; }
-secure(){ local u g m l s; test ! -L "$1" -a -f "$1"; read -r u g m l s < <(/usr/bin/stat -c "%u %g %a %h %s" "$1"); test "$u:$g:$m:$l" = "$uid:$gid:$2:1" -a "$s" -gt 0 -a "$s" -le 65536; }
-queue(){ "$runuser" -u ubuntu -- "$az" servicebus queue show --subscription 73783c0c-5a53-4f9b-b244-6f64e813814c --resource-group rg-polyedge-dev --namespace-name sb-polyedge-funded-cl-6urdjr5nmwx7w --name funded-dynamic-quote-intents --only-show-errors -o json|/usr/bin/jq -ce 'if .status=="Active" and .countDetails.activeMessageCount==0 and .countDetails.scheduledMessageCount==0 and (.countDetails.deadLetterMessageCount|type=="number" and .>=0) then {status:.status,activeMessageCount:.countDetails.activeMessageCount,scheduledMessageCount:.countDetails.scheduledMessageCount,deadLetterMessageCount:.countDetails.deadLetterMessageCount} else error("queue is not a current zero-active DLQ snapshot") end'; }
-heartbeat(){ local i c n after; i=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value); c=$("$podman" inspect --format "{{.Id}}" polyedge-funded-signer); n=$(/usr/bin/date -u +%s); after=$(/usr/bin/date -u -d "$health_after" +%s); "$journalctl" -u polyedge-funded-signer.service -n 500 -o json --no-pager|/usr/bin/jq -Rse --arg i "$i" --arg c "$c" --argjson n "$n" --argjson after "$after" '[split("\n")[]|fromjson?|select(type=="object")|. as $r|($r.MESSAGE|fromjson?) as $e|select($e|type=="object")|{t:(($r.__REALTIME_TIMESTAMP|tonumber)/1000000),i:($r._SYSTEMD_INVOCATION_ID//""),c:($r.CONTAINER_ID_FULL//""),e:$e}] as $x|[$x[]|select(.i==$i and .c==$c and .t>=$after and .e.schema=="polyedge.funded_direct_service.v2" and .e.status=="persistent_service_heartbeat")]|sort_by(.t)|last as $h|([$x[]|select(.i==$i and .c==$c and .e.schema=="polyedge.funded_direct_service.v2" and .e.status=="persistent_service_started" and .e.automatic_redemption_enabled==true)]|length)==1 and ([$x[]|select(.i==$i and .c==$c and .t>=$after and (.e.schema=="polyedge.funded_direct_alert.v1" or (.e.schema=="polyedge.funded_direct_service.v1" and .e.status=="failed_closed") or (.e.schema=="polyedge.funded_direct_service.v2" and .e.status=="persistent_message_failed_closed")))]|length)==0 and $h!=null and $h.t<=$n and $h.t>=($n-75) and ($h.e.processed_messages|type=="number" and .>0) and $h.e.failed_messages==0 and $h.e.failed_attempts==0 and $h.e.redemption_failures==0 and $h.e.executor.busy==false and $h.e.executor.user_channel_ready==true and $h.e.executor.market_channel_ready==true and $h.e.executor.user_channel_gaps==0 and $h.e.executor.market_channel_gaps==0 and $h.e.executor.user_channel_unparsed==0 and $h.e.executor.market_channel_unparsed==0 and $h.e.executor.reconnect_reconciliation_required==false and $h.e.executor.safety_snapshot_cache_ready==true and ($h.e.executor.safety_snapshot_cache_age_ms|type=="number" and .>=0 and .<=650) and $h.e.executor.safety_snapshot_open_order_count==0 and $h.e.executor.safety_snapshot_unresolved_position_count==0 and $h.e.executor.safety_snapshot_unresolved_risk_reservation_count==0 and $h.e.executor.safety_snapshot_cache_error==null and $h.e.executor.risk_reservation_index_ready==true|select(.)|{capturedAtEpoch:$h.t,healthBaselineAtEpoch:$after,automaticRedemptionEnabled:true,processedMessages:$h.e.processed_messages,failedMessages:$h.e.failed_messages,failedAttempts:$h.e.failed_attempts,redemptionFailures:$h.e.redemption_failures,executor:$h.e.executor}'; }
+secure(){ local u g m l s; test ! -L "$1" -a -f "$1"; read -r u g m l s < <(/usr/bin/stat -c "%u %g %a %h %s" "$1"); test "$u:$g:$m:$l" = "$uid:$gid:$2:1" -a "$s" -gt 0 -a "$s" -le "${3:-65536}"; }
+queue(){ if [ "$queue_backend" = oci ]; then secure "$queue_helper" 755 || return 1; "$queue_helper"; return; fi; "$runuser" -u ubuntu -- "$az" servicebus queue show --subscription 73783c0c-5a53-4f9b-b244-6f64e813814c --resource-group rg-polyedge-dev --namespace-name sb-polyedge-funded-cl-6urdjr5nmwx7w --name funded-dynamic-quote-intents --only-show-errors -o json|/usr/bin/jq -ce 'if .status=="Active" and .countDetails.activeMessageCount==0 and .countDetails.scheduledMessageCount==0 and (.countDetails.deadLetterMessageCount|type=="number" and .>=0) then {status:.status,activeMessageCount:.countDetails.activeMessageCount,scheduledMessageCount:.countDetails.scheduledMessageCount,deadLetterMessageCount:.countDetails.deadLetterMessageCount} else error("queue is not a current zero-active DLQ snapshot") end'; }
+heartbeat(){ local i c n after; i=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value); c=$("$podman" inspect --format "{{.Id}}" polyedge-funded-signer); n=$(/usr/bin/date -u +%s); after=$(/usr/bin/date -u -d "$health_after" +%s); "$journalctl" -u polyedge-funded-signer.service "_SYSTEMD_INVOCATION_ID=$i" "CONTAINER_ID_FULL=$c" -o json --all --no-pager|/usr/bin/jq -Rse --arg i "$i" --arg c "$c" --argjson n "$n" --argjson after "$after" --argjson maintenance_count "$maintenance_count" '[split("\n")[]|fromjson?|select(type=="object")|. as $r|($r.MESSAGE|fromjson?) as $e|select($e|type=="object")|{t:(($r.__REALTIME_TIMESTAMP|tonumber)/1000000),i:($r._SYSTEMD_INVOCATION_ID//""),c:($r.CONTAINER_ID_FULL//""),e:$e}] as $x|[$x[]|select(.i==$i and .c==$c and .t>=$after and .e.schema=="polyedge.funded_direct_service.v2" and .e.status=="persistent_service_heartbeat")]|sort_by(.t)|last as $h|([$x[]|select(.i==$i and .c==$c and .e.schema=="polyedge.funded_direct_service.v2" and .e.status=="persistent_service_started" and .e.automatic_redemption_enabled==true)]|length)==1 and ([$x[]|select(.i==$i and .c==$c and .t>=$after and (.e.schema=="polyedge.funded_direct_alert.v1" or (.e.schema=="polyedge.funded_direct_service.v1" and .e.status=="failed_closed") or (.e.schema=="polyedge.funded_direct_service.v2" and .e.status=="persistent_message_failed_closed")))]|length)==0 and $h!=null and $h.t<=$n and $h.t>=($n-75) and ($h.e.processed_messages|type=="number" and .>0) and $h.e.failed_messages==0 and $h.e.failed_attempts==0 and $h.e.redemption_failures==$maintenance_count and $h.e.executor.busy==false and $h.e.executor.user_channel_ready==true and $h.e.executor.market_channel_ready==true and $h.e.executor.user_channel_gaps==0 and $h.e.executor.market_channel_gaps==0 and $h.e.executor.user_channel_unparsed==0 and $h.e.executor.market_channel_unparsed==0 and $h.e.executor.reconnect_reconciliation_required==false and $h.e.executor.safety_snapshot_cache_ready==true and ($h.e.executor.safety_snapshot_cache_age_ms|type=="number" and .>=0 and .<=650) and $h.e.executor.safety_snapshot_open_order_count==0 and $h.e.executor.safety_snapshot_unresolved_position_count==0 and $h.e.executor.safety_snapshot_unresolved_risk_reservation_count==0 and $h.e.executor.safety_snapshot_cache_error==null and $h.e.executor.risk_reservation_index_ready==true|select(.)|{capturedAtEpoch:$h.t,healthBaselineAtEpoch:$after,automaticRedemptionEnabled:true,processedMessages:$h.e.processed_messages,failedMessages:$h.e.failed_messages,failedAttempts:$h.e.failed_attempts,redemptionFailures:$h.e.redemption_failures,executor:$h.e.executor}'; }
 printf '%s\n' "$run" | /usr/bin/grep -Eq '^venue-redemption-[0-9]{17}-[0-9a-f]{8}$'
 printf '%s\n' "$tx" | /usr/bin/grep -Eq '^0x[0-9a-f]{64}$'
 printf '%s\n' "$condition" | /usr/bin/grep -Eq '^0x[0-9a-f]{64}$'
@@ -27,16 +46,101 @@ fresh_after_epoch=$(/usr/bin/date -u -d "$fresh_after" +%s); health_after_epoch=
 test "$(/usr/bin/date -u -d "@$fresh_after_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$fresh_after"
 test "$(/usr/bin/date -u -d "@$health_after_epoch" +%Y-%m-%dT%H:%M:%SZ)" = "$health_after"
 test "$health_after_epoch" -ge "$fresh_after_epoch" -a "$health_after_epoch" -lt "$(/usr/bin/date -u +%s)"
-secure "$0" 755; secure "$live" 640; secure "$dry" 640; secure "$settlement" 640
+secure "$0" 755; secure "$live" 640; secure "$settlement" 640
+if [ -n "$dry" ]; then secure "$dry" 640; dry_sha="sha256:$(sha "$dry")"; fi
 case "$live:$dry:$settlement" in *"/funded-recovery/"*) exit 1;; esac
 /usr/bin/jq -e --arg run "$run" --arg tx "$tx" --arg condition "$condition" --arg blob "$settlement_blob" --arg after "$fresh_after" --argjson before "$liquid_before" --argjson after_liquid "$liquid_after" --argjson payout "$payout" '.schema_version==1 and .status=="redeemed_and_verified" and .dry_run==false and .run_id==$run and (.transaction_hash|ascii_downcase)==$tx and .redemption_submitted==true and .finished_ts>=$after and .liquid_collateral_before==$before and .liquid_collateral_after==$after_liquid and .realized_payout==$payout and .zero_open_orders_confirmed==true and .internal_settlement_blobs==[$blob] and (.selection.selected|map(.condition_id))==[$condition] and .selection.selected_gross_payout==$payout' "$live">/dev/null
-/usr/bin/jq -e --arg after "$fresh_after" '.schema_version==1 and .status=="nothing_to_redeem" and (.dry_run==true or (.dry_run==false and .redemption_enabled==true)) and .finished_ts>=$after and .zero_open_orders_confirmed==true and .portfolio.redeemable_winner_count==0 and .selection.selected_gross_payout==0 and (.selection.selected|type=="array" and length==0) and .redemption_submitted==false' "$dry">/dev/null
+if [ -n "$dry" ]; then
+  /usr/bin/jq -e --arg after "$fresh_after" '.schema_version==1 and .status=="nothing_to_redeem" and (.dry_run==true or (.dry_run==false and .redemption_enabled==true)) and .finished_ts>=$after and .zero_open_orders_confirmed==true and .portfolio.redeemable_winner_count==0 and .selection.selected_gross_payout==0 and (.selection.selected|type=="array" and length==0) and .redemption_submitted==false' "$dry">/dev/null
+fi
 /usr/bin/jq -e --arg tx "$tx" --arg condition "$condition" --argjson payout "$payout" '.schema=="polyedge.verified_internal_settlement.v1" and (.transaction_hash|ascii_downcase)==$tx and .condition_id==$condition and .payout==$payout and (.receipt_confirmations|tonumber)>=2' "$settlement">/dev/null
 exec 9>"$lock"; /usr/bin/flock -n 9
 "$guard" --assert-headroom; ! "$systemctl" is-active --quiet polyedge-parity-hourly.timer; "$systemctl" is-active --quiet polyedge-funded-signer.service; "$systemctl" is-active --quiet polyedge-funded-intent-producer.service; test "$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value)" = 0
 signer_invocation=$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value); signer_restarts=$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value); signer_container=$("$podman" inspect --format "{{.Id}}" polyedge-funded-signer); image=$("$podman" inspect --format "{{.Config.Image}}" polyedge-funded-signer); signer_user=$("$podman" inspect --format "{{.Config.User}}" polyedge-funded-signer); printf "%s" "$image"|/usr/bin/grep -Eq "^ghcr\.io/aldoapicella/polyedge-venue-probe@sha256:[0-9a-f]{64}$"; test "$signer_user" = "986:982"; revision=$("$podman" image inspect --format "{{ index .Labels \"org.opencontainers.image.revision\" }}" "$image"); printf "%s" "$revision"|/usr/bin/grep -Eq "^[0-9a-f]{40}$"; test "$("$podman" image inspect --format "{{.Os}}/{{.Architecture}}" "$image")" = linux/arm64
 producer_invocation=$("$systemctl" show polyedge-funded-intent-producer.service -p InvocationID --value); producer_restarts=$("$systemctl" show polyedge-funded-intent-producer.service -p NRestarts --value); test "$producer_restarts" = 0; producer_container=$("$podman" inspect --format "{{.Id}}" polyedge-funded-intent-producer); producer_image=$("$podman" inspect --format "{{.Config.Image}}" polyedge-funded-intent-producer); producer_user=$("$podman" inspect --format "{{.Config.User}}" polyedge-funded-intent-producer); printf "%s" "$producer_image"|/usr/bin/grep -Eq "^ghcr\.io/aldoapicella/polyedge-rust-backend@sha256:[0-9a-f]{64}$"; test "$producer_user" = "984:980"; producer_revision=$("$podman" image inspect --format "{{ index .Labels \"org.opencontainers.image.revision\" }}" "$producer_image"); printf "%s" "$producer_revision"|/usr/bin/grep -Eq "^[0-9a-f]{40}$"; test "$("$podman" image inspect --format "{{.Os}}/{{.Architecture}}" "$producer_image")" = linux/arm64; test "$("$podman" inspect --format "{{.State.Status}}|{{.State.Health.Status}}" polyedge-funded-intent-producer)" = "running|healthy"
-before=$(queue); hb=$(heartbeat); after=$(queue); test "$(/usr/bin/jq -r .deadLetterMessageCount<<<"$after")" -le "$(/usr/bin/jq -r .deadLetterMessageCount<<<"$before")"; free=$(/usr/bin/df -P -B1 /|/usr/bin/awk "NR==2{print \$4}"); test "$free" -ge "$min_disk"
+if [ -n "$recovery_inputs" ]; then
+  secure "$recovery_inputs" 640 131072
+  if [ -n "$dry" ]; then
+    jq -e --argjson now "$(date -u +%s)" --argjson after "$health_after_epoch" '.finished_ts | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | . <= $now and . >= ($now - 1800) and . >= $after' "$dry" >/dev/null
+  fi
+  printf '%s\n' "$recovery_image" | /usr/bin/grep -Eq '^ghcr\.io/aldoapicella/polyedge-venue-probe@sha256:[0-9a-f]{64}$'
+  printf '%s\n' "$recovery_revision" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
+  test "$recovery_image" != "$image"
+  test "$("$podman" image inspect --format '{{.Os}}/{{.Architecture}}|{{ index .Labels "org.opencontainers.image.revision" }}' "$recovery_image")" = "linux/arm64|$recovery_revision"
+  token_file=/run/polyedge-federated-funded-signer/azure-federated-token
+  if [ "${POLYEDGE_TEST_ALLOW_UNPRIVILEGED:-0}" = 1 ]; then token_file=$POLYEDGE_TEST_TOKEN_FILE; fi
+  test ! -L "$token_file" -a -f "$token_file"
+  test "$(stat -c '%u:%g:%a:%h' "$token_file")" = "$signer_user:600:1"
+  token_age=$(( $(date -u +%s) - $(stat -c %Y "$token_file") ))
+  test "$token_age" -ge 0 -a "$token_age" -le 240
+  identity_json=$("$podman" exec polyedge-funded-signer node --input-type=module -e 'console.log(JSON.stringify({tenant:process.env.AZURE_TENANT_ID,client:process.env.AZURE_CLIENT_ID}))')
+  tenant=$(jq -er '.tenant | select(test("^[0-9a-f-]{36}$"))' <<<"$identity_json")
+  client=$(jq -er '.client | select(test("^[0-9a-f-]{36}$"))' <<<"$identity_json")
+  proof_journal=$(mktemp); proof_input=$(mktemp)
+  trap 'rm -f "$proof_journal" "$proof_input"' EXIT
+  journal_captured_epoch=$(date -u +%s)
+  test "$health_after_epoch" -le "$journal_captured_epoch"
+  "$journalctl" -u polyedge-funded-signer.service "_SYSTEMD_INVOCATION_ID=$signer_invocation" "CONTAINER_ID_FULL=$signer_container" -o json --all --no-pager >"$proof_journal"
+  jq -n --rawfile bundle "$recovery_inputs" --rawfile journal "$proof_journal" \
+    --arg image "$image" --arg revision "$revision" --arg invocation "$signer_invocation" --arg container "$signer_container" \
+    '{bundle:($bundle|fromjson),bundleBytesBase64:($bundle|@base64),journal:$journal,runtime:{image:$image,revision:$revision,invocationId:$invocation,containerId:$container}}' >"$proof_input"
+  # This image has only a federated storage identity; no wallet/signing secrets.
+  # Match the signer Quadlet: Podman 4.9 no-new-privileges breaks UDP/DNS here.
+  recovery_proof=$("$podman" run --rm -i --pull=never --read-only --network bridge --user "$signer_user" \
+    --cap-drop ALL \
+    --volume "$token_file:/run/proof-token:ro" \
+    --env "AZURE_TENANT_ID=$tenant" --env "AZURE_CLIENT_ID=$client" \
+    --env AZURE_FEDERATED_TOKEN_FILE=/run/proof-token --env AZURE_STORAGE_ACCOUNT_NAME=stpolyedge6urdjr5nmwx7w \
+    "$recovery_image" node src/funded-terminal-no-order-proof.mjs --stdin <"$proof_input")
+  jq -e --argjson health_after "$health_after_epoch" --arg bundle_sha "sha256:$(sha "$recovery_inputs")" --arg live_sha "sha256:$(sha "$live")" --arg settlement_sha "sha256:$(sha "$settlement")" \
+    '.status=="verified_terminal_no_order" and .authenticatedSourcesVerified==true and .readOnly==true and
+     .sourceBundleSha256==$bundle_sha and .cleanSinceEpoch < $health_after and .redemption.summarySha256==$live_sha and .redemption.settlementSha256==$settlement_sha' <<<"$recovery_proof" >/dev/null
+  test "$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)" = "$signer_invocation"
+  test "$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)" = "$signer_container"
+  test "$("$podman" exec polyedge-funded-signer node --input-type=module -e 'import {loadCampaignUnresolvedRiskReservationRecords} from "./src/lib.mjs";const records=await loadCampaignUnresolvedRiskReservationRecords({campaignId:process.env.VENUE_PROBE_FUNDED_CAMPAIGN_ID,operatorDirect:true,dryRun:false,storageAccount:process.env.AZURE_STORAGE_ACCOUNT_NAME,storageContainer:process.env.AZURE_STORAGE_CONTAINER_NAME,azureClientId:process.env.AZURE_CLIENT_ID});console.log(records.length);')" = 0
+  rm -f "$proof_journal" "$proof_input"; trap - EXIT
+fi
+if [ -n "$approved_condition" ]; then
+  secure "$collector" 755
+  collector_sha="sha256:$(sha "$collector")"
+  approved_preflight=$("$podman" exec -i --workdir /app polyedge-funded-signer node --input-type=module - --collect \
+    "$approved_condition" "$recovery_image" "$recovery_revision" <"$collector")
+  test "sha256:$(sha "$collector")" = "$collector_sha"
+  jq -e --arg condition "$approved_condition" --arg image "$recovery_image" --arg revision "$recovery_revision" \
+    '.schema=="polyedge.approved_redemption_preflight.v1" and .status=="approved_redemption_ready" and
+     .read_only==true and .redemption_submitted==false and .condition_id==$condition and
+     .target_image==$image and .target_revision==$revision and .open_order_count==0 and
+     .unresolved_position_count==0 and .unresolved_reservation_count==0 and
+     .position_inventory.complete==true and .position_inventory.readbacks==2 and
+     .selection.available_winner_conditions==1 and .selection.skipped_winner_conditions==0 and
+     (.selection.selected|map(.condition_id))==[$condition] and .selection.selected_gross_payout>0' <<<"$approved_preflight" >/dev/null
+fi
+if [ -n "$approved_condition" ]; then
+  secure "$maintenance_helper" 755
+  maintenance_sha="sha256:$(sha "$maintenance_helper")"
+  maintenance_baseline=$("$journalctl" -u polyedge-funded-signer.service "_SYSTEMD_INVOCATION_ID=$signer_invocation" "CONTAINER_ID_FULL=$signer_container" -o json --all --no-pager |
+    "$maintenance_helper" "$signer_invocation" "$signer_container" "$(jq -er '.cleanSinceEpoch' <<<"$recovery_proof")")
+  maintenance_count=$(jq -er '.failureCount' <<<"$maintenance_baseline")
+fi
+before=$(queue); hb=$(heartbeat); after=$(queue); if [ "$queue_backend" = oci ]; then test "$before" = "$after"; fi; test "$(/usr/bin/jq -r '.deadLetterMessageCount // .archiveDlq.objectCount'<<<"$after")" -le "$(/usr/bin/jq -r '.deadLetterMessageCount // .archiveDlq.objectCount'<<<"$before")"; free=$(/usr/bin/df -P -B1 /|/usr/bin/awk "NR==2{print \$4}"); test "$free" -ge "$min_disk"
+test "$("$systemctl" show polyedge-funded-signer.service -p InvocationID --value)|$("$podman" inspect --format '{{.Id}}' polyedge-funded-signer)|$("$systemctl" show polyedge-funded-signer.service -p NRestarts --value)" = "$signer_invocation|$signer_container|0"
+test "$("$systemctl" show polyedge-funded-intent-producer.service -p InvocationID --value)|$("$podman" inspect --format '{{.Id}}' polyedge-funded-intent-producer)|$("$systemctl" show polyedge-funded-intent-producer.service -p NRestarts --value)" = "$producer_invocation|$producer_container|0"
 receipt="$out/post-redemption-$run-attestation.json"; test ! -e "$receipt"; /usr/bin/install -d -o "$uid" -g "$gid" -m 0750 "$out"; tmp=$(/usr/bin/mktemp "$out/.attestation.XXXXXX")
-/usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg helper "sha256:$(sha "$0")" --argjson dlq "$(/usr/bin/jq -r .deadLetterMessageCount<<<"$after")" --arg image "$image" --arg revision "$revision" --arg signer_user "$signer_user" --arg signer_invocation "$signer_invocation" --arg signer_container "$signer_container" --arg signer_restarts "$signer_restarts" --arg producer_image "$producer_image" --arg producer_revision "$producer_revision" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" --arg producer_container "$producer_container" --arg producer_restarts "$producer_restarts" --arg tx "$tx" --arg blob "$settlement_blob" --arg live_path "$live" --arg live_sha "sha256:$(sha "$live")" --arg dry_path "$dry" --arg dry_sha "sha256:$(sha "$dry")" --arg settlement_path "$settlement" --arg settlement_sha "sha256:$(sha "$settlement")" --argjson heartbeat "$hb" --argjson before "$before" --argjson after "$after" --argjson free "$free" --argjson min "$min_disk" '{schema:"polyedge.funded_signer_post_redemption_attestation.v1",status:"attested",createdAtUtc:$created,helperSha256:$helper,authorizedDeadLetterBaseline:$dlq,redemption:{transactionHash:$tx,settlementBlob:$blob},runtime:{signer:{invocationId:$signer_invocation,containerId:$signer_container,restartCount:($signer_restarts|tonumber),image:$image,revision:$revision,user:$signer_user},producer:{invocationId:$producer_invocation,containerId:$producer_container,restartCount:($producer_restarts|tonumber),image:$producer_image,revision:$producer_revision,user:$producer_user,status:"running",health:"healthy"}},evidence:{liveSummary:{path:$live_path,sha256:$live_sha},followUpDryRun:{path:$dry_path,sha256:$dry_sha},internalSettlement:{path:$settlement_path,sha256:$settlement_sha}},heartbeat:$heartbeat,queue:{before:$before,after:$after,deadLetterNonGrowth:true},disk:{availableBytes:$free,minimumAvailableBytes:$min},staleRecoveryReceiptsAccepted:false,servicesMutated:false,parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$tmp"
+/usr/bin/jq -n --arg created "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" --arg helper "sha256:$(sha "$0")" --argjson dlq "$(/usr/bin/jq -r '.deadLetterMessageCount // .archiveDlq.objectCount'<<<"$after")" --arg image "$image" --arg revision "$revision" --arg signer_user "$signer_user" --arg signer_invocation "$signer_invocation" --arg signer_container "$signer_container" --arg signer_restarts "$signer_restarts" --arg producer_image "$producer_image" --arg producer_revision "$producer_revision" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" --arg producer_container "$producer_container" --arg producer_restarts "$producer_restarts" --arg tx "$tx" --arg blob "$settlement_blob" --arg live_path "$live" --arg live_sha "sha256:$(sha "$live")" --arg dry_path "$dry" --arg dry_sha "$dry_sha" --arg collector "$collector" --arg collector_sha "$collector_sha" --argjson approved_preflight "$approved_preflight" --arg settlement_path "$settlement" --arg settlement_sha "sha256:$(sha "$settlement")" --argjson heartbeat "$hb" --arg maintenance_helper "$maintenance_helper" --arg maintenance_sha "$maintenance_sha" --argjson maintenance_baseline "$maintenance_baseline" --argjson before "$before" --argjson after "$after" --argjson free "$free" --argjson min "$min_disk" '{schema:"polyedge.funded_signer_post_redemption_attestation.v1",status:"attested",createdAtUtc:$created,helperSha256:$helper,authorizedDeadLetterBaseline:$dlq,redemption:{transactionHash:$tx,settlementBlob:$blob},runtime:{signer:{invocationId:$signer_invocation,containerId:$signer_container,restartCount:($signer_restarts|tonumber),image:$image,revision:$revision,user:$signer_user},producer:{invocationId:$producer_invocation,containerId:$producer_container,restartCount:($producer_restarts|tonumber),image:$producer_image,revision:$producer_revision,user:$producer_user,status:"running",health:"healthy"}},evidence:{maintenanceFailureBaseline:(if $maintenance_baseline==null then null else {collector:{path:$maintenance_helper,sha256:$maintenance_sha},proof:$maintenance_baseline} end),liveSummary:{path:$live_path,sha256:$live_sha},followUpDryRun:(if $dry_path=="" then null else {path:$dry_path,sha256:$dry_sha} end),approvedRedemptionPreflight:(if $approved_preflight==null then null else {collector:{path:$collector,sha256:$collector_sha},proof:$approved_preflight} end),internalSettlement:{path:$settlement_path,sha256:$settlement_sha}},heartbeat:$heartbeat,queue:{before:$before,after:$after,deadLetterNonGrowth:true},disk:{availableBytes:$free,minimumAvailableBytes:$min},staleRecoveryReceiptsAccepted:false,servicesMutated:false,parityTimerRemainsPaused:true,azureDeletionAllowed:false}' >"$tmp"
 /usr/bin/chown "$uid:$gid" "$tmp"; /usr/bin/chmod 640 "$tmp"; /usr/bin/sync -f "$tmp"; /usr/bin/ln "$tmp" "$receipt"; /usr/bin/sync -f "$out"; /usr/bin/rm -f "$tmp"; printf "attested post-redemption signer state: %s\n" "$receipt"
+if [ -n "$recovery_inputs" ]; then
+  recovery_receipt="$out/recording-recovery-$signer_invocation.json"
+  test ! -e "$recovery_receipt"
+  tmp=$(mktemp "$out/.recording-recovery.XXXXXX")
+  jq -n --slurpfile lifecycle "$receipt" --arg path "$receipt" --arg hash "sha256:$(sha "$receipt")" \
+    --arg bundle_path "$recovery_inputs" --arg bundle_sha "sha256:$(sha "$recovery_inputs")" \
+    --arg image "$recovery_image" --arg revision "$recovery_revision" --argjson proof "$recovery_proof" \
+    '{schema:"polyedge.funded_signer_recording_recovery.v1",status:"recording_recovered",createdAtUtc:$lifecycle[0].createdAtUtc,
+      helperSha256:$lifecycle[0].helperSha256,runtime:$lifecycle[0].runtime,
+      lifecycle:{path:$path,sha256:$hash},sourceBundle:{path:$bundle_path,sha256:$bundle_sha},targetSigner:{image:$image,revision:$revision},proof:$proof,
+      approvedRedemptionPreflight:$lifecycle[0].evidence.approvedRedemptionPreflight,
+      maintenanceFailureBaseline:$lifecycle[0].evidence.maintenanceFailureBaseline,
+      originalGuardedDeploymentClaimed:false,servicesMutated:false,azureDeletionAllowed:false}' >"$tmp"
+  chown "$uid:$gid" "$tmp"; chmod 640 "$tmp"; sync -f "$tmp"; ln "$tmp" "$recovery_receipt"; rm -f "$tmp"; sync -f "$out"
+  printf 'attested missing rollout recording: %s\n' "$recovery_receipt"
+fi

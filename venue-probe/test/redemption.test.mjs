@@ -16,6 +16,7 @@ import {
   discoverOnchainRedeemableConditions,
   expectedRecoveredAdapterApprovals,
   fetchGammaMarket,
+  fetchRedemptionPositions,
   hasUnselectedUnresolvedRiskReservations,
   persistCanonicalRecoveryJournal,
   putCanonicalRecoveryJournal,
@@ -42,6 +43,39 @@ const owner = "0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921";
 const funder = "0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8";
 const conditionA = `0x${"11".repeat(32)}`;
 const conditionB = `0x${"22".repeat(32)}`;
+
+test("redemption finds later-page winners and rejects incomplete position history", async () => {
+  const config = { funderAddress: funder, dataUrl: "https://positions.example/custom" };
+  const firstPage = Array.from({ length: 500 }, (_, index) => ({
+    asset: String(index), size: "0", currentValue: "0", redeemable: false
+  }));
+  const winner = {
+    asset: "500", conditionId: conditionA, size: "5", currentValue: "5",
+    redeemable: true, curPrice: 1, negativeRisk: false
+  };
+  const offsets = [];
+  const positions = await fetchRedemptionPositions(config, {
+    fetcher: async (value) => {
+      const url = new URL(value);
+      assert.equal(url.origin, "https://positions.example");
+      assert.equal(url.pathname, "/positions");
+      assert.equal(url.searchParams.get("user"), funder.toLowerCase());
+      assert.equal(url.searchParams.get("limit"), "500");
+      assert.equal(url.searchParams.get("sizeThreshold"), "0");
+      const offset = Number(url.searchParams.get("offset"));
+      offsets.push(offset);
+      return { ok: true, json: async () => offset === 0 ? firstPage : [winner] };
+    }
+  });
+  assert.deepEqual(offsets, [0, 500]);
+  assert.equal(positions.length, 501);
+  assert.deepEqual(positions.at(-1), { ...winner, size: 5, currentValue: 5 });
+  await assert.rejects(fetchRedemptionPositions(config, {
+    fetcher: async (value) => new URL(value).searchParams.get("offset") === "0"
+      ? { ok: true, json: async () => firstPage }
+      : { ok: false, status: 503 }
+  }), /positions returned HTTP 503/);
+});
 
 function recoveryJournalFixture() {
   const prefix = "reports/funded/dynamic-quote/sessions/campaign";

@@ -1178,6 +1178,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "flate2",
  "libc",
  "percent-encoding",
  "polyedge-api",

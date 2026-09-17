@@ -1,0 +1,175 @@
+#!/usr/bin/python3 -I
+"""Read current funded queue statistics and DLQ object metadata; never receive."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shlex
+import stat
+import subprocess
+import sys
+from urllib.parse import urlparse
+
+
+def digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def snapshot(global_stats, channel_stats, objects, binding):
+    for stats in (global_stats, channel_stats):
+        assert set(stats) == {"queue", "dlq"}
+        for values in stats.values():
+            assert set(values) == {"visible_messages", "in_flight_messages", "size_in_bytes"}
+            assert all(type(value) is int and value == 0 for value in values.values()), "queue is not empty"
+    names = set()
+    for row in objects:
+        assert re.fullmatch(r"funded-queue-dlq/\d{4}/\d{2}/\d{2}/.+-[0-9a-f]{64}\.json", row["name"])
+        assert row["name"] not in names, "overlapping DLQ pages"
+        names.add(row["name"])
+        assert isinstance(row["etag"], str) and row["etag"]
+        assert type(row["size"]) is int and row["size"] > 0
+    return {
+        "schema": "polyedge.funded_oci_queue_snapshot.v1", "backend": "oci", "status": "observed_zero", "readOnly": True,
+        "statisticsAreApproximate": True, "binding": binding, "globalStats": global_stats, "fundedDirectStats": channel_stats,
+        "archiveDlq": {"prefix": "funded-queue-dlq/", "objectCount": len(objects), "exhaustiveListing": True,
+                       "inventorySha256": digest(sorted(objects, key=lambda row: row["name"]))},
+    }
+
+
+def output(*args):
+    return subprocess.check_output(args, text=True, timeout=30).strip()
+
+
+def stopped_consumer_url():
+    for unit in ("polyedge-funded-signer.service", "polyedge-funded-intent-producer.service"):
+        assert output("/usr/bin/systemctl", "show", unit, "-p", "ActiveState", "--value") in ("inactive", "failed")
+        assert output("/usr/bin/systemctl", "show", unit, "-p", "MainPID", "--value") == "0"
+    paths = (Path("/etc/containers/systemd/polyedge-funded-signer.container"), Path("/etc/polyedge/funded-signer.env"))
+    for path in paths:
+        info = path.lstat()
+        assert stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0 and info.st_nlink == 1
+        assert stat.S_IMODE(info.st_mode) == 0o600 and 0 < info.st_size <= 131072
+    assert [line for line in paths[0].read_text().splitlines() if line.startswith("EnvironmentFile=")] == ["EnvironmentFile=" + str(paths[1])]
+    rows = [line.partition("=")[2] for line in paths[1].read_text().splitlines()
+            if line.startswith("FUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL=")]
+    assert len(rows) == 1 and len(shlex.split(rows[0])) == 1
+    return {"url": shlex.split(rows[0])[0]}
+
+
+def bridge_binding(stopped=False):
+    config = Path("/etc/polyedge/oci-queue-bridge.env")
+    info = config.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0
+    assert stat.S_IMODE(info.st_mode) == 0o640 and info.st_nlink == 1 and 0 < info.st_size <= 8192
+    keys = {"POLYEDGE_OCI_QUEUE_ID", "POLYEDGE_OCI_QUEUE_ENDPOINT", "POLYEDGE_OCI_OBJECT_NAMESPACE", "POLYEDGE_OCI_DLQ_BUCKET"}
+    values = {}
+    for line in config.read_text().splitlines():
+        key, separator, value = line.partition("=")
+        if key in keys:
+            assert separator and key not in values
+            parsed = shlex.split(value)
+            assert len(parsed) == 1
+            values[key] = parsed[0]
+    assert set(values) == keys
+    unit = "polyedge-oci-queue-bridge.service"
+    assert output("/usr/bin/systemctl", "is-active", unit) == "active"
+    pid = output("/usr/bin/systemctl", "show", unit, "-p", "MainPID", "--value")
+    invocation = output("/usr/bin/systemctl", "show", unit, "-p", "InvocationID", "--value")
+    assert pid.isdecimal() and int(pid) > 0 and re.fullmatch(r"[0-9a-f]{32}", invocation)
+    bridge = Path("/usr/local/libexec/polyedge-oci-queue-bridge")
+    command = ["/home/ubuntu/.local/share/oci-cli/bin/python3", str(bridge)]
+    assert Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") == [arg.encode() for arg in command] + [b""]
+    info = bridge.lstat()
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0 and info.st_nlink == 1
+    assert stat.S_IMODE(info.st_mode) == 0o755
+    bridge_sha = hashlib.sha256(bridge.read_bytes()).hexdigest()
+    # This reviewed bridge sends and receives exclusively on funded-direct.
+    assert bridge_sha == "c0058eed7747133a1e1530005ce0fcc7fc73754f3e8382e3d430c0d2b38429e4"
+    started = output("/usr/bin/systemctl", "show", unit, "-p", "ExecMainStartTimestamp", "--value")
+    started_epoch = int(output("/usr/bin/date", "-d", started, "+%s"))
+    assert max(info.st_mtime, info.st_ctime) <= started_epoch, "bridge source changed after process start"
+    # Only compare the four public topology fields, never emit the process env.
+    active = {}
+    for pair in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+        key, separator, value = pair.partition(b"=")
+        if key.decode(errors="replace") in keys:
+            active[key.decode()] = value.decode()
+    assert active == values, "bridge process differs from the configured queue"
+    consumer = stopped_consumer_url() if stopped else json.loads(output("/usr/bin/podman", "exec", "polyedge-funded-signer", "node", "-e",
+        'console.log(JSON.stringify({url:process.env.FUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL}))'))
+    assert consumer == {"url": "http://10.89.0.1:8182/v1/messages"}
+    endpoint = values["POLYEDGE_OCI_QUEUE_ENDPOINT"]
+    url = urlparse(endpoint)
+    queue_id = re.fullmatch(r"ocid1\.queue\.oc1\.([a-z]+-[a-z]+-[0-9]+)\.[a-z0-9.]+", values["POLYEDGE_OCI_QUEUE_ID"])
+    assert queue_id
+    assert url.scheme == "https" and url.hostname and url.port in (None, 443)
+    assert re.fullmatch(r"cell-[0-9]+\.queue\.messaging\." + re.escape(queue_id[1]) + r"\.oci\.oraclecloud\.com", url.hostname)
+    assert not url.username and not url.password and not url.query and not url.fragment and url.path in ("", "/")
+    return {"queueId": values["POLYEDGE_OCI_QUEUE_ID"], "endpoint": endpoint,
+            "objectNamespace": values["POLYEDGE_OCI_OBJECT_NAMESPACE"], "dlqBucket": values["POLYEDGE_OCI_DLQ_BUCKET"],
+            "channel": "funded-direct", "bridgeInvocationId": invocation, "consumerBridgeUrl": consumer["url"],
+            "bridgeCommand": command, "bridgeSourceSha256": bridge_sha,
+            "configSha256": hashlib.sha256(config.read_bytes()).hexdigest()}
+
+
+def read_cloud(binding):
+    # The existing OCI SDK is Ubuntu-owned, so only the unprivileged worker imports it.
+    assert os.geteuid() == pwd.getpwnam("ubuntu").pw_uid and os.geteuid() != 0
+    import oci
+    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+    queue = oci.queue.QueueClient({}, signer=signer, service_endpoint=binding["endpoint"], timeout=(10, 30),
+                                  retry_strategy=oci.retry.NoneRetryStrategy())
+    storage = oci.object_storage.ObjectStorageClient({}, signer=signer, timeout=(10, 30),
+                                                    retry_strategy=oci.retry.NoneRetryStrategy())
+
+    def stats(**kwargs):
+        data = queue.get_stats(binding["queueId"], **kwargs).data
+        assert data.channel_id == kwargs.get("channel_id"), "queue response channel mismatch"
+        return {name: {field: getattr(getattr(data, name), field)
+                      for field in ("visible_messages", "in_flight_messages", "size_in_bytes")}
+                for name in ("queue", "dlq")}
+
+    global_stats, channel_stats = stats(), stats(channel_id="funded-direct")
+    objects, seen, start = [], set(), None
+    # ponytail: bounded full metadata listing; add a verified index only if this exceeds 100k objects.
+    while True:
+        page = storage.list_objects(binding["objectNamespace"], binding["dlqBucket"], prefix="funded-queue-dlq/",
+                                    fields="name,etag,size", limit=1000, **({"start": start} if start else {})).data
+        objects.extend({"name": row.name, "etag": row.etag, "size": row.size} for row in page.objects)
+        assert len(objects) <= 100000
+        start = page.next_start_with
+        if not start:
+            break
+        assert start not in seen, "repeated DLQ cursor"
+        seen.add(start)
+    assert stats() == global_stats and stats(channel_id="funded-direct") == channel_stats, "queue statistics changed during capture"
+    return {"global_stats": global_stats, "channel_stats": channel_stats, "objects": objects}
+
+
+def main(stopped=False):
+    assert os.geteuid() == 0
+    binding = bridge_binding(stopped)
+    helper = Path(__file__).resolve()
+    worker = subprocess.run(["/usr/sbin/runuser", "-u", "ubuntu", "--",
+        "/home/ubuntu/.local/share/oci-cli/bin/python3", "-I", str(helper), "--read"],
+        input=json.dumps(binding), text=True, capture_output=True, timeout=120, check=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"})
+    assert len(worker.stdout) <= 32 * 1024 * 1024
+    cloud = json.loads(worker.stdout)
+    assert bridge_binding(stopped) == binding, "queue binding changed during capture"
+    result = snapshot(**cloud, binding=binding)
+    result["verifier"] = {"path": str(helper), "sha256": "sha256:" + hashlib.sha256(helper.read_bytes()).hexdigest()}
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    try:
+        if sys.argv[1:] == ["--read"]:
+            print(json.dumps(read_cloud(json.loads(sys.stdin.read(8192)))))
+        else:
+            assert sys.argv[1:] in ([], ["--stopped"])
+            main(sys.argv[1:] == ["--stopped"])
+    except Exception as error:
+        raise SystemExit(f"funded OCI queue snapshot failed: {type(error).__name__}") from None

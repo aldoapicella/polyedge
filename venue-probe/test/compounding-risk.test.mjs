@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { runPersistentFundedDirectService } from "../src/funded-direct-service.mjs";
 import {
   discoverVerifiedAutomaticInternalSettlements,
   fundedSessionExpiryMs,
@@ -497,6 +498,9 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
     sourceUnresolvedReservationCount: 0,
     now: () => new Date("2026-09-16T00:05:00.000Z")
   };
+  const beforeInitial = new Map(fixture.container.values);
+  await assert.rejects(migrateProtectedReserveState({ ...input, positionCount: 1 }), /requires zero orders, positions/);
+  assert.deepEqual(fixture.container.values, beforeInitial);
   const first = await migrateProtectedReserveState(input);
   assert.equal(first.state.reserve_basis, "fully_reconciled_current_equity");
   assert.equal(first.state.reserve_monotonic, false);
@@ -527,6 +531,7 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
   const restartInput = {
     ...input,
     accountEquity: 48,
+    positionCount: 1,
     now: () => new Date("2026-09-16T00:06:00.000Z")
   };
   const recovered = await migrateProtectedReserveState(restartInput);
@@ -545,10 +550,26 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
   });
   assert.equal(second.state.migration_completed_at,
     first.state.migration_completed_at);
+  assert.equal(fixture.container.etags.get(fixture.targetManifest.capital_policy.state_blob_name), targetEtag);
+  assert.deepEqual(second.state, recovered.state);
+  const startupLogs = [];
+  await runPersistentFundedDirectService({
+    env: { FUNDED_DIRECT_SERVICE_ENABLED: "true", FUNDED_DIRECT_ENGINE: "persistent_v1",
+      FUNDED_DIRECT_SERVICE_BUS_NAMESPACE: "sb-test", FUNDED_DIRECT_SERVICE_BUS_QUEUE: "funded-test" },
+    createBusClient: () => ({ createReceiver: () => ({ close: async () => {} }), close: async () => {} }),
+    createProcessor: async () => ({ process: async () => assert.fail("startup must not submit orders") }),
+    createExecutor: async () => {
+      const resumed = await migrateProtectedReserveState(restartInput);
+      assert.deepEqual(resumed.state, recovered.state);
+      return { status: () => ({ ready: true }), close: async () => {} };
+    },
+    runRedemption: async () => assert.fail("initialization must not submit redemption"),
+    logger: event => { startupLogs.push(event); if (event.status === "persistent_service_started") process.emit("SIGTERM"); }
+  });
+  assert.equal(startupLogs.filter(event => event.status === "persistent_service_started").length, 1);
   for (const unsafe of [
     { fullyReconciled: false },
     { openOrderCount: 1 },
-    { positionCount: 1 },
     { sourceUnresolvedReservationCount: 1 },
     { accountEquity: 47 }
   ]) {
@@ -1508,7 +1529,8 @@ test("multiple exact reservations and maker orders aggregate for one condition",
   assert.equal(settlement.reservation_matched_notional, 2);
 });
 
-test("one confirmed transaction redeeming multiple conditions creates separate records", async () => {
+for (const secondPayout of [5, 10]) {
+test(`one confirmed transaction creates separate records with second payout ${secondPayout}`, async () => {
   const reservations = [
     automaticReservation(),
     automaticReservation({
@@ -1526,15 +1548,15 @@ test("one confirmed transaction redeeming multiple conditions creates separate r
       conditionId: secondCondition,
       asset: secondToken,
       transactionHash: secondFillTransaction,
-      size: 5,
+      size: secondPayout,
       usdcSize: 2
     }),
     redeemActivity(),
-    redeemActivity({ conditionId: secondCondition, payout: 5 })
+    redeemActivity({ conditionId: secondCondition, payout: secondPayout })
   ];
   const receipt = confirmedReceipt([
     decodedRedemption(),
-    decodedRedemption({ conditionId: secondCondition, payout: 5, index_sets: [2] })
+    decodedRedemption({ conditionId: secondCondition, payout: secondPayout, index_sets: [2] })
   ]);
   let receiptCalls = 0;
   const settlements = await discoverVerifiedAutomaticInternalSettlements({
@@ -1550,8 +1572,8 @@ test("one confirmed transaction redeeming multiple conditions creates separate r
           conditionId: secondCondition,
           assetId: secondToken,
           transactionHash: secondFillTransaction,
-          size: 5,
-          price: 0.4
+          size: secondPayout,
+          price: 2 / secondPayout
         })],
     getTransactionReceipt: async () => { receiptCalls += 1; return receipt; }
   });
@@ -1563,6 +1585,21 @@ test("one confirmed transaction redeeming multiple conditions creates separate r
   ].sort());
   assert.equal(new Set(settlements.map((row) => row.id)).size, 2);
   assert.ok(settlements.every((row) => row.transaction_hash === automaticRedemption));
+});
+
+}
+
+test("same-amount batched redemption rejects missing or extra transfer legs", () => {
+  const receipt = confirmedReceipt([decodedRedemption(), decodedRedemption({conditionId: secondCondition, payout: 10, index_sets: [2]})]);
+  assert.equal(verifyAutomaticSettlementEvidence(verifyFixture({receipt})).payout, 10);
+  for (const [field, index] of [["erc20_transfers", 0], ["erc20_transfers", 1], ["erc20_transfers", 2], ["collateral_wraps", 0], ["ctf_transfers", 0], ["ctf_transfers", 1]]) {
+    for (const change of ["missing", "extra"]) {
+      const broken = structuredClone(receipt);
+      if (change === "missing") broken[field].splice(index, 1);
+      else broken[field].push(structuredClone(broken[field][index]));
+      assert.throws(() => verifyAutomaticSettlementEvidence(verifyFixture({receipt: broken})), /transfer chain/, `${change} ${field}[${index}]`);
+    }
+  }
 });
 
 test("automatic settlement fails closed on CLOB hash, asset, wallet, status, or receipt mismatch", () => {

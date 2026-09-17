@@ -554,19 +554,21 @@ export function verifyAutomaticSettlementEvidence({
   const decodedRedemptions = Array.isArray(receipt?.redemptions)
     ? receipt.redemptions
     : [];
-  const decodedMatches = decodedRedemptions.filter((row) =>
+  const samePayoutRedemptions = decodedRedemptions.filter((row) =>
     normalizedAddress(row?.contract_address) === CONDITIONAL_TOKENS_ADDRESS
       && normalizedHash(row?.transaction_hash) === transactionHash
       && normalizedAddress(row?.redeemer) === PUSD_CTF_COLLATERAL_ADAPTER_ADDRESS
       && normalizedAddress(row?.collateral_token) === USDCE_ADDRESS
       && normalizedHash(row?.parent_collection_id) === ZERO_TRANSACTION_HASH
-      && normalizedHash(row?.condition_id) === conditionId
       && moneyEqual(row?.payout, payout)
       && /^\d+$/.test(String(row?.payout_base_units || ""))
       && String(row.payout_base_units) === payoutBaseUnits
       && Array.isArray(row?.index_sets)
       && row.index_sets.length > 0
       && row.index_sets.every((index) => normalizedIndexSet(index))
+  );
+  const decodedMatches = samePayoutRedemptions.filter((row) =>
+    normalizedHash(row?.condition_id) === conditionId
   );
   if (receipt?.status !== "success"
       || Number(receipt?.chain_id) !== 137
@@ -626,12 +628,14 @@ export function verifyAutomaticSettlementEvidence({
       && normalizedAddress(row?.to) === wallet
       && canonicalBaseUnits(row?.amount_base_units) === payoutBaseUnits
   );
+  // Batched conditions may have identical payouts. Token legs stay exact;
+  // fungible transfer legs must match the decoded payout multiplicity.
   if (walletToAdapter.length !== 1
       || adapterBurn.length !== 1
-      || usdceCtfToAdapter.length !== 1
-      || usdceAdapterToPusd.length !== 1
-      || pusdMintToWallet.length !== 1
-      || pusdWrapToWallet.length !== 1) {
+      || usdceCtfToAdapter.length !== samePayoutRedemptions.length
+      || usdceAdapterToPusd.length !== samePayoutRedemptions.length
+      || pusdMintToWallet.length !== samePayoutRedemptions.length
+      || pusdWrapToWallet.length !== samePayoutRedemptions.length) {
     throw new Error("fail closed: decoded redemption adapter/CTF/USDC.e/pUSD transfer chain is invalid");
   }
   const filledShares = money(fills.reduce(
@@ -959,10 +963,11 @@ export async function migrateProtectedReserveState({
   }
 
   if (checkpoint?.migration_source_session_id !== undefined) {
+    // The verified checkpoint records the original flat rollover. Later target
+    // positions do not repeat migration; equity and ledger checks below still bind restart.
     if (currentEquityTarget
         && (fullyReconciled !== true
           || Number(openOrderCount) !== 0
-          || Number(positionCount) !== 0
           || Number(sourceUnresolvedReservationCount) !== 0)) {
       throw new Error("fail closed: unbounded rollover checkpoint requires a flat source account");
     }

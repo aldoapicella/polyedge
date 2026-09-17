@@ -102,8 +102,7 @@ const RAW_SOURCE_INVENTORY_SCHEMA_VERSION: u32 = 1;
 const RAW_SOURCE_INVENTORY_DOMAIN: &str = "polyedge.raw-source-inventory.v1";
 const ADAPTIVE_LOG_LIMIT: usize = 100;
 const REFERENCE_HISTORY_SECONDS: i64 = 130;
-const SWEEP_SELECTION_RULE: &str = "Rank candidates only by aggregate PnL across chronological validation days: maximize the worst fill-model validation PnL, then total validation PnL, then candidate name; final-day test results are opened only for the fixed winner.";
-const SWEEP_FOLD_SELECTION_RULE: &str = "Within this fold, rank candidates only on its single validation day: maximize the worst fill-model validation PnL, then total validation PnL, then candidate name.";
+const SWEEP_SELECTION_RULE: &str = "Rank on selection-input validation days only: conservative evidence gates, worst conservative net PnL, total conservative net PnL, candidate name. Holdout data is read only for the fixed winner.";
 const SWEEP_BLOCK_DAYS: usize = 7;
 const SWEEP_MIN_BLOCKS: usize = 4;
 const SWEEP_BOOTSTRAP_RESAMPLES: usize = 10_000;
@@ -111,7 +110,7 @@ const SWEEP_MAX_SEARCH_COMBINATIONS: usize = 100_000;
 
 fn sweep_robust_candidate_rule() -> String {
     format!(
-        "The fixed winner is robust only when validation net PnL and the deterministic {SWEEP_BLOCK_DAYS}-day circular block-bootstrap lower 95% bound ({SWEEP_BOOTSTRAP_RESAMPLES} resamples, at least {} daily clusters) are both above zero under touch_after_250ms and trade_through, and the sealed final-day test has at least one complete market and non-negative net PnL under both models.",
+        "The fixed winner is robust only when validation net PnL and the deterministic {SWEEP_BLOCK_DAYS}-day circular block-bootstrap lower 95% bound ({SWEEP_BOOTSTRAP_RESAMPLES} resamples, at least {} daily clusters) are both above zero under trade_through, queue_proxy_conservative and adverse_selection_penalized, with eligible queue evidence, and a separate holdout also has at least 28 consecutive UTC days, positive wallet-constrained PnL and a positive block lower bound under those models. no_maker_fills is a control. This is research evidence under the recorded paper wallet, not funded-capital authorization.",
         SWEEP_BLOCK_DAYS * SWEEP_MIN_BLOCKS
     )
 }
@@ -363,6 +362,7 @@ pub struct SettlementCarryOptions {
 
 #[derive(Clone, Debug)]
 pub struct ReplayOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub markets: Option<PathBuf>,
     pub strategy_config: Option<PathBuf>,
@@ -374,6 +374,7 @@ pub struct ReplayOptions {
 
 #[derive(Clone, Debug)]
 pub struct BaselineOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub markets: Option<PathBuf>,
     pub out: PathBuf,
@@ -383,6 +384,7 @@ pub struct BaselineOptions {
 
 #[derive(Clone, Debug)]
 pub struct RegimesOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
     pub markets: Option<PathBuf>,
     pub fill_model: FillModel,
@@ -394,7 +396,10 @@ pub struct RegimesOptions {
 
 #[derive(Clone, Debug)]
 pub struct SweepOptions {
+    pub wallet_config: Option<PathBuf>,
     pub input: PathBuf,
+    pub test_input: Option<PathBuf>,
+    pub test_markets: Option<PathBuf>,
     pub markets: Option<PathBuf>,
     pub search: Option<PathBuf>,
     pub split: String,
@@ -416,6 +421,7 @@ pub struct CalibrationOptions {
 #[derive(Clone, Debug)]
 pub struct SampleSizeOptions {
     pub results: PathBuf,
+    pub fill_model: Option<FillModel>,
     pub out: PathBuf,
     pub markdown: PathBuf,
 }
@@ -662,6 +668,7 @@ pub fn run_normalize(options: NormalizeOptions) -> Result<Value, ResearchError> 
         "events": projected_events,
         "input_events": input_events,
         "malformed_lines": stream.malformed_lines,
+        "invalid_timestamps": stream.invalid_timestamps,
         "event_counts": projected_counts,
         "input_event_counts": input_counts,
         "first_recorded_ts": first_ts.map(ts),
@@ -781,10 +788,29 @@ pub fn run_build_markets(options: BuildMarketsOptions) -> Result<Value, Research
     Ok(report)
 }
 
+fn replay_settings(
+    path: Option<&Path>,
+) -> Result<(RuntimeSettings, Option<String>), ResearchError> {
+    let mut settings = RuntimeSettings::default();
+    let Some(path) = path else {
+        return Ok((settings, None));
+    };
+    let bytes = fs::read(path)?;
+    settings.strategy = serde_json::from_slice::<StrategyConfig>(&bytes)?;
+    settings.validate_adaptive_strategy().map_err(|error| {
+        ResearchError::InvalidInput(format!(
+            "invalid replay strategy config {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok((settings, Some(sha256_prefixed(&bytes))))
+}
+
 pub fn run_replay(options: ReplayOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     let markets = load_market_truth(options.markets.as_deref())?;
-    let settings = RuntimeSettings::default();
+    let (settings, strategy_config_sha256) = replay_settings(options.strategy_config.as_deref())?;
     let request = ReplayRequest {
         name: options.fill_model.as_str().to_owned(),
         fill_model: options.fill_model,
@@ -796,8 +822,10 @@ pub fn run_replay(options: ReplayOptions) -> Result<Value, ResearchError> {
         &markets,
         vec![request],
         &options.exclude_windows,
+        &wallet,
     )?;
-    let result = results.pop().unwrap_or_else(empty_replay_result);
+    let mut result = results.pop().unwrap_or_else(empty_replay_result);
+    result["strategy_config_sha256"] = json!(strategy_config_sha256);
     let report = envelope(
         "polyedge-rs research replay",
         &options.input,
@@ -818,6 +846,7 @@ pub fn run_replay(options: ReplayOptions) -> Result<Value, ResearchError> {
 
 pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     let markets = load_market_truth(options.markets.as_deref())?;
     let settings = RuntimeSettings::default();
     let requests = FillModel::all_baseline()
@@ -829,8 +858,13 @@ pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
             settings: settings.clone(),
         })
         .collect::<Vec<_>>();
-    let results =
-        run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
+    let results = run_replay_requests(
+        &options.input,
+        &markets,
+        requests,
+        &options.exclude_windows,
+        &wallet,
+    )?;
     let result = json!({
         "fill_models": results,
         "primary_unit": "settled_market_net_pnl",
@@ -856,6 +890,7 @@ pub fn run_baseline(options: BaselineOptions) -> Result<Value, ResearchError> {
 
 pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     let projected_campaign_manifest_sha256 = {
         let path = options.input.join(PROJECTED_CAMPAIGN_INDEX_FILE);
         if path.is_file() {
@@ -866,23 +901,49 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
     };
     let markets = load_market_truth(options.markets.as_deref())?;
     let settings = RuntimeSettings::default();
-    let modes = [
-        StrategyProfileMode::Static,
-        StrategyProfileMode::DynamicSafetyOnly,
-        StrategyProfileMode::DynamicQuoteStyle,
-        StrategyProfileMode::FullDeterministic,
-    ];
-    let requests = modes
+    let (profiles, profile_config_sha256) = if let Some(path) = &options.profile_config {
+        let (registry, hash) = labs::load_frozen_candidate_registry_with_hash(path)?;
+        let profiles = registry
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                Ok((
+                    candidate.name,
+                    StrategyProfileMode::from_config(&candidate.profile)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ResearchError>>()?;
+        (profiles, Some(hash))
+    } else {
+        (
+            vec![
+                StrategyProfileMode::Static,
+                StrategyProfileMode::DynamicSafetyOnly,
+                StrategyProfileMode::DynamicQuoteStyle,
+                StrategyProfileMode::FullDeterministic,
+            ]
+            .into_iter()
+            .map(|mode| (mode.as_str().to_owned(), mode))
+            .collect(),
+            None,
+        )
+    };
+    let requests = profiles
         .into_iter()
-        .map(|mode| ReplayRequest {
-            name: mode.as_str().to_owned(),
+        .map(|(name, mode)| ReplayRequest {
+            name,
             fill_model: options.fill_model,
             mode,
             settings: settings.clone(),
         })
         .collect::<Vec<_>>();
-    let results =
-        run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
+    let results = run_replay_requests(
+        &options.input,
+        &markets,
+        requests,
+        &options.exclude_windows,
+        &wallet,
+    )?;
     let static_net = results
         .iter()
         .find(|row| row["profile"].as_str() == Some("static"))
@@ -934,6 +995,7 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
         "profiles": results,
         "comparisons": comparisons,
         "projected_campaign_manifest_sha256": projected_campaign_manifest_sha256,
+        "profile_config_sha256": profile_config_sha256,
         "profile_config": options.profile_config.map(|path| path.to_string_lossy().into_owned()),
         "research_only": true,
         "live_deployment_allowed": false
@@ -958,60 +1020,192 @@ pub fn run_regimes(options: RegimesOptions) -> Result<Value, ResearchError> {
 
 pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
+    let wallet = ReplayWalletConstraints::load(options.wallet_config.as_deref())?;
     if !options.split.eq_ignore_ascii_case("walk_forward") {
         return Err(ResearchError::InvalidInput(format!(
             "sweep selection supports only chronological walk_forward, got {}",
             options.split
         )));
     }
-    let markets = load_market_truth(options.markets.as_deref())?;
     let settings = RuntimeSettings::default();
-    let build = sweep_candidates(options.max_experiments.max(1), options.search.as_deref())?;
+    let build = sweep_candidates(
+        options.max_experiments.clamp(1, 100),
+        options.search.as_deref(),
+    )?;
     if build.configured && build.candidates.len() == 1 {
         return Err(ResearchError::InvalidInput(
             "explicit sweep --search requires max_experiments >= 2 so at least one configured candidate is evaluated alongside the baseline"
                 .to_owned(),
         ));
     }
-    let requests = build
-        .candidates
-        .iter()
-        .flat_map(|candidate| {
-            [
-                ReplayRequest {
-                    name: format!("{}__touch_after_250ms", candidate.name),
-                    fill_model: FillModel::TouchAfter250Ms,
-                    mode: StrategyProfileMode::StaticSweep(candidate.clone()),
-                    settings: settings.clone(),
-                },
-                ReplayRequest {
-                    name: format!("{}__trade_through", candidate.name),
-                    fill_model: FillModel::TradeThrough,
-                    mode: StrategyProfileMode::StaticSweep(candidate.clone()),
-                    settings: settings.clone(),
-                },
-            ]
-        })
-        .collect::<Vec<_>>();
-    let results =
-        run_replay_requests(&options.input, &markets, requests, &options.exclude_windows)?;
+    if options.test_input.is_none() && options.test_markets.is_some() {
+        return Err(ResearchError::InvalidInput(
+            "--test-markets requires --test-input".to_owned(),
+        ));
+    }
+    if let Some(test) = &options.test_input {
+        let selection = fs::canonicalize(&options.input)?;
+        let test = fs::canonicalize(test)?;
+        if selection.starts_with(&test) || test.starts_with(&selection) {
+            return Err(ResearchError::InvalidInput(
+                "selection and test inputs must be separate, disjoint paths".to_owned(),
+            ));
+        }
+        if options
+            .markets
+            .as_ref()
+            .zip(options.test_markets.as_ref())
+            .is_some_and(|(a, b)| fs::canonicalize(a).ok() == fs::canonicalize(b).ok())
+        {
+            return Err(ResearchError::InvalidInput(
+                "selection and test market-truth inputs must be separate".to_owned(),
+            ));
+        }
+    }
+    let selection_binding_before = if options.test_input.is_some() {
+        Some(labs::collect_replay_index_inputs(&options.input)?)
+    } else {
+        None
+    };
+    let selection_markets_before = options.markets.as_ref().map(fs::read).transpose()?;
+    let markets = load_market_truth(options.markets.as_deref())?;
+    if selection_markets_before != options.markets.as_ref().map(fs::read).transpose()? {
+        return Err(ResearchError::InvalidInput(
+            "selection market truth changed while loading".to_owned(),
+        ));
+    }
+    let requests = sweep_replay_requests(&build.candidates, &settings);
+    let results = run_replay_requests(
+        &options.input,
+        &markets,
+        requests,
+        &options.exclude_windows,
+        &wallet,
+    )?;
+    if selection_markets_before != options.markets.as_ref().map(fs::read).transpose()? {
+        return Err(ResearchError::InvalidInput(
+            "selection market truth changed during replay".to_owned(),
+        ));
+    }
+    if let Some(binding) = &selection_binding_before {
+        if *binding != labs::collect_replay_index_inputs(&options.input)? {
+            return Err(ResearchError::InvalidInput(
+                "selection input changed during replay".to_owned(),
+            ));
+        }
+    }
     let (plan, mut split_warnings) = split_plan(&results, &options.split);
     let grouped = group_sweep_results(results);
-    let (candidates, fold_results, selection) =
+    let (mut candidates, fold_results, mut selection) =
         build_sweep_evidence(&grouped, &build.candidates, &plan);
+    if let Some(test_input) = &options.test_input {
+        let validation_passes = candidates
+            .iter()
+            .find(|c| c["selected"] == true)
+            .is_some_and(|c| {
+                c["validation_net_positive_under_conservative_models"] == true
+                    && c["validation_block_bound_positive_under_conservative_models"] == true
+            });
+        if !validation_passes {
+            selection["status"] = json!("insufficient_validation_evidence_holdout_unopened");
+        } else {
+            // Freeze the winner before reading any holdout event or settlement artifact.
+            if let Some(winner) = build
+                .candidates
+                .iter()
+                .find(|c| selection["candidate"].as_str() == Some(&c.name))
+            {
+                let selection_binding = selection_binding_before
+                    .as_ref()
+                    .expect("holdout requires selection binding");
+                let receipt = json!({"candidate":winner.name, "parameters":winner.parameters_json(),
+                "selection_input":selection_binding,
+                "selection_markets_sha256":selection_markets_before.as_ref().map(|b| sha256_prefixed(b)),
+                "test_input":test_input, "test_markets":options.test_markets,
+                "exclude_windows":exclusion_windows_json(&options.exclude_windows),
+                "fill_models":sweep_fill_models().map(|m|m.as_str()),
+                "candidate_set_sha256":sha256_prefixed(&serde_json::to_vec(&build.candidates.iter().map(|c|json!({"name":c.name,"parameters":c.parameters_json()})).collect::<Vec<_>>())?),
+                "validation_ranking_sha256":sha256_prefixed(&serde_json::to_vec(&candidates)?),
+                "wallet_constraints":wallet.as_json(), "wallet_config_sha256":wallet.source_sha256,
+                "git_sha":git_sha()});
+                let state_root = std::env::var_os("XDG_STATE_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| PathBuf::from(home).join(".local/state"))
+                    })
+                    .ok_or_else(|| {
+                        ResearchError::InvalidInput(
+                            "research holdout receipt state directory unavailable".to_owned(),
+                        )
+                    })?
+                    .join("polyedge/research/holdout-receipts");
+                let holdout_id = holdout_inventory_identity(test_input)?;
+                claim_holdout_once(&state_root, &holdout_id, &receipt)?;
+                write_json_file(
+                    &options.out.with_extension("winner-before-test.json"),
+                    &receipt,
+                )?;
+                let test_binding = labs::collect_replay_index_inputs(test_input)?;
+                let test_market_bytes = options.test_markets.as_ref().map(fs::read).transpose()?;
+                let test_markets = load_market_truth(options.test_markets.as_deref())?;
+                let test_results = run_replay_requests(
+                    test_input,
+                    &test_markets,
+                    sweep_replay_requests(std::slice::from_ref(winner), &settings),
+                    &options.exclude_windows,
+                    &wallet,
+                )?;
+                if holdout_id != holdout_inventory_identity(test_input)?
+                    || test_binding != labs::collect_replay_index_inputs(test_input)?
+                    || test_market_bytes
+                        != options.test_markets.as_ref().map(fs::read).transpose()?
+                {
+                    return Err(ResearchError::InvalidInput(
+                        "holdout input or market truth changed during replay".to_owned(),
+                    ));
+                }
+                validate_sweep_holdout(
+                    grouped
+                        .get(&winner.name)
+                        .expect("selected candidate exists"),
+                    &test_results,
+                )?;
+                let test_days = sweep_market_days(&test_results);
+                let mut test = sealed_test_evidence(&test_results, &test_days);
+                test["input_binding"] = test_binding;
+                test["markets_sha256"] =
+                    json!(test_market_bytes.as_ref().map(|b| sha256_prefixed(b)));
+                test["winner_receipt_sha256"] =
+                    json!(sha256_prefixed(&serde_json::to_vec(&receipt)?));
+                let robust = validation_passes && sealed_test_non_collapsing(&test);
+                selection["status"] = json!("fixed_winner_test_evaluated");
+                selection["sealed_test"] = test.clone();
+                selection["robust_candidate"] = json!(robust);
+                for row in &mut candidates {
+                    if row["selected"] == true {
+                        row["sealed_test"] = test.clone();
+                        row["robust_candidate"] = json!(robust);
+                    }
+                }
+            }
+        }
+    }
     if build.truncated {
         split_warnings.push(json!(format!(
             "search space truncated: {} configured combinations plus baseline, {} candidates evaluated under max_experiments={}",
             build.requested_combinations,
             build.candidates.len(),
-            options.max_experiments.max(1)
+            options.max_experiments.clamp(1, 100)
         )));
     }
     split_warnings.push(json!(
         "coarse deterministic search over logged decisions; no live deployment"
     ));
     let result = json!({
-        "schema_version": 2,
+        "schema_version": 3,
+        "wallet_constraints": wallet.as_json(),
+        "wallet_config_sha256": wallet.source_sha256,
         "split_method": options.split,
         "split_plan": plan,
         "fold_results": fold_results,
@@ -1023,6 +1217,8 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
             "requested_combinations": build.requested_combinations,
             "baseline_included": true,
             "evaluated_candidates": build.candidates.len(),
+            "evaluated_selection_replays":build.candidates.len()*sweep_fill_models().len(),
+            "selection_replay_cap":500,
             "truncated": build.truncated
         },
         "max_experiments": options.max_experiments,
@@ -1030,13 +1226,13 @@ pub fn run_sweep(options: SweepOptions) -> Result<Value, ResearchError> {
         "selection": selection,
         "selection_rule": SWEEP_SELECTION_RULE,
         "robust_candidate_rule": sweep_robust_candidate_rule(),
-        "test_sealing_rule": "For each non-final chronological fold, the fold validation winner's next-day test is opened as walk-forward diagnostic evidence. The final aggregate test remains sealed and is opened only for the winner fixed from all chronological validation days; if the final fold winner differs, that fold test remains sealed.",
+        "test_sealing_rule": "All candidates use selection input only. A winner receipt is created before a separate test input and separate market truth are read. Existing receipts cannot be overwritten. Single-input runs are validation only; no holdout result is claimed.",
         "warnings": split_warnings.clone()
     });
     let report = envelope(
         "polyedge-rs research sweep",
         &options.input,
-        "touch_after_250ms,trade_through",
+        "touch_after_250ms,trade_through,queue_proxy_conservative,adverse_selection_penalized,no_maker_fills",
         &options.split,
         start.elapsed(),
         split_warnings,
@@ -1095,19 +1291,43 @@ pub fn run_calibration(options: CalibrationOptions) -> Result<Value, ResearchErr
 
 pub fn run_sample_size(options: SampleSizeOptions) -> Result<Value, ResearchError> {
     let start = Instant::now();
-    let source = read_json_file(&options.results)?;
-    let pnls = extract_market_pnls(&source);
-    let stats = sample_size_stats(&pnls);
+    let source_bytes = fs::read(&options.results)?;
+    let source: Value = serde_json::from_slice(&source_bytes)?;
+    let selected = select_market_pnls(&source, options.fill_model)?;
+    let fill_model = selected.fill_model;
+    let pnls = selected
+        .rows
+        .iter()
+        .map(|(_, pnl)| *pnl)
+        .collect::<Vec<_>>();
+    let mut stats = sample_size_stats(&pnls);
+    stats["iid_descriptive_ci_low"] = stats["ci_low"].clone();
+    stats["iid_descriptive_ci_high"] = stats["ci_high"].clone();
+    let temporal = temporal_market_mean_confidence(&selected.rows);
+    stats["ci_low"] = temporal["ci_low"].clone();
+    stats["ci_high"] = temporal["ci_high"].clone();
+    stats["temporal_confidence"] = temporal;
+    stats["claim_input_eligible"] = json!(selected.eligible);
+    stats["profitability_claim_allowed"] = json!(
+        selected.eligible
+            && stats["ci_low"]
+                .as_str()
+                .is_some_and(|v| decimal_from_str(v) > Decimal::ZERO)
+    );
     let result = json!({
         "results": options.results.to_string_lossy(),
+        "source_report_sha256":sha256_prefixed(&source_bytes),
+        "selected_model_sha256":selected.model_sha256,
+        "profile":selected.profile,
         "sample_unit": "settled_market_net_pnl",
+        "fill_model": fill_model.as_str(),
         "statistics": stats,
-        "profitability_claim_allowed": stats["ci_low"].as_str().is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
+        "profitability_claim_allowed": stats["profitability_claim_allowed"]
     });
     let report = envelope(
         "polyedge-rs research sample-size",
         &options.results,
-        "none",
+        fill_model.as_str(),
         "none",
         start.elapsed(),
         Vec::new(),
@@ -1249,6 +1469,7 @@ struct StreamStats {
     events: usize,
     excluded_events: usize,
     malformed_lines: usize,
+    invalid_timestamps: usize,
     duplicate_estimate: usize,
     warnings: Vec<String>,
     notices: Vec<String>,
@@ -1659,9 +1880,9 @@ fn read_next_pending_event(
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
-        let recorded_ts = parse_datetime(raw.get("recorded_ts"))
-            .or_else(|| parse_datetime(raw.get("ts")))
-            .unwrap_or_else(Utc::now);
+        let Some(recorded_ts) = event_recorded_ts(&raw, stats) else {
+            continue;
+        };
         if is_excluded_ts(recorded_ts, exclude_windows) {
             stats.excluded_events += 1;
             continue;
@@ -1732,9 +1953,9 @@ fn process_event_line<F>(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
-    let recorded_ts = parse_datetime(raw.get("recorded_ts"))
-        .or_else(|| parse_datetime(raw.get("ts")))
-        .unwrap_or_else(Utc::now);
+    let Some(recorded_ts) = event_recorded_ts(&raw, stats) else {
+        return;
+    };
     if is_excluded_ts(recorded_ts, exclude_windows) {
         stats.excluded_events += 1;
         return;
@@ -1761,7 +1982,22 @@ fn process_event_line<F>(
     });
 }
 
+fn event_recorded_ts(raw: &Value, stats: &mut StreamStats) -> Option<DateTime<Utc>> {
+    let timestamp = parse_datetime(raw.get("recorded_ts").or_else(|| raw.get("ts")));
+    if timestamp.is_none() {
+        stats.invalid_timestamps += 1;
+        stats.malformed_lines += 1;
+    }
+    timestamp
+}
+
 fn finalize_stream_stats(stats: &mut StreamStats) {
+    if stats.invalid_timestamps > 0 {
+        stats.warnings.push(format!(
+            "{} records with missing or invalid event timestamps skipped",
+            stats.invalid_timestamps
+        ));
+    }
     if stats.out_of_order_timestamps > 0 {
         stats.warnings.push(format!(
             "{} out-of-order timestamps",
@@ -2059,6 +2295,10 @@ fn insert_exclusion_metadata(
     stream: &StreamStats,
     windows: &[ExcludedTimeWindow],
 ) {
+    object.insert(
+        "invalid_timestamps".to_owned(),
+        json!(stream.invalid_timestamps),
+    );
     object.insert(
         "excluded_event_count".to_owned(),
         json!(stream.excluded_events),
@@ -4370,7 +4610,23 @@ fn validate_strategy_batch(
     if contains_secret_key(input_value) {
         return Err("secret_bearing_pipeline_input");
     }
-    let input = serde_json::from_value::<DecisionPipelineInputV3>(input_value.clone())
+    let mut decode_value = input_value.clone();
+    // Pre-OCI-bridge primary paper inputs lack this transport-only field. It
+    // cannot affect this lane with intent publication disabled. Preserve the
+    // recorded bytes/hashes and permit no other missing or unknown fields.
+    if contract_version == 4
+        && input_value["schema_version"] == 3
+        && input_value.pointer("/settings/deploy/runtime_role") == Some(&json!("primary"))
+        && input_value.pointer("/settings/live/execution_mode") == Some(&json!("paper"))
+        && input_value.pointer("/settings/azure/publish_strategy_canary_intents")
+            == Some(&json!(false))
+        && input_value
+            .pointer("/settings/azure/funded_direct_oci_queue_bridge_url")
+            .is_none()
+    {
+        decode_value["settings"]["azure"]["funded_direct_oci_queue_bridge_url"] = json!("");
+    }
+    let input = serde_json::from_value::<DecisionPipelineInputV3>(decode_value.clone())
         .map_err(|_| "pipeline_input_decode_failed")?;
     let recorded_output = serde_json::from_value::<DecisionPipelineOutputV3>(output_value.clone())
         .map_err(|_| "pipeline_output_decode_failed")?;
@@ -4445,7 +4701,7 @@ fn validate_strategy_batch(
     if serde_json::to_value(&input)
         .map_err(|_| "pipeline_input_roundtrip_failed")?
         .as_object()
-        != input_value.as_object()
+        != decode_value.as_object()
     {
         return Err("pipeline_input_roundtrip_mismatch");
     }
@@ -7402,6 +7658,18 @@ enum StrategyProfileMode {
 }
 
 impl StrategyProfileMode {
+    fn from_config(profile: &str) -> Result<Self, ResearchError> {
+        match profile {
+            "static" => Ok(Self::Static),
+            "dynamic_safety_only" => Ok(Self::DynamicSafetyOnly),
+            "dynamic_quote_style" => Ok(Self::DynamicQuoteStyle),
+            "full_deterministic_profile" => Ok(Self::FullDeterministic),
+            other => Err(ResearchError::InvalidInput(format!(
+                "frozen candidate has unsupported replay profile {other}"
+            ))),
+        }
+    }
+
     fn as_str(&self) -> &'static str {
         match self {
             Self::Static => "static",
@@ -7565,6 +7833,7 @@ struct ReplayOrder {
     side: String,
     price: Decimal,
     size: Decimal,
+    minimum_order_size: Option<Decimal>,
     order_kind: String,
     decision_ts: DateTime<Utc>,
     ttl_ms: Option<i64>,
@@ -7661,6 +7930,194 @@ impl ReplayOrder {
     }
 }
 
+/// An explicit research wallet, shared by every candidate and fill assumption.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayWalletConstraints {
+    campaign_baseline: Decimal,
+    equity_floor: Decimal,
+    maximum_drawdown: Decimal,
+    maximum_order_notional: Decimal,
+    maximum_unresolved_orders_or_positions: usize,
+    simulated_initial_equity: Option<Decimal>,
+    current_equity_policy: Option<ReplayCurrentEquityPolicy>,
+    #[serde(skip)]
+    source_sha256: Option<String>,
+}
+
+impl Default for ReplayWalletConstraints {
+    fn default() -> Self {
+        Self {
+            campaign_baseline: WALLET_CAMPAIGN_BASELINE,
+            equity_floor: WALLET_EQUITY_FLOOR,
+            maximum_drawdown: WALLET_MAX_DRAWDOWN,
+            maximum_order_notional: WALLET_MAX_ORDER_NOTIONAL,
+            maximum_unresolved_orders_or_positions: 1,
+            simulated_initial_equity: None,
+            current_equity_policy: None,
+            source_sha256: None,
+        }
+    }
+}
+
+impl ReplayWalletConstraints {
+    fn load(path: Option<&Path>) -> Result<Self, ResearchError> {
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        let bytes = fs::read(path)?;
+        let mut wallet: Self = serde_json::from_slice(&bytes)?;
+        if wallet.campaign_baseline <= Decimal::ZERO
+            || wallet.equity_floor < Decimal::ZERO
+            || wallet.equity_floor >= wallet.campaign_baseline
+            || wallet.maximum_drawdown <= Decimal::ZERO
+            || wallet.maximum_order_notional <= Decimal::ZERO
+            || wallet.maximum_unresolved_orders_or_positions != 1
+            || wallet.maximum_drawdown > wallet.campaign_baseline - wallet.equity_floor
+            || wallet.simulated_initial_equity.is_some() != wallet.current_equity_policy.is_some()
+            || wallet
+                .simulated_initial_equity
+                .is_some_and(|equity| equity <= Decimal::ZERO || equity.scale() > 6)
+            || wallet
+                .current_equity_policy
+                .as_ref()
+                .is_some_and(|policy| !policy.valid())
+            || (wallet.current_equity_policy.is_some()
+                && [
+                    wallet.campaign_baseline,
+                    wallet.equity_floor,
+                    wallet.maximum_drawdown,
+                    wallet.maximum_order_notional,
+                ]
+                .iter()
+                .any(|value| value.scale() > 6))
+        {
+            return Err(ResearchError::InvalidInput(
+                "wallet config requires positive baseline/drawdown/order limit, a nonnegative floor below baseline, and exactly one unresolved order or position".to_owned(),
+            ));
+        }
+        wallet.source_sha256 = Some(sha256_prefixed(&bytes));
+        Ok(wallet)
+    }
+
+    fn as_json(&self) -> Value {
+        let mut value = json!({
+            "campaign_baseline": self.campaign_baseline.to_string(),
+            "equity_floor": self.equity_floor.to_string(),
+            "maximum_drawdown": self.maximum_drawdown.to_string(),
+            "maximum_order_notional": self.maximum_order_notional.to_string(),
+            "maximum_unresolved_orders_or_positions": self.maximum_unresolved_orders_or_positions,
+            "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
+        });
+        if let Some(policy) = &self.current_equity_policy {
+            value["simulated_initial_equity"] = json!(self.initial_equity().to_string());
+            value["current_equity_policy"] = json!(policy);
+            value["fee_basis"] = json!("configured_funded_contract_not_observed_historical_market");
+        }
+        value
+    }
+
+    fn initial_equity(&self) -> Decimal {
+        self.simulated_initial_equity
+            .unwrap_or(self.campaign_baseline)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayCurrentEquityPolicy {
+    reserve_ratio: Decimal,
+    minimum_reserve: Decimal,
+    target_order_ratio: Decimal,
+    operating_buffer_ratio: Decimal,
+    minimum_order_notional: Decimal,
+    fee_rate: Decimal,
+    fee_exponent: u32,
+}
+
+impl ReplayCurrentEquityPolicy {
+    fn valid(&self) -> bool {
+        self.reserve_ratio > Decimal::ZERO
+            && self.reserve_ratio < Decimal::ONE
+            && self.target_order_ratio > Decimal::ZERO
+            && self.target_order_ratio < Decimal::ONE
+            && self.operating_buffer_ratio >= Decimal::ZERO
+            && self.operating_buffer_ratio < Decimal::ONE
+            && self.minimum_reserve >= Decimal::ZERO
+            && self.minimum_order_notional >= Decimal::ONE
+            && self.minimum_reserve.scale() <= 6
+            && self.minimum_order_notional.scale() <= 6
+            && self.fee_rate >= Decimal::ZERO
+            && self.fee_rate <= Decimal::ONE
+            && self.fee_exponent <= 10
+    }
+
+    fn fee_per_share(&self, price: Decimal) -> Decimal {
+        self.fee_rate
+            * (0..self.fee_exponent).fold(Decimal::ONE, |product, _| {
+                product * price * (Decimal::ONE - price)
+            })
+    }
+
+    // Keep admission in parity with venue-probe sizeProtectedOrder. The policy
+    // recomputes its reserve after reconciliation; peak equity is diagnostic only.
+    fn size(
+        &self,
+        equity: Decimal,
+        order: &ReplayOrder,
+        fee: Decimal,
+        maximum_notional: Decimal,
+    ) -> Result<Decimal, &'static str> {
+        let venue_minimum = order
+            .minimum_order_size
+            .filter(|minimum| *minimum > Decimal::ZERO)
+            .ok_or("missing_decision_time_venue_minimum")?;
+        if order.price >= Decimal::ONE {
+            return Err("invalid_or_unsupported_order");
+        }
+        let reserve = wallet_money(self.minimum_reserve.max(equity * self.reserve_ratio));
+        let buffer = wallet_money(equity * self.operating_buffer_ratio);
+        let operable = wallet_money((equity - reserve - buffer).max(Decimal::ZERO));
+        if equity <= reserve + self.minimum_order_notional {
+            return Err("protected_reserve_order_floor_reached");
+        }
+        let minimum_shares = venue_minimum
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity)
+            .max(
+                (self.minimum_order_notional / order.price)
+                    .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToPositiveInfinity),
+            );
+        let budget = (minimum_shares * (order.price + fee))
+            .max(equity * self.target_order_ratio)
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToPositiveInfinity);
+        let shares = order
+            .size
+            .min(maximum_notional / order.price)
+            .min(operable / (order.price + fee))
+            .min(budget / (order.price + fee))
+            .round_dp_with_strategy(2, rust_decimal::RoundingStrategy::ToNegativeInfinity);
+        let notional = wallet_money(shares * order.price);
+        let reserved = wallet_money(notional + wallet_money(shares * fee));
+        if shares < venue_minimum {
+            return Err("protected_order_below_venue_minimum");
+        }
+        if notional < self.minimum_order_notional {
+            return Err("protected_order_below_policy_minimum");
+        }
+        if shares > order.size || notional > order.size * order.price + Decimal::new(1, 9) {
+            return Err("protected_order_exceeds_source_intent");
+        }
+        if reserved > operable {
+            return Err("operable_capital_exceeded");
+        }
+        Ok(shares)
+    }
+}
+
+fn wallet_money(value: Decimal) -> Decimal {
+    value.round_dp_with_strategy(6, rust_decimal::RoundingStrategy::MidpointAwayFromZero)
+}
+
 #[derive(Clone, Debug)]
 struct WalletPendingOrder {
     market_id: String,
@@ -7675,6 +8132,7 @@ struct WalletPendingOrder {
 
 #[derive(Clone, Debug)]
 struct WalletConstrainedResult {
+    constraints: ReplayWalletConstraints,
     net_pnl: Decimal,
     ending_equity: Decimal,
     max_drawdown: Decimal,
@@ -7688,7 +8146,7 @@ struct WalletConstrainedResult {
 
 impl WalletConstrainedResult {
     fn as_json(&self) -> Value {
-        json!({
+        let mut value = json!({
             "wallet_constrained": true,
             "wallet_constrained_net_pnl": self.net_pnl.to_string(),
             "wallet_constrained_ending_equity": self.ending_equity.to_string(),
@@ -7699,15 +8157,17 @@ impl WalletConstrainedResult {
             "wallet_constrained_unresolved_orders": self.unresolved_orders,
             "wallet_constrained_skip_reasons": self.skip_reasons,
             "wallet_constrained_equity_curve": self.equity_curve,
-            "wallet_constraints": {
-                "campaign_baseline": WALLET_CAMPAIGN_BASELINE.to_string(),
-                "equity_floor": WALLET_EQUITY_FLOOR.to_string(),
-                "maximum_drawdown": WALLET_MAX_DRAWDOWN.to_string(),
-                "maximum_order_notional": WALLET_MAX_ORDER_NOTIONAL.to_string(),
-                "maximum_unresolved_orders_or_positions": 1,
-                "capital_reuse": "only_after_market_settlement_or_unfilled_order_release"
-            }
-        })
+            "wallet_constraints": self.constraints.as_json()
+        });
+        if self.constraints.current_equity_policy.is_some() {
+            value["wallet_constrained_campaign_net_pnl"] =
+                json!((self.ending_equity - self.constraints.campaign_baseline).to_string());
+            value["wallet_constrained_campaign_drawdown"] =
+                json!((self.constraints.campaign_baseline - self.ending_equity)
+                    .max(Decimal::ZERO)
+                    .to_string());
+        }
+        value
     }
 }
 
@@ -7715,6 +8175,7 @@ fn wallet_constrained_replay(
     orders: &[ReplayOrder],
     markets: &BTreeMap<String, MarketTruth>,
     fill_model: FillModel,
+    constraints: &ReplayWalletConstraints,
 ) -> WalletConstrainedResult {
     let mut ordered = orders.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by(|(left_index, left), (right_index, right)| {
@@ -7723,7 +8184,7 @@ fn wallet_constrained_replay(
             .then(left_index.cmp(right_index))
     });
 
-    let mut equity = WALLET_CAMPAIGN_BASELINE;
+    let mut equity = constraints.initial_equity();
     let mut peak_equity = equity;
     let mut max_drawdown = Decimal::ZERO;
     let mut accepted_orders = 0_usize;
@@ -7739,6 +8200,10 @@ fn wallet_constrained_replay(
         "net_pnl": "0",
         "drawdown": "0"
     })];
+    if constraints.current_equity_policy.is_some() {
+        equity_curve[0]["campaign_net_pnl"] =
+            json!((equity - constraints.campaign_baseline).to_string());
+    }
 
     for (_, order) in ordered {
         settle_wallet_pending(
@@ -7749,6 +8214,7 @@ fn wallet_constrained_replay(
             &mut peak_equity,
             &mut max_drawdown,
             &mut equity_curve,
+            constraints,
         );
         if pending.is_some() {
             increment_count(
@@ -7766,7 +8232,10 @@ fn wallet_constrained_replay(
 
         // Size from facts available at decision time only. In particular, neither
         // the eventual fill quantity nor the winning outcome may affect admission.
-        let fee_bound_per_share = if order.is_maker() {
+        let fee_bound_per_share = if let Some(policy) = &constraints.current_equity_policy {
+            // The funded signer reserves the taker fee bound even for post-only orders.
+            policy.fee_per_share(order.price)
+        } else if order.is_maker() {
             Decimal::ZERO
         } else {
             crypto_taker_fee_per_share(order.price).unwrap_or(Decimal::ZERO)
@@ -7777,18 +8246,36 @@ fn wallet_constrained_replay(
             Decimal::ZERO
         };
         let worst_loss_per_share = order.price + fee_bound_per_share + penalty_bound_per_share;
-        let drawdown_floor = (peak_equity - WALLET_MAX_DRAWDOWN).max(WALLET_EQUITY_FLOOR);
-        let loss_budget = equity - drawdown_floor;
-        if loss_budget <= Decimal::ZERO || worst_loss_per_share <= Decimal::ZERO {
-            increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
-            skipped_orders += 1;
-            continue;
-        }
-        let accepted_size = order
-            .size
-            .min(WALLET_MAX_ORDER_NOTIONAL / order.price)
-            .min(equity / order.price)
-            .min(loss_budget / worst_loss_per_share);
+        let accepted_size = if let Some(policy) = &constraints.current_equity_policy {
+            match policy.size(
+                equity,
+                order,
+                fee_bound_per_share,
+                constraints.maximum_order_notional,
+            ) {
+                Ok(size) => size,
+                Err(reason) => {
+                    increment_count(&mut skip_reasons, reason);
+                    skipped_orders += 1;
+                    continue;
+                }
+            }
+        } else {
+            let drawdown_floor =
+                (peak_equity - constraints.maximum_drawdown).max(constraints.equity_floor);
+            let loss_budget = equity - drawdown_floor;
+            if loss_budget <= Decimal::ZERO || worst_loss_per_share <= Decimal::ZERO {
+                increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
+                skipped_orders += 1;
+                continue;
+            }
+            let accepted_size = order
+                .size
+                .min(constraints.maximum_order_notional / order.price)
+                .min(equity / order.price)
+                .min(loss_budget / worst_loss_per_share);
+            accepted_size
+        };
         if accepted_size <= Decimal::ZERO {
             increment_count(&mut skip_reasons, "insufficient_equity_or_drawdown_budget");
             skipped_orders += 1;
@@ -7800,7 +8287,13 @@ fn wallet_constrained_replay(
         if constrained_fill > Decimal::ZERO {
             accepted_filled_orders += 1;
         }
-        let fee_per_share = if order.filled_size > Decimal::ZERO {
+        let fee_per_share = if let Some(policy) = &constraints.current_equity_policy {
+            if order.is_maker() {
+                Decimal::ZERO
+            } else {
+                policy.fee_per_share(order.avg_price.unwrap_or(order.price))
+            }
+        } else if order.filled_size > Decimal::ZERO {
             order.fee / order.filled_size
         } else {
             Decimal::ZERO
@@ -7848,11 +8341,13 @@ fn wallet_constrained_replay(
             &mut peak_equity,
             &mut max_drawdown,
             &mut equity_curve,
+            constraints,
         );
     }
 
     WalletConstrainedResult {
-        net_pnl: equity - WALLET_CAMPAIGN_BASELINE,
+        constraints: constraints.clone(),
+        net_pnl: equity - constraints.initial_equity(),
         ending_equity: equity,
         max_drawdown,
         accepted_orders,
@@ -7873,6 +8368,7 @@ fn settle_wallet_pending(
     peak_equity: &mut Decimal,
     max_drawdown: &mut Decimal,
     equity_curve: &mut Vec<Value>,
+    constraints: &ReplayWalletConstraints,
 ) {
     let Some(order) = pending.as_ref() else {
         return;
@@ -7901,6 +8397,9 @@ fn settle_wallet_pending(
         Decimal::ZERO
     };
     *equity += pnl;
+    if constraints.current_equity_policy.is_some() {
+        *equity = wallet_money(*equity);
+    }
     *peak_equity = (*peak_equity).max(*equity);
     let drawdown = *peak_equity - *equity;
     *max_drawdown = (*max_drawdown).max(drawdown);
@@ -7909,9 +8408,13 @@ fn settle_wallet_pending(
         "event": if order.filled_size > Decimal::ZERO { "market_settlement" } else { "unfilled_order_release" },
         "market_id": order.market_id,
         "equity": equity.to_string(),
-        "net_pnl": (*equity - WALLET_CAMPAIGN_BASELINE).to_string(),
+        "net_pnl": (*equity - constraints.initial_equity()).to_string(),
         "drawdown": drawdown.to_string()
     }));
+    if constraints.current_equity_policy.is_some() {
+        equity_curve.last_mut().unwrap()["campaign_net_pnl"] =
+            json!((*equity - constraints.campaign_baseline).to_string());
+    }
 }
 
 fn increment_count(counts: &mut BTreeMap<String, usize>, key: &str) {
@@ -7938,6 +8441,7 @@ struct QueueMarketEvidence {
 struct ResearchReplayEngine {
     request: ReplayRequest,
     markets: BTreeMap<String, MarketTruth>,
+    observed_minimum_order_sizes: BTreeMap<String, Decimal>,
     token_to_market: BTreeMap<String, (String, String)>,
     books: BTreeMap<String, OrderBookState>,
     fair_values: BTreeMap<String, Value>,
@@ -8007,6 +8511,7 @@ impl ResearchReplayEngine {
                 policy: RegimePolicy::new(request.settings.strategy.clone()),
                 request,
                 markets,
+                observed_minimum_order_sizes: BTreeMap::new(),
                 token_to_market,
                 books: BTreeMap::new(),
                 fair_values: BTreeMap::new(),
@@ -8049,6 +8554,7 @@ impl ResearchReplayEngine {
                 policy: RegimePolicy::new(request.settings.strategy.clone()),
                 request,
                 markets,
+                observed_minimum_order_sizes: BTreeMap::new(),
                 token_to_market,
                 books: BTreeMap::new(),
                 fair_values: BTreeMap::new(),
@@ -8169,6 +8675,12 @@ impl ResearchReplayEngine {
         let market = market_from_payload(payload);
         if market.market_id.is_empty() {
             return;
+        }
+        // Never initialize venue rules from preloaded final market truth.
+        self.observed_minimum_order_sizes.remove(&market.market_id);
+        if let Some(minimum) = decimal(payload.get("minimum_order_size")) {
+            self.observed_minimum_order_sizes
+                .insert(market.market_id.clone(), minimum);
         }
         if !market.up_token_id.is_empty() {
             self.token_to_market.insert(
@@ -8889,6 +9401,7 @@ impl ResearchReplayEngine {
             order_id: None,
             applied_order_id: None,
             queue_snapshot_bound: false,
+            minimum_order_size: self.observed_minimum_order_sizes.get(&market_id).copied(),
             market_id,
             token_id,
             outcome: text(payload, "outcome"),
@@ -8905,9 +9418,7 @@ impl ResearchReplayEngine {
             fee: Decimal::ZERO,
             adverse_penalty: Decimal::ZERO,
             fill_ts: None,
-            fill_ref_price: self
-                .latest_reference_at(recorded_ts)
-                .map(|reference| reference.price),
+            fill_ref_price: None,
             adverse_checked: false,
             cancel_ts: None,
             queue_initial_size_ahead: None,
@@ -9173,6 +9684,10 @@ impl ResearchReplayEngine {
         let applied_fill_size = fill_size.min(remaining);
         let fill_ref_price = self
             .latest_reference_at(fill_ts)
+            .filter(|reference| {
+                !reference.stale
+                    && fill_ts.signed_duration_since(reference.ts) <= Duration::seconds(5)
+            })
             .map(|reference| reference.price);
         let order = &mut self.orders[index];
         let previous_filled = order.filled_size;
@@ -9185,7 +9700,7 @@ impl ResearchReplayEngine {
         });
         order.filled_size = new_filled.min(order.size);
         order.fill_ts = order.fill_ts.or(Some(fill_ts));
-        order.fill_ref_price = order.fill_ref_price.or(fill_ref_price);
+        order.fill_ref_price = fill_ref_price;
         if maker {
             self.maker_fills += 1;
         } else {
@@ -9208,7 +9723,7 @@ impl ResearchReplayEngine {
     }
 
     fn apply_adverse_penalties(&mut self, reference: &ReferencePoint) {
-        if self.request.fill_model != FillModel::AdverseSelectionPenalized {
+        if self.request.fill_model != FillModel::AdverseSelectionPenalized || reference.stale {
             return;
         }
         for order in &mut self.orders {
@@ -9218,11 +9733,10 @@ impl ResearchReplayEngine {
             let Some(fill_ts) = order.fill_ts else {
                 continue;
             };
-            if reference.ts < fill_ts || reference.ts > fill_ts + Duration::seconds(5) {
+            if reference.ts <= fill_ts || reference.ts > fill_ts + Duration::seconds(5) {
                 continue;
             }
             let Some(fill_ref) = order.fill_ref_price else {
-                order.adverse_checked = true;
                 continue;
             };
             let adverse = (order.outcome == "up" && reference.price < fill_ref)
@@ -9260,7 +9774,18 @@ impl ResearchReplayEngine {
             .find(|reference| reference.ts <= now)
     }
 
-    fn finish(mut self) -> Value {
+    fn finish(mut self, wallet_constraints: &ReplayWalletConstraints) -> Value {
+        let adverse_missing = if self.request.fill_model == FillModel::AdverseSelectionPenalized {
+            self.orders
+                .iter()
+                .filter(|o| o.is_filled() && (!o.adverse_checked || o.fill_ref_price.is_none()))
+                .count()
+        } else {
+            0
+        };
+        if adverse_missing > 0 {
+            self.warnings.insert(format!("{adverse_missing} filled orders lack post-fill adverse-selection reference evidence"));
+        }
         let actionable_decision_outputs = self.pending_actionable_decisions.len();
         let applied_decision_outputs = self.applied_actionable_decisions.len();
         let unbound_actionable_decision_outputs =
@@ -9278,8 +9803,12 @@ impl ResearchReplayEngine {
         for market in self.markets.values_mut() {
             market.finalize_flags();
         }
-        let wallet =
-            wallet_constrained_replay(&self.orders, &self.markets, self.request.fill_model);
+        let wallet = wallet_constrained_replay(
+            &self.orders,
+            &self.markets,
+            self.request.fill_model,
+            wallet_constraints,
+        );
         let wallet_json = wallet.as_json();
         let queue_eligible_market_ids = self
             .queue_market_evidence
@@ -9434,6 +9963,7 @@ impl ResearchReplayEngine {
             "fills": self.fills,
             "maker_fills": self.maker_fills,
             "taker_fills": self.taker_fills,
+            "adverse_selection_pnl_eligible": self.request.fill_model == FillModel::AdverseSelectionPenalized && adverse_missing == 0,
             "fill_rate": ratio_usize(self.fills, self.orders_seen),
             "cancels": self.cancels,
             "cancel_fill_ratio": ratio_usize(self.cancels, self.fills),
@@ -9487,6 +10017,7 @@ fn run_replay_requests(
     markets: &[MarketTruth],
     requests: Vec<ReplayRequest>,
     exclude_windows: &[ExcludedTimeWindow],
+    wallet: &ReplayWalletConstraints,
 ) -> Result<Vec<Value>, ResearchError> {
     let mut engines = requests
         .into_iter()
@@ -9505,6 +10036,17 @@ fn run_replay_requests(
     let queue_input_binding = replay_queue_input_binding(input, &stream)?;
     let mut results = Vec::new();
     for mut engine in engines {
+        if wallet.current_equity_policy.is_some()
+            && engine.orders.iter().any(|order| {
+                order
+                    .minimum_order_size
+                    .is_none_or(|minimum| minimum <= Decimal::ZERO)
+            })
+        {
+            return Err(ResearchError::InvalidInput(
+                "current-equity replay requires a positive decision-time venue minimum for every order".to_owned()
+            ));
+        }
         if stream.malformed_lines > 0 {
             engine.warnings.insert(format!(
                 "{} malformed lines skipped",
@@ -9519,7 +10061,10 @@ fn run_replay_requests(
                 engine.warnings.insert(text.to_owned());
             }
         }
-        let mut result = engine.finish();
+        let mut result = engine.finish(wallet);
+        if let Some(hash) = &wallet.source_sha256 {
+            result["wallet_config_sha256"] = json!(hash);
+        }
         if let Some(object) = result.as_object_mut() {
             insert_exclusion_metadata(object, &stream, exclude_windows);
             if let Some(queue) = object
@@ -9814,6 +10359,114 @@ fn calibration_group_json(groups: &BTreeMap<String, BTreeMap<String, Calibration
     Value::Object(output)
 }
 
+fn holdout_inventory_identity(input: &Path) -> Result<String, ResearchError> {
+    let manifest: Value = read_json_file(&input.join("events_manifest.json"))?;
+    let inventory: RawSourceInventory =
+        serde_json::from_value(manifest["raw_source_inventory"].clone())?;
+    validate_raw_source_inventory(&inventory)?;
+    if !inventory.canonical.exhaustive_listing || inventory.canonical.blobs.is_empty() {
+        return Err(ResearchError::InvalidInput(
+            "holdout requires exhaustive immutable source bindings".to_owned(),
+        ));
+    }
+    let hashes = inventory
+        .canonical
+        .blobs
+        .iter()
+        .map(|b| b.sha256.clone())
+        .collect::<BTreeSet<_>>();
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&hashes)?)
+    ))
+}
+
+fn claim_holdout_once(root: &Path, id: &str, receipt: &Value) -> Result<(), ResearchError> {
+    fs::create_dir_all(root)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(root.join(format!("{id}.json")))?;
+    file.write_all(&serde_json::to_vec_pretty(receipt)?)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn sweep_fill_models() -> [FillModel; 5] {
+    [
+        FillModel::TouchAfter250Ms,
+        FillModel::TradeThrough,
+        FillModel::QueueProxyConservative,
+        FillModel::AdverseSelectionPenalized,
+        FillModel::NoMakerFills,
+    ]
+}
+
+fn conservative_sweep_model(value: &Value) -> bool {
+    matches!(
+        value.as_str(),
+        Some("trade_through" | "queue_proxy_conservative" | "adverse_selection_penalized")
+    )
+}
+
+fn sweep_replay_requests(
+    candidates: &[SweepCandidate],
+    settings: &RuntimeSettings,
+) -> Vec<ReplayRequest> {
+    candidates
+        .iter()
+        .flat_map(|candidate| {
+            sweep_fill_models().map(|fill_model| ReplayRequest {
+                name: format!("{}__{}", candidate.name, fill_model.as_str()),
+                fill_model,
+                mode: StrategyProfileMode::StaticSweep(candidate.clone()),
+                settings: settings.clone(),
+            })
+        })
+        .collect()
+}
+
+fn validate_sweep_holdout(selection: &[Value], test: &[Value]) -> Result<(), ResearchError> {
+    let rows = |results: &[Value]| {
+        results
+            .first()
+            .and_then(|r| r["market_results"].as_array())
+            .cloned()
+            .unwrap_or_default()
+    };
+    let selected_rows = rows(selection);
+    let test_rows = rows(test);
+    if selected_rows.is_empty() || test_rows.is_empty() {
+        return Err(ResearchError::InvalidInput(
+            "selection and holdout require market lifecycle evidence".to_owned(),
+        ));
+    }
+    let ids = selected_rows
+        .iter()
+        .filter_map(|r| r["market_id"].as_str())
+        .collect::<BTreeSet<_>>();
+    let selection_end = selected_rows
+        .iter()
+        .map(|r| parse_datetime(r.get("end_ts")))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|dates| dates.into_iter().max());
+    let test_start = test_rows
+        .iter()
+        .map(|r| parse_datetime(r.get("start_ts")))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|dates| dates.into_iter().min());
+    if test_rows
+        .iter()
+        .any(|r| r["market_id"].as_str().is_none_or(|id| ids.contains(id)))
+        || !selection_end
+            .zip(test_start)
+            .is_some_and(|(end, start)| end < start)
+    {
+        return Err(ResearchError::InvalidInput("holdout overlaps selection markets or is not strictly later than every selection lifecycle".to_owned()));
+    }
+    Ok(())
+}
+
 fn group_sweep_results(results: Vec<Value>) -> BTreeMap<String, Vec<Value>> {
     let mut by_candidate = BTreeMap::<String, Vec<Value>>::new();
     for result in results {
@@ -9830,66 +10483,20 @@ fn group_sweep_results(results: Vec<Value>) -> BTreeMap<String, Vec<Value>> {
 
 fn split_plan(results: &[Value], split_method: &str) -> (Value, Vec<Value>) {
     let days = sweep_market_days(results);
-    let mut warnings = Vec::new();
-    if days.len() < 3 {
-        warnings.push(json!(
-            "fewer than three market days available; split metrics are informational only"
-        ));
-    }
-    let walk_forward_folds = if days.len() >= 3 {
-        (1..days.len() - 1)
-            .map(|validation_index| {
-                json!({
-                    "train_days": days[..validation_index].to_vec(),
-                    "validation_day": days[validation_index],
-                    "test_day": days[validation_index + 1]
-                })
-            })
-            .collect::<Vec<_>>()
+    let folds = (1..days.len())
+        .map(|i| json!({"train_days":days[..i], "validation_day":days[i]}))
+        .collect::<Vec<_>>();
+    let warnings = if days.len() < 2 {
+        vec![json!(
+            "fewer than two market days available; validation selection unavailable"
+        )]
     } else {
         Vec::new()
     };
-    let leave_one_day_out_folds = days
-        .iter()
-        .map(|test_day| {
-            json!({
-                "train_days": days.iter().filter(|day| *day != test_day).cloned().collect::<Vec<_>>(),
-                "test_day": test_day
-            })
-        })
-        .collect::<Vec<_>>();
-    let latest_walk_forward = walk_forward_folds.last().cloned().unwrap_or_else(|| {
-        json!({
-            "train_days": days.iter().take(days.len().saturating_sub(2)).cloned().collect::<Vec<_>>(),
-            "validation_day": days.get(days.len().saturating_sub(2)).cloned(),
-            "test_day": days.last().cloned()
-        })
-    });
-    let selected = if split_method.eq_ignore_ascii_case("leave_one_day_out") {
-        json!({
-            "method": "leave_one_day_out",
-            "folds": leave_one_day_out_folds,
-            "selection_rule": "summarize held-out day stability; do not tune on held-out days"
-        })
-    } else {
-        json!({
-            "method": "walk_forward",
-            "folds": walk_forward_folds,
-            "selection_rule": "rank on validation only; report next day as test"
-        })
-    };
     (
-        json!({
-            "requested_method": split_method,
-            "market_days": days,
-            "latest_walk_forward": latest_walk_forward,
-            "walk_forward": selected,
-            "leave_one_day_out": {
-                "folds": leave_one_day_out_folds,
-                "selection_rule": "summarize held-out day stability; do not tune on held-out days"
-            },
-            "no_future_leakage_rule": "training days must be strictly earlier than validation/test days"
-        }),
+        json!({"requested_method":split_method, "market_days":days, "scope":"selection_input_only",
+        "latest_walk_forward":folds.last(), "walk_forward":{"method":"walk_forward", "folds":folds},
+        "no_future_leakage_rule":"Holdout events and market truth must be separate inputs and are read only after the winner is fixed."}),
         warnings,
     )
 }
@@ -9925,10 +10532,6 @@ fn build_sweep_evidence(
         .as_str()
         .map(|day| vec![day.to_owned()])
         .unwrap_or_default();
-    let final_test_days = latest["test_day"]
-        .as_str()
-        .map(|day| vec![day.to_owned()])
-        .unwrap_or_default();
 
     let mut evidence = candidates
         .iter()
@@ -9940,22 +10543,38 @@ fn build_sweep_evidence(
                 .collect::<Vec<_>>();
             let pnls = validation_models
                 .iter()
+                .filter(|row| conservative_sweep_model(&row["fill_model"]))
                 .filter_map(|row| row["net_pnl"].as_str().map(decimal_from_str))
                 .collect::<Vec<_>>();
             let minimum_validation_pnl = pnls.iter().copied().min().unwrap_or_default();
             let total_validation_pnl = pnls.iter().copied().sum();
-            let validation_net_positive = validation_models.len() == 2
-                && validation_models.iter().all(|row| {
-                    row["net_pnl"]
-                        .as_str()
-                        .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
-                });
-            let validation_block_bound_positive = validation_models.len() == 2
-                && validation_models.iter().all(|row| {
-                    row["block_confidence_lower_95"]
-                        .as_str()
-                        .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
-                });
+            let validation_net_positive = validation_models
+                .iter()
+                .filter(|r| conservative_sweep_model(&r["fill_model"]))
+                .count()
+                == 3
+                && validation_models
+                    .iter()
+                    .filter(|r| conservative_sweep_model(&r["fill_model"]))
+                    .all(|row| {
+                        row["pnl_eligible"] == true
+                            && row["net_pnl"]
+                                .as_str()
+                                .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
+                    });
+            let validation_block_bound_positive = validation_models
+                .iter()
+                .filter(|r| conservative_sweep_model(&r["fill_model"]))
+                .count()
+                == 3
+                && validation_models
+                    .iter()
+                    .filter(|r| conservative_sweep_model(&r["fill_model"]))
+                    .all(|row| {
+                        row["block_confidence_lower_95"]
+                            .as_str()
+                            .is_some_and(|value| decimal_from_str(value) > Decimal::ZERO)
+                    });
             let validation_folds = folds
                 .iter()
                 .enumerate()
@@ -9996,16 +10615,6 @@ fn build_sweep_evidence(
     let selected_name = (!validation_days.is_empty())
         .then(|| evidence.first().map(|row| row.candidate.name.clone()))
         .flatten();
-    let selected_test = selected_name
-        .as_ref()
-        .and_then(|name| grouped.get(name))
-        .map(|rows| sealed_test_evidence(rows, &final_test_days));
-    let test_non_collapsing = selected_test
-        .as_ref()
-        .is_some_and(sealed_test_non_collapsing);
-    let selected_robust = evidence.first().is_some_and(|row| {
-        row.validation_net_positive && row.validation_block_bound_positive && test_non_collapsing
-    });
 
     let candidate_rows = evidence
         .iter()
@@ -10020,14 +10629,9 @@ fn build_sweep_evidence(
                 .iter()
                 .zip(row.validation_models.iter())
                 .map(|(source, validation)| {
-                    let test = if selected {
-                        market_split_stats(source, &final_test_days)
-                    } else {
-                        json!({"status": "sealed_not_selected", "opened": false})
-                    };
                     json!({
                         "fill_model": source["fill_model"],
-                        "evidence_scope": "validation_only_except_fixed_winner_test",
+                        "evidence_scope": "selection_input_only",
                         "markets": validation["markets"],
                         "net_pnl": validation["net_pnl"],
                         "profitable_markets": validation["profitable_markets"],
@@ -10036,7 +10640,7 @@ fn build_sweep_evidence(
                         "split_performance": {
                             "train": market_split_stats(source, &latest_train_days),
                             "validation": market_split_stats(source, &latest_validation_days),
-                            "test": test
+                            "test": {"status":"not_evaluated", "opened":false}
                         }
                     })
                 })
@@ -10046,18 +10650,18 @@ fn build_sweep_evidence(
                 "parameters": row.candidate.parameters_json(),
                 "validation_rank": index + 1,
                 "selected": selected,
-                "robust_candidate": selected && selected_robust,
+                "robust_candidate": false,
                 "validation_minimum_fill_model_net_pnl": row.minimum_validation_pnl.to_string(),
                 "validation_total_fill_model_net_pnl": row.total_validation_pnl.to_string(),
-                "validation_net_positive_under_both_models": row.validation_net_positive,
-                "validation_block_bound_positive_under_both_models": row.validation_block_bound_positive,
+                "validation_net_positive_under_conservative_models": row.validation_net_positive,
+                "validation_block_bound_positive_under_conservative_models": row.validation_block_bound_positive,
                 "validation_folds": row.validation_folds,
                 "fill_model_results": compatible_models,
-                "sealed_test": if selected { selected_test.clone().unwrap_or(Value::Null) } else { Value::Null }
+                "sealed_test": null
             })
         })
         .collect::<Vec<_>>();
-    let fold_results = build_fold_results(grouped, candidates, &folds, selected_name.as_deref());
+    let fold_results = folds;
     let selection = selected_name.map_or_else(
         || {
             json!({
@@ -10069,11 +10673,11 @@ fn build_sweep_evidence(
         },
         |candidate| {
             json!({
-                "status": "winner_fixed_before_test_open",
+                "status": "validation_winner_fixed_test_not_evaluated",
                 "candidate": candidate,
                 "selection_source": "chronological_validation_days_only",
-                "robust_candidate": selected_robust,
-                "sealed_test": selected_test,
+                "robust_candidate": false,
+                "sealed_test": null,
             })
         },
     );
@@ -10081,13 +10685,51 @@ fn build_sweep_evidence(
 }
 
 fn rank_sweep_candidates(rows: &mut [SweepCandidateEvidence]) {
-    rows.sort_by(|left, right| {
-        right
-            .minimum_validation_pnl
-            .cmp(&left.minimum_validation_pnl)
-            .then(right.total_validation_pnl.cmp(&left.total_validation_pnl))
-            .then(left.candidate.name.cmp(&right.candidate.name))
+    rows.sort_by(|a, b| {
+        b.validation_net_positive
+            .cmp(&a.validation_net_positive)
+            .then(
+                b.validation_block_bound_positive
+                    .cmp(&a.validation_block_bound_positive),
+            )
+            .then(b.minimum_validation_pnl.cmp(&a.minimum_validation_pnl))
+            .then(b.total_validation_pnl.cmp(&a.total_validation_pnl))
+            .then(a.candidate.name.cmp(&b.candidate.name))
     });
+}
+
+fn sweep_pnl_eligible(result: &Value) -> bool {
+    result["warnings"].as_array().is_some_and(Vec::is_empty)
+        && result["wallet_constrained_unresolved_orders"] == 0
+        && result["wallet_constrained_equity_curve"]
+            .as_array()
+            .is_some_and(|curve| !curve.is_empty())
+        && (result["wallet_constraints"]["current_equity_policy"].is_object()
+            || (result["wallet_constrained_max_drawdown"]
+                .as_str()
+                .and_then(|v| v.parse::<Decimal>().ok())
+                .is_some_and(|dd| {
+                    result["wallet_constraints"]["maximum_drawdown"]
+                        .as_str()
+                        .and_then(|v| v.parse::<Decimal>().ok())
+                        .is_some_and(|limit| dd <= limit)
+                })
+                && result["wallet_constrained_ending_equity"]
+                    .as_str()
+                    .and_then(|v| v.parse::<Decimal>().ok())
+                    .is_some_and(|eq| {
+                        result["wallet_constraints"]["equity_floor"]
+                            .as_str()
+                            .and_then(|v| v.parse::<Decimal>().ok())
+                            .is_some_and(|floor| eq >= floor)
+                    })))
+        && result["market_results"].as_array().is_some_and(|rows| {
+            !rows.is_empty() && rows.iter().all(|r| r["complete_for_simulation"] == true)
+        })
+        && (result["fill_model"] != "queue_proxy_conservative"
+            || result["queue_proxy_pnl_eligible"] == true)
+        && (result["fill_model"] != "adverse_selection_penalized"
+            || result["adverse_selection_pnl_eligible"] == true)
 }
 
 fn validation_model_evidence(result: &Value, days: &[String]) -> Value {
@@ -10099,6 +10741,7 @@ fn validation_model_evidence(result: &Value, days: &[String]) -> Value {
         .collect::<Vec<_>>();
     json!({
         "fill_model": result["fill_model"],
+        "pnl_eligible": sweep_pnl_eligible(result),
         "days": days,
         "markets": stats["markets"],
         "net_pnl": stats["net_pnl"],
@@ -10106,11 +10749,35 @@ fn validation_model_evidence(result: &Value, days: &[String]) -> Value {
         "losing_markets": stats["losing_markets"],
         "daily_pnl": daily,
         "block_confidence_method": "seven_day_circular_block_bootstrap_10000_resamples_minimum_28_daily_clusters",
-        "block_confidence_lower_95": sweep_block_bootstrap_daily_lower_95(&values).map(|value| value.to_string())
+        "pnl_basis":"paper_wallet_settlement_deltas",
+        "block_confidence_lower_95": consecutive_market_days(days).then(||sweep_block_bootstrap_daily_lower_95(&values)).flatten().map(|value| value.to_string())
     })
 }
 
+fn wallet_market_pnls(result: &Value) -> BTreeMap<String, Decimal> {
+    let mut previous = Decimal::ZERO;
+    let mut pnls = BTreeMap::new();
+    for point in result["wallet_constrained_equity_curve"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let Some(current) = point["net_pnl"]
+            .as_str()
+            .and_then(|v| v.parse::<Decimal>().ok())
+        else {
+            continue;
+        };
+        if let Some(id) = point["market_id"].as_str() {
+            *pnls.entry(id.to_owned()).or_default() += current - previous;
+        }
+        previous = current;
+    }
+    pnls
+}
+
 fn daily_market_pnl(result: &Value, days: &[String]) -> Vec<Value> {
+    let wallet_pnls = wallet_market_pnls(result);
     let mut totals = days
         .iter()
         .map(|day| (day.clone(), Decimal::ZERO))
@@ -10126,9 +10793,9 @@ fn daily_market_pnl(result: &Value, days: &[String]) -> Vec<Value> {
             let Some(total) = totals.get_mut(&day) else {
                 continue;
             };
-            *total += row["net_pnl"]
-                .as_str()
-                .map(decimal_from_str)
+            *total += wallet_pnls
+                .get(row["market_id"].as_str().unwrap_or(""))
+                .copied()
                 .unwrap_or_default();
         }
     }
@@ -10136,6 +10803,18 @@ fn daily_market_pnl(result: &Value, days: &[String]) -> Vec<Value> {
         .into_iter()
         .map(|(date, pnl)| json!({"date": date, "net_pnl": pnl.to_string()}))
         .collect()
+}
+
+fn consecutive_market_days(days: &[String]) -> bool {
+    let parsed = days
+        .iter()
+        .map(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .collect::<Option<Vec<_>>>();
+    parsed.is_some_and(|dates| {
+        dates
+            .windows(2)
+            .all(|pair| pair[0].succ_opt() == Some(pair[1]))
+    })
 }
 
 fn sweep_block_bootstrap_daily_lower_95(values: &[Decimal]) -> Option<Decimal> {
@@ -10172,111 +10851,28 @@ fn sweep_block_bootstrap_daily_lower_95(values: &[Decimal]) -> Option<Decimal> {
 }
 
 fn sealed_test_evidence(rows: &[Value], test_days: &[String]) -> Value {
-    json!({
-        "status": "opened_after_winner_fixed",
-        "days": test_days,
-        "fill_model_results": rows.iter().map(|row| {
-            let mut stats = market_split_stats(row, test_days);
-            if let Some(object) = stats.as_object_mut() {
-                object.insert("fill_model".to_owned(), row["fill_model"].clone());
-            }
-            stats
-        }).collect::<Vec<_>>()
-    })
+    json!({"status":"opened_after_winner_fixed", "days":test_days,
+        "fill_model_results":rows.iter().map(|row|validation_model_evidence(row,test_days)).collect::<Vec<_>>()})
 }
 
 fn sealed_test_non_collapsing(test: &Value) -> bool {
     test["fill_model_results"].as_array().is_some_and(|rows| {
-        rows.len() == 2
-            && rows.iter().all(|row| {
-                row["markets"].as_u64().unwrap_or_default() > 0
+        let conservative = rows
+            .iter()
+            .filter(|r| conservative_sweep_model(&r["fill_model"]))
+            .collect::<Vec<_>>();
+        conservative.len() == 3
+            && conservative.iter().all(|row| {
+                row["pnl_eligible"] == true
+                    && row["markets"].as_u64().unwrap_or_default() > 0
                     && row["net_pnl"]
                         .as_str()
-                        .is_some_and(|value| decimal_from_str(value) >= Decimal::ZERO)
+                        .is_some_and(|v| decimal_from_str(v) > Decimal::ZERO)
+                    && row["block_confidence_lower_95"]
+                        .as_str()
+                        .is_some_and(|v| decimal_from_str(v) > Decimal::ZERO)
             })
     })
-}
-
-fn build_fold_results(
-    grouped: &BTreeMap<String, Vec<Value>>,
-    candidates: &[SweepCandidate],
-    folds: &[Value],
-    aggregate_winner: Option<&str>,
-) -> Vec<Value> {
-    folds
-        .iter()
-        .enumerate()
-        .filter_map(|(fold_index, fold)| {
-            let validation_days = fold["validation_day"]
-                .as_str()
-                .map(|day| vec![day.to_owned()])?;
-            let test_days = fold["test_day"]
-                .as_str()
-                .map(|day| vec![day.to_owned()])?;
-            let mut rankings = candidates
-                .iter()
-                .filter_map(|candidate| {
-                    let rows = grouped.get(&candidate.name)?;
-                    let models = rows
-                        .iter()
-                        .map(|row| {
-                            let mut stats = market_split_stats(row, &validation_days);
-                            if let Some(object) = stats.as_object_mut() {
-                                object.insert("fill_model".to_owned(), row["fill_model"].clone());
-                            }
-                            stats
-                        })
-                        .collect::<Vec<_>>();
-                    let pnls = models
-                        .iter()
-                        .filter_map(|row| row["net_pnl"].as_str().map(decimal_from_str))
-                        .collect::<Vec<_>>();
-                    Some((
-                        candidate.name.clone(),
-                        pnls.iter().copied().min().unwrap_or_default(),
-                        pnls.iter().copied().sum::<Decimal>(),
-                        models,
-                    ))
-                })
-                .collect::<Vec<_>>();
-            rankings.sort_by(|left, right| {
-                right
-                    .1
-                    .cmp(&left.1)
-                    .then(right.2.cmp(&left.2))
-                    .then(left.0.cmp(&right.0))
-            });
-            let winner = rankings.first()?.0.clone();
-            let is_final_fold = fold_index + 1 == folds.len();
-            let sealed_test = if !is_final_fold || aggregate_winner == Some(winner.as_str()) {
-                grouped
-                    .get(&winner)
-                    .map(|rows| sealed_test_evidence(rows, &test_days))
-            } else {
-                Some(json!({
-                    "status": "sealed_fold_winner_differs_from_fixed_aggregate_winner",
-                    "days": test_days,
-                    "fill_model_results": null
-                }))
-            };
-            Some(json!({
-                "fold_index": fold_index,
-                "train_days": fold["train_days"],
-                "validation_day": fold["validation_day"],
-                "test_day": fold["test_day"],
-                "selection_rule": SWEEP_FOLD_SELECTION_RULE,
-                "validation_rankings": rankings.into_iter().enumerate().map(|(index, (candidate, minimum, total, models))| json!({
-                    "rank": index + 1,
-                    "candidate": candidate,
-                    "minimum_fill_model_net_pnl": minimum.to_string(),
-                    "total_fill_model_net_pnl": total.to_string(),
-                    "fill_model_results": models
-                })).collect::<Vec<_>>(),
-                "selected_candidate": winner,
-                "sealed_test": sealed_test
-            }))
-        })
-        .collect()
 }
 
 fn sweep_market_days(results: &[Value]) -> Vec<String> {
@@ -10306,6 +10902,7 @@ fn json_string_array(value: &Value) -> Vec<String> {
 }
 
 fn market_split_stats(result: &Value, days: &[String]) -> Value {
+    let wallet_pnls = wallet_market_pnls(result);
     if days.is_empty() {
         return json!({
             "days": [],
@@ -10325,11 +10922,10 @@ fn market_split_stats(result: &Value, days: &[String]) -> Value {
                 && market_day(row).is_some_and(|day| days.contains(&day))
             {
                 markets += 1;
-                let pnl = row
-                    .get("net_pnl")
-                    .and_then(Value::as_str)
-                    .map(decimal_from_str)
-                    .unwrap_or(Decimal::ZERO);
+                let pnl = wallet_pnls
+                    .get(row["market_id"].as_str().unwrap_or(""))
+                    .copied()
+                    .unwrap_or_default();
                 net += pnl;
                 match pnl.cmp(&Decimal::ZERO) {
                     std::cmp::Ordering::Greater => profitable += 1,
@@ -10349,11 +10945,9 @@ fn market_split_stats(result: &Value, days: &[String]) -> Value {
 }
 
 fn market_day(row: &Value) -> Option<String> {
-    row.get("end_ts")
-        .and_then(Value::as_str)
-        .or_else(|| row.get("start_ts").and_then(Value::as_str))
-        .and_then(|value| value.get(0..10))
-        .map(ToOwned::to_owned)
+    parse_datetime(row.get("end_ts"))
+        .or_else(|| parse_datetime(row.get("start_ts")))
+        .map(|timestamp| timestamp.date_naive().to_string())
 }
 
 fn load_sweep_search_space(path: Option<&Path>) -> Result<SweepSearchSpace, ResearchError> {
@@ -10765,7 +11359,8 @@ fn sample_size_stats(values: &[Decimal]) -> Value {
         "required_n_for_plus_minus_0_05": required_005,
         "required_n_for_plus_minus_0_10": required_010,
         "required_n_to_detect_observed_mean": required_detect,
-        "profitability_claim_allowed": ci_low.is_some_and(|value| value > Decimal::ZERO)
+        "confidence_method": "iid_descriptive_only",
+        "profitability_claim_allowed": false
     })
 }
 
@@ -10785,47 +11380,142 @@ fn required_n_to_detect_mean(mean: Decimal, std: Decimal) -> Option<u64> {
     Some((7.84 * ratio * ratio).ceil() as u64)
 }
 
-fn extract_market_pnls(source: &Value) -> Vec<Decimal> {
-    if let Some(markets) = source
-        .pointer("/result/market_results")
-        .and_then(Value::as_array)
-    {
-        return markets
+struct SelectedMarketPnls {
+    fill_model: FillModel,
+    profile: String,
+    model_sha256: String,
+    eligible: bool,
+    rows: Vec<(chrono::NaiveDate, Decimal)>,
+}
+
+fn select_market_pnls(
+    source: &Value,
+    requested: Option<FillModel>,
+) -> Result<SelectedMarketPnls, ResearchError> {
+    let result = source.get("result").unwrap_or(source);
+    let selected = if let Some(models) = result.get("fill_models").and_then(Value::as_array) {
+        let model = requested.ok_or_else(|| {
+            ResearchError::InvalidInput(
+                "sample-size requires --fill-model for a multi-model result".to_owned(),
+            )
+        })?;
+        models
             .iter()
-            .filter(|row| row["winning_outcome"].is_string())
-            .filter_map(|row| {
-                row.get("net_pnl")
-                    .and_then(Value::as_str)
-                    .map(decimal_from_str)
-            })
-            .collect();
+            .find(|row| row["fill_model"].as_str() == Some(model.as_str()))
+            .ok_or_else(|| {
+                ResearchError::InvalidInput("requested sample-size fill model is absent".to_owned())
+            })?
+    } else {
+        result
+    };
+    let model = selected["fill_model"]
+        .as_str()
+        .ok_or_else(|| {
+            ResearchError::InvalidInput("sample-size input has no fill_model".to_owned())
+        })?
+        .parse::<FillModel>()?;
+    if requested.is_some_and(|value| value != model) {
+        return Err(ResearchError::InvalidInput(
+            "requested fill model does not match sample-size input".to_owned(),
+        ));
     }
-    if let Some(models) = source
-        .pointer("/result/fill_models")
-        .and_then(Value::as_array)
-    {
-        if let Some(primary) = models
-            .iter()
-            .find(|row| row["fill_model"].as_str() == Some("touch_after_250ms"))
-            .or_else(|| models.first())
+    let conservative = matches!(
+        model,
+        FillModel::TradeThrough | FillModel::QueueProxyConservative
+    ) || (model == FillModel::AdverseSelectionPenalized
+        && selected["adverse_selection_pnl_eligible"] == true);
+    let eligible = conservative
+        && (!is_queue_proxy_shadow_model(model)
+            || selected["queue_proxy_pnl_eligible"].as_bool() == Some(true))
+        && selected["warnings"].as_array().is_some_and(Vec::is_empty);
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row in selected["market_results"].as_array().ok_or_else(|| {
+        ResearchError::InvalidInput("sample-size input has no market_results".to_owned())
+    })? {
+        if row["complete_for_simulation"].as_bool() != Some(true)
+            || !row["winning_outcome"].is_string()
         {
-            return primary["market_results"]
-                .as_array()
-                .map(|markets| {
-                    markets
-                        .iter()
-                        .filter(|row| row["winning_outcome"].is_string())
-                        .filter_map(|row| {
-                            row.get("net_pnl")
-                                .and_then(Value::as_str)
-                                .map(decimal_from_str)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            continue;
         }
+        let id = row["market_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                ResearchError::InvalidInput("settled market has no identity".to_owned())
+            })?;
+        if !seen.insert(id) {
+            return Err(ResearchError::InvalidInput(
+                "duplicate settled market in sample-size input".to_owned(),
+            ));
+        }
+        let day = market_day(row)
+            .and_then(|d| chrono::NaiveDate::parse_from_str(&d, "%Y-%m-%d").ok())
+            .ok_or_else(|| {
+                ResearchError::InvalidInput("settled market is missing a UTC day".to_owned())
+            })?;
+        let pnl = row["net_pnl"]
+            .as_str()
+            .and_then(|v| v.parse::<Decimal>().ok())
+            .ok_or_else(|| {
+                ResearchError::InvalidInput("settled market has invalid net_pnl".to_owned())
+            })?;
+        rows.push((day, pnl));
     }
-    Vec::new()
+    Ok(SelectedMarketPnls {
+        fill_model: model,
+        profile: selected["profile"].as_str().unwrap_or("unknown").to_owned(),
+        model_sha256: sha256_prefixed(&serde_json::to_vec(selected)?),
+        eligible,
+        rows,
+    })
+}
+
+fn temporal_market_mean_confidence(rows: &[(chrono::NaiveDate, Decimal)]) -> Value {
+    let mut grouped = BTreeMap::<chrono::NaiveDate, (Decimal, u64)>::new();
+    for (day, pnl) in rows {
+        let entry = grouped.entry(*day).or_default();
+        entry.0 += pnl;
+        entry.1 += 1;
+    }
+    let days = grouped.keys().copied().collect::<Vec<_>>();
+    let consecutive = days
+        .windows(2)
+        .all(|pair| pair[0].succ_opt() == Some(pair[1]));
+    let mut result = json!({"method":"seven_day_circular_block_bootstrap_settled_market_mean", "block_days":SWEEP_BLOCK_DAYS,
+        "bootstrap_resamples":SWEEP_BOOTSTRAP_RESAMPLES, "daily_clusters":days.len(), "consecutive_utc_days":consecutive,
+        "ci_low":null, "ci_high":null});
+    if days.len() < SWEEP_BLOCK_DAYS * SWEEP_MIN_BLOCKS || !consecutive {
+        return result;
+    }
+    let encoded = serde_json::to_vec(&grouped).expect("daily PnL aggregates serialize");
+    let digest = Sha256::digest(encoded);
+    let mut seed = u64::from_le_bytes(digest[..8].try_into().expect("eight-byte seed"));
+    if seed == 0 {
+        seed = 0x9e37_79b9_7f4a_7c15;
+    }
+    let daily = grouped.values().copied().collect::<Vec<_>>();
+    let mut estimates = Vec::with_capacity(SWEEP_BOOTSTRAP_RESAMPLES);
+    for _ in 0..SWEEP_BOOTSTRAP_RESAMPLES {
+        let (mut sum, mut count, mut sampled) = (Decimal::ZERO, 0_u64, 0_usize);
+        while sampled < daily.len() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let start = seed as usize % daily.len();
+            for offset in 0..SWEEP_BLOCK_DAYS.min(daily.len() - sampled) {
+                let (pnl, n) = daily[(start + offset) % daily.len()];
+                sum += pnl;
+                count += n;
+                sampled += 1;
+            }
+        }
+        estimates.push(sum / Decimal::from(count));
+    }
+    estimates.sort_unstable();
+    result["ci_low"] = json!(estimates[SWEEP_BOOTSTRAP_RESAMPLES * 25 / 1000].to_string());
+    result["ci_high"] = json!(estimates[SWEEP_BOOTSTRAP_RESAMPLES * 975 / 1000].to_string());
+    result
 }
 
 fn choose_recommendation(
@@ -10833,12 +11523,23 @@ fn choose_recommendation(
     regimes: &Option<Value>,
     sample_size: &Option<Value>,
 ) -> &'static str {
+    let model = sample_size
+        .as_ref()
+        .and_then(|v| v.pointer("/result/fill_model"))
+        .and_then(Value::as_str);
+    let model_matches = model.is_some()
+        && regimes
+            .as_ref()
+            .and_then(|v| v.pointer("/result/fill_model"))
+            .and_then(Value::as_str)
+            == model;
+    let queue = model == Some("queue_proxy_conservative");
     let sample_allows = sample_size
         .as_ref()
         .and_then(|value| value.pointer("/result/statistics/profitability_claim_allowed"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if !sample_allows {
+    if !sample_allows || !model_matches {
         return "Continue collecting data unchanged";
     }
     let baseline_primary = baseline
@@ -10846,23 +11547,45 @@ fn choose_recommendation(
         .and_then(|value| value.pointer("/result/fill_models"))
         .and_then(Value::as_array)
         .and_then(|models| {
-            models
-                .iter()
-                .find(|row| row["fill_model"].as_str() == Some("touch_after_250ms"))
+            models.iter().find(|row| {
+                row["fill_model"].as_str() == model
+                    && (!queue || row["queue_proxy_pnl_eligible"].as_bool() == Some(true))
+            })
         })
         .and_then(|row| row["net_pnl"].as_str())
         .map(decimal_from_str)
         .unwrap_or(Decimal::ZERO);
-    let best_adaptive = regimes
+    let profile = sample_size
         .as_ref()
-        .and_then(|value| value.pointer("/result/profiles"))
+        .and_then(|v| v.pointer("/result/profile"))
+        .and_then(Value::as_str);
+    let selected_profile = regimes
+        .as_ref()
+        .and_then(|v| v.pointer("/result/profiles"))
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|row| row["profile"].as_str() != Some("static"))
-        .filter_map(|row| row["net_pnl"].as_str().map(decimal_from_str))
-        .max()
-        .unwrap_or(Decimal::ZERO);
+        .and_then(|rows| {
+            rows.iter().find(|row| {
+                row["profile"].as_str() == profile
+                    && profile != Some("static")
+                    && (!queue || row["queue_proxy_pnl_eligible"] == true)
+            })
+        });
+    let source_matches = selected_profile
+        .and_then(|row| serde_json::to_vec(row).ok())
+        .is_some_and(|bytes| {
+            sample_size
+                .as_ref()
+                .and_then(|v| v.pointer("/result/selected_model_sha256"))
+                .and_then(Value::as_str)
+                == Some(sha256_prefixed(&bytes).as_str())
+        });
+    if !source_matches {
+        return "Continue collecting data unchanged";
+    }
+    let best_adaptive = selected_profile
+        .and_then(|row| row["net_pnl"].as_str())
+        .map(decimal_from_str)
+        .unwrap_or_default();
     if best_adaptive > baseline_primary {
         "Keep adaptive profiles research-only"
     } else {
@@ -12503,6 +13226,47 @@ mod tests {
     }
 
     #[test]
+    fn holdout_guards_bind_once_and_use_wallet_pnl_with_consecutive_days() {
+        let root =
+            std::env::temp_dir().join(format!("polyedge-holdout-receipt-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let id = format!("{:x}", Sha256::digest(b"heldout raw content"));
+        claim_holdout_once(&root, &id, &json!({"candidate":"first","out":"one.json"})).unwrap();
+        assert!(claim_holdout_once(
+            &root,
+            &id,
+            &json!({"candidate":"second","out":"another.json"})
+        )
+        .is_err());
+        let selection =
+            json!({"market_results":[{"market_id":"a","end_ts":"2026-06-01T00:15:00Z"}]});
+        let test = json!({"market_results":[{"market_id":"b","start_ts":"2026-06-02T00:00:00Z"}]});
+        assert!(validate_sweep_holdout(
+            std::slice::from_ref(&selection),
+            std::slice::from_ref(&test)
+        )
+        .is_ok());
+        let mut overlapping = test.clone();
+        overlapping["market_results"][0]["market_id"] = json!("a");
+        assert!(validate_sweep_holdout(&[selection], &[overlapping]).is_err());
+        let ledger = json!({"market_results":[{"market_id":"a","end_ts":"2026-06-01T00:15:00Z","net_pnl":"100","complete_for_simulation":true}],
+            "wallet_constrained_equity_curve":[{"net_pnl":"0"},{"market_id":"a","net_pnl":"-1"}]});
+        assert_eq!(
+            market_split_stats(&ledger, &["2026-06-01".to_owned()])["net_pnl"],
+            "-1"
+        );
+        assert_eq!(
+            daily_market_pnl(&ledger, &["2026-06-01".to_owned()])[0]["net_pnl"],
+            "-1"
+        );
+        assert!(!consecutive_market_days(&[
+            "2026-06-01".to_owned(),
+            "2026-06-03".to_owned()
+        ]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sweep_block_bound_is_fail_closed_deterministic_and_positive_only_with_enough_days() {
         assert_eq!(
             sweep_block_bootstrap_daily_lower_95(&[Decimal::ONE; 27]),
@@ -12520,17 +13284,16 @@ mod tests {
     }
 
     #[test]
-    fn sweep_sealed_test_accepts_zero_but_rejects_negative_pnl() {
-        let test = |second_pnl: &str| {
-            json!({
-                "fill_model_results": [
-                    {"markets": 1, "net_pnl": "0"},
-                    {"markets": 1, "net_pnl": second_pnl}
-                ]
-            })
+    fn sweep_sealed_test_requires_all_conservative_models_and_temporal_bounds() {
+        let test = |bound: &str| {
+            json!({"fill_model_results":(["trade_through","queue_proxy_conservative","adverse_selection_penalized"].map(|model|
+            json!({"fill_model":model,"pnl_eligible":true,"markets":280,"net_pnl":"1","block_confidence_lower_95":bound})))})
         };
-        assert!(sealed_test_non_collapsing(&test("0")));
-        assert!(!sealed_test_non_collapsing(&test("-0.01")));
+        assert!(sealed_test_non_collapsing(&test("0.01")));
+        assert!(!sealed_test_non_collapsing(&test("0")));
+        let mut missing = test("0.01");
+        missing["fill_model_results"][1]["pnl_eligible"] = json!(false);
+        assert!(!sealed_test_non_collapsing(&missing));
     }
 
     fn wallet_ts(value: &str) -> DateTime<Utc> {
@@ -12806,6 +13569,7 @@ mod tests {
             side: "buy".to_owned(),
             price: d("0.50"),
             size: d("5"),
+            minimum_order_size: None,
             order_kind: "post_only_gtc".to_owned(),
             decision_ts: wallet_ts(decision),
             ttl_ms: None,
@@ -12822,6 +13586,84 @@ mod tests {
             queue_initial_size_ahead: None,
             queue_size_ahead: None,
         }
+    }
+
+    #[test]
+    fn current_equity_sizing_matches_funded_helper() {
+        let policy = ReplayCurrentEquityPolicy {
+            reserve_ratio: d("0.1"),
+            minimum_reserve: d("2"),
+            target_order_ratio: d("0.05"),
+            operating_buffer_ratio: d("0.01"),
+            minimum_order_notional: d("1"),
+            fee_rate: d("0.07"),
+            fee_exponent: 1,
+        };
+        let vectors = json!([
+            ["50.690567", "0.5", "5", "0.0175"],
+            ["50.690567", "0.2", "5", "0.0112"],
+            ["50.690567", "0.9", "5", "0.0063"],
+            ["3.6", "0.3224734", "5", "0.0152939014404708"]
+        ]);
+        let helper = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../venue-probe/src/compounding-risk.mjs");
+        let output = std::process::Command::new("node")
+            .args([
+                "--input-type=module",
+                "-e",
+                r#"
+            const {sizeProtectedOrder} = await import(process.argv[1]);
+            const rows = JSON.parse(process.argv[2]).map(([e,p,m,f]) => {
+                const equity=Number(e), price=Number(p);
+                return sizeProtectedOrder({state:{high_water_equity:equity, authorized_equity_ceiling:equity,
+                    protected_reserve:Math.round(Math.max(2,equity*.1)*1e6)/1e6,
+                    operating_buffer_ratio:.01, minimum_order_notional:1,
+                    minimum_reserve:2, target_order_ratio:.05},
+                    accountEquity:equity, price, requestedShares:10.5/price,
+                    requestedNotional:10.5, minimumOrderSize:Number(m),
+                    maximumOrderNotional:10.5, feePerShare:Number(f)});
+            });
+            console.log(JSON.stringify(rows));
+        "#,
+            ])
+            .arg(helper)
+            .arg(vectors.to_string())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let funded: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+        for (input, expected) in vectors.as_array().unwrap().iter().zip(funded) {
+            let mut order = wallet_order("m", "2026-06-01T00:01:00Z", "0");
+            order.price = d(input[1].as_str().unwrap());
+            order.size = d("10.5") / order.price;
+            order.minimum_order_size = Some(d(input[2].as_str().unwrap()));
+            let fee = policy.fee_per_share(order.price);
+            assert_eq!(fee, d(input[3].as_str().unwrap()));
+            let actual = policy.size(d(input[0].as_str().unwrap()), &order, fee, d("10.5"));
+            assert_eq!(actual.is_ok(), expected["executable"] == true);
+            match actual {
+                Ok(shares) => assert_eq!(shares, decimal(expected.get("shares")).unwrap()),
+                Err(reason) => assert!(expected["blockers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v == reason)),
+            }
+        }
+        let mut result = json!({"warnings":[], "wallet_constrained_unresolved_orders":0,
+            "wallet_constrained_equity_curve":[{"equity":"3.6"}],
+            "wallet_constrained_max_drawdown":"47.090567", "wallet_constrained_ending_equity":"3.6",
+            "wallet_constraints":{"maximum_drawdown":"29.505501", "equity_floor":"0"},
+            "market_results":[{"complete_for_simulation":true}], "fill_model":"trade_through"});
+        assert!(!sweep_pnl_eligible(&result));
+        result["wallet_constraints"]["current_equity_policy"] = json!(policy);
+        assert!(sweep_pnl_eligible(&result));
+        result["wallet_constrained_unresolved_orders"] = json!(1);
+        assert!(!sweep_pnl_eligible(&result));
     }
 
     #[test]
@@ -12846,7 +13688,12 @@ mod tests {
             wallet_order("m3", "2026-06-01T00:16:01Z", "5"),
         ];
 
-        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+        let result = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.accepted_orders, 2);
         assert_eq!(result.skipped_orders, 1);
@@ -12873,10 +13720,18 @@ mod tests {
             wallet_order("eligible", "2026-06-01T00:02:00Z", "5"),
         ];
 
-        let full_wallet =
-            wallet_constrained_replay(&orders, &markets, FillModel::QueueProxyConservative);
-        let filtered_wallet =
-            wallet_constrained_replay(&orders[1..], &markets, FillModel::QueueProxyConservative);
+        let full_wallet = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::QueueProxyConservative,
+            &ReplayWalletConstraints::default(),
+        );
+        let filtered_wallet = wallet_constrained_replay(
+            &orders[1..],
+            &markets,
+            FillModel::QueueProxyConservative,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(full_wallet.net_pnl, Decimal::ZERO);
         assert_eq!(full_wallet.accepted_orders, 1);
@@ -12905,7 +13760,12 @@ mod tests {
             wallet_order("m2", "2026-06-01T00:16:00Z", "5"),
         ];
 
-        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+        let result = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.net_pnl, -Decimal::ONE);
         assert_eq!(result.ending_equity, d("4.030521"));
@@ -12934,7 +13794,12 @@ mod tests {
             wallet_order("m2", "2026-06-01T00:16:00Z", "5"),
         ];
 
-        let result = wallet_constrained_replay(&orders, &markets, FillModel::Touch);
+        let result = wallet_constrained_replay(
+            &orders,
+            &markets,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.accepted_orders, 2);
         assert_eq!(result.net_pnl, d("2"));
@@ -12969,8 +13834,18 @@ mod tests {
             ),
         ]);
 
-        let winner = wallet_constrained_replay(&orders, &markets_for_winner, FillModel::Touch);
-        let loser = wallet_constrained_replay(&orders, &markets_for_loser, FillModel::Touch);
+        let winner = wallet_constrained_replay(
+            &orders,
+            &markets_for_winner,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
+        let loser = wallet_constrained_replay(
+            &orders,
+            &markets_for_loser,
+            FillModel::Touch,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(winner.accepted_orders, loser.accepted_orders);
         assert_eq!(winner.skipped_orders, loser.skipped_orders);
@@ -12987,8 +13862,12 @@ mod tests {
         order.fee = d("0.01");
         order.adverse_penalty = d("0.005");
 
-        let result =
-            wallet_constrained_replay(&[order], &markets, FillModel::AdverseSelectionPenalized);
+        let result = wallet_constrained_replay(
+            &[order],
+            &markets,
+            FillModel::AdverseSelectionPenalized,
+            &ReplayWalletConstraints::default(),
+        );
 
         assert_eq!(result.net_pnl, d("-0.515"));
         assert_eq!(result.accepted_filled_orders, 1);
@@ -13211,7 +14090,7 @@ mod tests {
                 raw: Value::Null,
             });
         }
-        let replay = replay.finish();
+        let replay = replay.finish(&ReplayWalletConstraints::default());
         assert_eq!(replay["orders"], 1);
         assert_eq!(replay["fills"], 0);
         assert_eq!(replay["net_pnl"], "0");
@@ -13297,7 +14176,7 @@ mod tests {
             raw: Value::Null,
         });
 
-        let result = replay.finish();
+        let result = replay.finish(&ReplayWalletConstraints::default());
         assert_eq!(result["orders"], 1);
         assert_eq!(result["fills"], 0);
         assert_eq!(result["replay_metrics"]["fills_prevented_expired"], 1);
@@ -14617,6 +15496,101 @@ mod tests {
 
         let (batch, decisions) = decision_pipeline_v4_evidence(&input);
         assert!(batch["candidate"].is_null());
+        // Pre-OCI-bridge primary recordings omit this inactive transport setting.
+        let mut legacy = batch.clone();
+        legacy["pipeline_input"]["settings"]["azure"]
+            .as_object_mut()
+            .unwrap()
+            .remove("funded_direct_oci_queue_bridge_url");
+        let decode_error =
+            serde_json::from_value::<DecisionPipelineInputV3>(legacy["pipeline_input"].clone())
+                .unwrap_err();
+        assert!(decode_error
+            .to_string()
+            .contains("missing field `funded_direct_oci_queue_bridge_url`"));
+        let hash = canonical_value_sha256(&legacy["pipeline_input"]).unwrap();
+        legacy["pipeline_input_sha256"] = json!(hash);
+        legacy["batch_id"] = json!(format!(
+            "strategy-batch-{}",
+            hash.trim_start_matches("sha256:")
+        ));
+        let recorded_legacy = legacy.clone();
+        assert!(validate_strategy_batch(&legacy).is_ok());
+        assert_eq!(legacy, recorded_legacy);
+        let mut wrong_hash = legacy.clone();
+        wrong_hash["pipeline_input_sha256"] = batch["pipeline_input_sha256"].clone();
+        assert_eq!(
+            validate_strategy_batch(&wrong_hash).unwrap_err(),
+            "pipeline_input_hash_mismatch"
+        );
+        for pointer in [
+            "/pipeline_input/settings/azure/funded_direct_oci_queue_bridge_url",
+            "/pipeline_input/settings/strategy/enable_taker_orders",
+        ] {
+            let mut invalid = legacy.clone();
+            if pointer.ends_with("bridge_url") {
+                invalid["pipeline_input"]["settings"]["azure"]
+                    ["funded_direct_oci_queue_bridge_url"] = Value::Null;
+            } else {
+                *invalid.pointer_mut(pointer).unwrap() = Value::Null;
+            }
+            assert_eq!(
+                validate_strategy_batch(&invalid).unwrap_err(),
+                "pipeline_input_decode_failed"
+            );
+        }
+        let mut active_transport = legacy.clone();
+        active_transport["pipeline_input"]["settings"]["azure"]
+            ["publish_strategy_canary_intents"] = json!(true);
+        assert_eq!(
+            validate_strategy_batch(&active_transport).unwrap_err(),
+            "pipeline_input_decode_failed"
+        );
+        let mut unknown_field = legacy.clone();
+        unknown_field["pipeline_input"]["settings"]["azure"]["unknown_transport"] = json!("");
+        assert_eq!(
+            validate_strategy_batch(&unknown_field).unwrap_err(),
+            "pipeline_input_roundtrip_mismatch"
+        );
+        let mut live = legacy.clone();
+        live["pipeline_input"]["settings"]["live"]["allow_live"] = json!(true);
+        assert_eq!(
+            validate_strategy_batch(&live).unwrap_err(),
+            "unsafe_execution_settings"
+        );
+        let mut missing_other = legacy.clone();
+        missing_other["pipeline_input"]["settings"]["strategy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enable_taker_orders");
+        assert_eq!(
+            validate_strategy_batch(&missing_other).unwrap_err(),
+            "pipeline_input_decode_failed"
+        );
+        for (pointer, value) in [
+            (
+                "/pipeline_input/settings/deploy/runtime_role",
+                json!("profitability_shadow"),
+            ),
+            (
+                "/pipeline_input/settings/live/execution_mode",
+                json!("live"),
+            ),
+        ] {
+            let mut unsupported_lane = legacy.clone();
+            *unsupported_lane.pointer_mut(pointer).unwrap() = value;
+            assert_eq!(
+                validate_strategy_batch(&unsupported_lane).unwrap_err(),
+                "pipeline_input_decode_failed"
+            );
+        }
+        let mut older_contract = legacy;
+        older_contract["schema"] = json!("polyedge.strategy_decision_batch.v3");
+        older_contract["schema_version"] = json!(3);
+        assert_eq!(
+            validate_strategy_batch(&older_contract).unwrap_err(),
+            "pipeline_input_decode_failed"
+        );
         let mut audit = AuditAccumulator::default();
         audit.observe(&EventLine {
             event_type: "runtime_provenance".to_owned(),

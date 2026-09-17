@@ -1,13 +1,13 @@
 use polyedge_reporting::research::{
     load_default_exclusions, load_frozen_candidate_registry, run_audit, run_backfill, run_baseline,
-    run_build_markets, run_calibration, run_chart_backfill, run_final_report, run_normalize,
-    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
-    AuditOptions, BackfillOptions, BaselineOptions, BuildMarketsOptions, CalibrationOptions,
-    ChartBackfillOptions, ExcludedTimeWindow, FillModel, FinalReportOptions, NormalizeOptions,
-    ProspectiveValidationOptions, QueueAuditOptions, RegimesOptions, ReplayOptions,
-    SampleSizeOptions, SweepOptions,
+    run_build_markets, run_build_replay_index, run_calibration, run_chart_backfill,
+    run_final_report, run_normalize, run_queue_audit, run_regimes, run_replay, run_sample_size,
+    run_sweep, run_validate_prospective, AuditOptions, BackfillOptions, BaselineOptions,
+    BuildMarketsOptions, CalibrationOptions, ChartBackfillOptions, ExcludedTimeWindow, FillModel,
+    FinalReportOptions, NormalizeOptions, ProspectiveValidationOptions, QueueAuditOptions,
+    RegimesOptions, ReplayIndexOptions, ReplayOptions, SampleSizeOptions, SweepOptions,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,380 @@ fn audit_counts_fixture_and_malformed_lines() {
 
     assert_eq!(report["result"]["markets_seen"], 1);
     assert_eq!(report["result"]["malformed_lines"], 1);
+}
+
+#[test]
+fn invalid_event_timestamps_are_rejected_in_raw_and_merged_inputs() {
+    let dir = test_dir("invalid_timestamps");
+    let lines = [
+        serde_json::json!({"event_type":"reference","recorded_ts":"2026-06-01T00:00:00Z"}),
+        serde_json::json!({"event_type":"reference"}),
+        serde_json::json!({"event_type":"reference","recorded_ts":"invalid"}),
+        serde_json::json!({"event_type":"reference","recorded_ts":"invalid","ts":"2026-06-01T00:00:01Z"}),
+        serde_json::json!({"event_type":"reference","recorded_ts":null}),
+        serde_json::json!({"event_type":"reference","ts":"2026-06-01T00:00:02Z"}),
+    ].map(|row| row.to_string()).join("\n");
+    for merged in [false, true] {
+        let input = dir.join(if merged { "merged" } else { "raw" });
+        fs::create_dir_all(&input).unwrap();
+        write_events(&input.join("other.jsonl"), &lines);
+        if merged {
+            fs::write(input.join("events_manifest.json"), "{}").unwrap();
+        }
+        let report = run_audit(AuditOptions {
+            input: input.clone(),
+            out: input.join("audit.json"),
+            markdown: input.join("audit.md"),
+            exclude_windows: Vec::new(),
+            settlement_carry: None,
+        })
+        .unwrap();
+        assert_eq!(report["result"]["total_events"], 2);
+        assert_eq!(report["result"]["malformed_lines"], 4);
+        assert_eq!(report["result"]["invalid_timestamps"], 4);
+        assert!(report["warnings"].as_array().unwrap().iter().any(|v| v
+            .as_str()
+            .is_some_and(|s| s.contains("4 records with missing or invalid event timestamps"))));
+    }
+    let report = run_normalize(NormalizeOptions {
+        input: dir.join("raw/other.jsonl"),
+        out: dir.join("normalized"),
+        format: "jsonl-indexed-gzip-sharded".to_owned(),
+        overwrite: false,
+        decision_grade_projection: false,
+    })
+    .unwrap();
+    assert_eq!(report["result"]["events"], 2);
+    assert_eq!(report["result"]["invalid_timestamps"], 4);
+}
+
+#[test]
+fn explicit_wallet_changes_capital_and_binds_every_baseline_fill_model() {
+    let dir = test_dir("explicit_wallet");
+    let raw = dir.join("raw.jsonl");
+    write_events(&raw, &filled_touch_fixture("2026-06-01T00:01:01+00:00"));
+    let wallet = dir.join("wallet.json");
+    let mut config = json!({
+        "campaign_baseline": "20", "equity_floor": "19",
+        "maximum_drawdown": "0.5", "maximum_order_notional": "0.1",
+        "maximum_unresolved_orders_or_positions": 1
+    });
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut options = ReplayOptions {
+        wallet_config: None,
+        input: raw.clone(),
+        markets: None,
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    };
+    let historical = run_replay(options.clone()).unwrap();
+    options.wallet_config = Some(wallet.clone());
+    let configured = run_replay(options.clone()).unwrap();
+    assert_ne!(
+        historical["result"]["wallet_constrained_net_pnl"],
+        configured["result"]["wallet_constrained_net_pnl"]
+    );
+    assert_eq!(
+        configured["result"]["wallet_constrained_equity_curve"][0]["equity"],
+        "20"
+    );
+    let hash = configured["result"]["wallet_config_sha256"].clone();
+    assert!(hash.as_str().unwrap().starts_with("sha256:"));
+    let baseline = run_baseline(BaselineOptions {
+        wallet_config: Some(wallet.clone()),
+        input: raw,
+        markets: None,
+        out: dir.join("baseline.json"),
+        markdown: dir.join("baseline.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap();
+    for row in baseline["result"]["fill_models"].as_array().unwrap() {
+        assert_eq!(row["wallet_config_sha256"], hash);
+        assert_eq!(row["wallet_constraints"]["campaign_baseline"], "20");
+        assert_eq!(row["wallet_constraints"]["maximum_order_notional"], "0.1");
+    }
+    config["maximum_unresolved_orders_or_positions"] = json!(2);
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options.clone()).is_err());
+    config["maximum_unresolved_orders_or_positions"] = json!(1);
+    config["equity_floor"] = json!("20");
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options.clone()).is_err());
+    config["equity_floor"] = json!("19");
+    config["ignored_limit"] = json!("999");
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options).is_err());
+}
+
+#[test]
+fn current_equity_wallet_requires_causal_minimum_and_separates_replay_profit() {
+    let dir = test_dir("current_equity_wallet");
+    let raw = dir.join("raw.jsonl");
+    let events = filled_touch_fixture("2026-06-01T00:01:01+00:00");
+    write_events(&raw, &events);
+    let wallet = dir.join("wallet.json");
+    let mut config = json!({
+        "campaign_baseline":"29.505501", "simulated_initial_equity":"50.690567",
+        "equity_floor":"0", "maximum_drawdown":"29.505501", "maximum_order_notional":"10.5",
+        "maximum_unresolved_orders_or_positions":1,
+        "current_equity_policy":{"reserve_ratio":"0.1", "minimum_reserve":"2",
+            "target_order_ratio":"0.05", "operating_buffer_ratio":"0.01", "minimum_order_notional":"1",
+            "fee_rate":"0.07", "fee_exponent":1}
+    });
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    let options = ReplayOptions {
+        wallet_config: Some(wallet.clone()),
+        input: raw.clone(),
+        markets: None,
+        strategy_config: None,
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    };
+    assert!(run_replay(options.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("decision-time venue minimum"));
+    let mut rows: Vec<Value> = events
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for row in &mut rows {
+        if row["event_type"] == "market" {
+            row["payload"]["minimum_order_size"] = json!("5");
+        }
+    }
+    write_events(
+        &raw,
+        &rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let report = run_replay(options.clone()).unwrap();
+    let start = &report["result"]["wallet_constrained_equity_curve"][0];
+    assert_eq!(start["equity"], "50.690567");
+    assert_eq!(start["net_pnl"], "0");
+    assert_eq!(start["campaign_net_pnl"], "21.185066");
+    assert!(report["result"]["wallet_config_sha256"].is_string());
+    config["simulated_initial_equity"] = Value::Null;
+    fs::write(&wallet, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(run_replay(options).is_err());
+}
+
+#[test]
+fn configured_replay_and_profiles_are_used_and_index_binds_real_shards() {
+    let dir = test_dir("configured_replay_index");
+    let raw = dir.join("raw.jsonl");
+    write_events(
+        &raw,
+        &filled_touch_fixture("2026-06-01T00:01:01+00:00").replace("post_only_gtc", "fak"),
+    );
+    let config = dir.join("strategy.json");
+    fs::write(&config, b"{ invalid json }").unwrap();
+    let options = ReplayOptions {
+        wallet_config: None,
+        input: raw.clone(),
+        markets: None,
+        strategy_config: Some(config.clone()),
+        fill_model: FillModel::Touch,
+        out: dir.join("replay.json"),
+        markdown: dir.join("replay.md"),
+        exclude_windows: Vec::new(),
+    };
+    assert!(run_replay(options.clone()).is_err());
+    fs::write(
+        &config,
+        serde_json::to_vec(&polyedge_config::StrategyConfig::default()).unwrap(),
+    )
+    .unwrap();
+    let default_replay = run_replay(options.clone()).unwrap();
+    assert_eq!(default_replay["result"]["taker_fills"], 0);
+    fs::write(
+        &config,
+        serde_json::to_vec(&polyedge_config::StrategyConfig {
+            enable_taker_orders: true,
+            ..Default::default()
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let replay = run_replay(options).unwrap();
+    assert_eq!(replay["result"]["taker_fills"], 1);
+    assert!(replay["result"]["strategy_config_sha256"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    let profiles = dir.join("profiles.yaml");
+    fs::write(
+        &profiles,
+        frozen_candidates_yaml().replace("profile: \"static\"", "profile: \"unknown\""),
+    )
+    .unwrap();
+    let error = run_regimes(RegimesOptions {
+        wallet_config: None,
+        input: raw.clone(),
+        markets: None,
+        fill_model: FillModel::Touch,
+        profile_config: Some(profiles),
+        out: dir.join("regimes.json"),
+        markdown: dir.join("regimes.md"),
+        exclude_windows: Vec::new(),
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("unsupported replay profile"));
+    let normalized = dir.join("normalized");
+    run_normalize(NormalizeOptions {
+        input: raw,
+        out: normalized.clone(),
+        format: "jsonl-indexed-gzip-sharded".to_owned(),
+        overwrite: false,
+        decision_grade_projection: false,
+    })
+    .unwrap();
+    let options = ReplayIndexOptions {
+        input: normalized.clone(),
+        out: dir.join("index"),
+        exclude_windows: Vec::new(),
+    };
+    let index = run_build_replay_index(options.clone()).unwrap();
+    assert_eq!(index["result"]["status"], "normalized_input_bound");
+    assert!(index["result"]["index_contents"].is_null());
+    let shards = index["result"]["input_files"]["normalized_shards"]
+        .as_array()
+        .unwrap();
+    assert!(!shards.is_empty());
+    for shard in shards {
+        use sha2::{Digest, Sha256};
+        let bytes = fs::read(normalized.join(shard["file"].as_str().unwrap())).unwrap();
+        assert_eq!(
+            shard["sha256"],
+            format!("sha256:{:x}", Sha256::digest(bytes))
+        );
+    }
+    fs::remove_file(normalized.join(shards[0]["file"].as_str().unwrap())).unwrap();
+    assert!(run_build_replay_index(options).is_err());
+    assert!(run_build_replay_index(ReplayIndexOptions {
+        input: PathBuf::from("azure://account/container/prefix"),
+        out: dir.join("remote-index"),
+        exclude_windows: Vec::new()
+    })
+    .is_err());
+}
+
+#[test]
+fn sample_size_requires_bound_conservative_model_and_temporal_independence() {
+    let dir = test_dir("temporal_sample");
+    let source = dir.join("baseline.json");
+    let make_source = |days: u32, correlated: bool| {
+        let rows=(1..=days).flat_map(|day|(0..100).map(move |market|serde_json::json!({
+            "market_id":format!("{day}-{market}"),"start_ts":format!("2026-06-{day:02}T00:00:00Z"),
+            "winning_outcome":"up","complete_for_simulation":true,"net_pnl":if correlated && day>21 {"-2"} else {"1"}
+        }))).collect::<Vec<_>>();
+        serde_json::json!({"result":{"fill_models":[{"fill_model":"queue_proxy_conservative","profile":"static",
+            "queue_proxy_pnl_eligible":true,"warnings":[],"market_results":rows}]}})
+    };
+    let options = SampleSizeOptions {
+        results: source.clone(),
+        fill_model: Some(FillModel::QueueProxyConservative),
+        out: dir.join("sample.json"),
+        markdown: dir.join("sample.md"),
+    };
+    fs::write(
+        &source,
+        serde_json::to_vec(&make_source(27, false)).unwrap(),
+    )
+    .unwrap();
+    let mut missing = options.clone();
+    missing.fill_model = None;
+    assert!(run_sample_size(missing)
+        .unwrap_err()
+        .to_string()
+        .contains("requires --fill-model"));
+    let short = run_sample_size(options.clone()).unwrap();
+    assert_eq!(short["result"]["profitability_claim_allowed"], false);
+    assert!(short["result"]["statistics"]["ci_low"].is_null());
+    fs::write(&source, serde_json::to_vec(&make_source(28, true)).unwrap()).unwrap();
+    let first = run_sample_size(options.clone()).unwrap();
+    let second = run_sample_size(options.clone()).unwrap();
+    let stats = &first["result"]["statistics"];
+    assert!(
+        stats["iid_descriptive_ci_low"]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap()
+            > 0.0
+    );
+    assert!(stats["ci_low"].as_str().unwrap().parse::<f64>().unwrap() < 0.0);
+    assert_eq!(stats["ci_low"], second["result"]["statistics"]["ci_low"]);
+    assert_eq!(stats["profitability_claim_allowed"], false);
+    assert_eq!(stats["temporal_confidence"]["bootstrap_resamples"], 10000);
+    let mut ineligible = make_source(28, false);
+    ineligible["result"]["fill_models"][0]["queue_proxy_pnl_eligible"] = serde_json::json!(false);
+    fs::write(&source, serde_json::to_vec(&ineligible).unwrap()).unwrap();
+    let result = run_sample_size(options.clone()).unwrap();
+    assert_eq!(result["result"]["profitability_claim_allowed"], false);
+    let duplicate = ineligible["result"]["fill_models"][0]["market_results"][0].clone();
+    ineligible["result"]["fill_models"][0]["market_results"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    fs::write(&source, serde_json::to_vec(&ineligible).unwrap()).unwrap();
+    assert!(run_sample_size(options)
+        .unwrap_err()
+        .to_string()
+        .contains("duplicate settled market"));
+}
+
+#[test]
+fn adverse_penalty_uses_fresh_fill_reference_and_requires_later_evidence() {
+    let dir = test_dir("adverse_fill_reference");
+    for (name, fresh_reference, post_ts, eligible) in [
+        ("fresh", true, "2026-06-01T00:01:02Z", true),
+        ("stale", false, "2026-06-01T00:01:02Z", false),
+        ("same_time", true, "2026-06-01T00:01:01Z", false),
+    ] {
+        let mut lines = vec![
+            market_line("m1", "up", "down"),
+            market_start_line("m1"),
+            reference_line("100", "2026-06-01T00:00:30Z"),
+            decision_line("m1", "up", "up", "2026-06-01T00:01:00Z"),
+        ];
+        if fresh_reference {
+            lines.push(reference_line("110", "2026-06-01T00:01:00.500Z"));
+        }
+        lines.extend([
+            book_line("up", "0.50", "2026-06-01T00:01:01Z"),
+            reference_line("105", post_ts),
+            reference_line("101", "2026-06-01T00:15:01Z"),
+        ]);
+        let input = dir.join(format!("{name}.jsonl"));
+        write_events(&input, &lines.join("\n"));
+        let report = run_replay(ReplayOptions {
+            wallet_config: None,
+            input,
+            markets: None,
+            strategy_config: None,
+            fill_model: FillModel::AdverseSelectionPenalized,
+            out: dir.join(format!("{name}.json")),
+            markdown: dir.join(format!("{name}.md")),
+            exclude_windows: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(report["result"]["fills"], 1);
+        assert_eq!(report["result"]["adverse_selection_pnl_eligible"], eligible);
+        if eligible {
+            assert_eq!(report["result"]["adverse_penalty"], "0.025");
+        }
+    }
 }
 
 #[test]
@@ -216,6 +590,7 @@ fn exclude_window_skips_events_and_prevents_contaminated_fills() {
     assert_eq!(audit["result"]["excluded_event_count"], 3);
 
     let replay = run_replay(ReplayOptions {
+        wallet_config: None,
         input: events,
         markets: None,
         strategy_config: None,
@@ -545,6 +920,7 @@ fn gzip_normalized_outputs_feed_build_markets_and_replay() {
     assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
 
     let replay = run_replay(ReplayOptions {
+        wallet_config: None,
         input: normalized,
         markets: Some(markets_path),
         strategy_config: None,
@@ -597,6 +973,7 @@ fn sharded_gzip_normalized_outputs_merge_by_event_time_for_replay() {
     assert_eq!(markets["result"]["summary"]["complete_for_simulation"], 1);
 
     let replay = run_replay(ReplayOptions {
+        wallet_config: None,
         input: normalized,
         markets: Some(markets_path),
         strategy_config: None,
@@ -767,6 +1144,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     })
     .unwrap();
     let baseline = run_baseline(BaselineOptions {
+        wallet_config: None,
         input: events.clone(),
         markets: None,
         out: reports.join("baseline.json"),
@@ -783,6 +1161,9 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     })
     .unwrap();
     let sweep = run_sweep(SweepOptions {
+        wallet_config: None,
+        test_input: None,
+        test_markets: None,
         input: events.clone(),
         markets: None,
         search: None,
@@ -794,6 +1175,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     })
     .unwrap();
     let sample = run_sample_size(SampleSizeOptions {
+        fill_model: Some(FillModel::TradeThrough),
         results: reports.join("baseline.json"),
         out: reports.join("sample_size.json"),
         markdown: reports.join("sample_size.md"),
@@ -813,7 +1195,7 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
     );
     assert_eq!(
         sweep["result"]["split_plan"]["no_future_leakage_rule"],
-        "training days must be strictly earlier than validation/test days"
+        "Holdout events and market truth must be separate inputs and are read only after the winner is fixed."
     );
     assert_eq!(sample["result"]["statistics"]["n"], 1);
     assert_eq!(
@@ -862,16 +1244,14 @@ fn baseline_calibration_sample_size_sweep_and_final_report_generate_outputs() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|row| row["fill_model"].as_str() == Some("touch_after_250ms"))
+        .find(|row| {
+            row["fill_model"].as_str() == prospective["result"]["rows"][0]["fill_model"].as_str()
+        })
         .unwrap()["net_pnl"]
         .clone();
     assert_eq!(
         prospective["result"]["rows"][0]["static_net_pnl"],
         expected_static
-    );
-    assert_ne!(
-        prospective["result"]["rows"][0]["static_net_pnl"],
-        Value::String("0".to_owned())
     );
     assert_eq!(
         prospective["result"]["rows"][0]["ci_95_low"],
@@ -1286,6 +1666,7 @@ fn future_settlement_reference_is_not_a_decision_time_feature() {
     );
 
     let report = run_regimes(RegimesOptions {
+        wallet_config: None,
         input: events,
         markets: None,
         fill_model: FillModel::Touch,
@@ -1336,14 +1717,16 @@ fn normalize_redacts_secret_fields_without_redacting_public_token_ids() {
 }
 
 #[test]
-fn sweep_reports_walk_forward_and_leave_one_day_splits() {
-    let dir = test_dir("sweep_splits");
-    let events = dir.join("events.jsonl");
-    write_events(&events, &five_day_fixture());
-
+fn sweep_without_separate_holdout_is_validation_only() {
+    let dir = test_dir("sweep_validation_only");
+    let input = dir.join("events.jsonl");
+    write_events(&input, &five_day_fixture());
     let report = run_sweep(SweepOptions {
-        input: events,
+        wallet_config: None,
+        input,
         markets: None,
+        test_input: None,
+        test_markets: None,
         search: None,
         split: "walk_forward".to_owned(),
         max_experiments: 1,
@@ -1352,32 +1735,23 @@ fn sweep_reports_walk_forward_and_leave_one_day_splits() {
         exclude_windows: Vec::new(),
     })
     .unwrap();
-    let plan = &report["result"]["split_plan"];
-
-    assert_eq!(plan["market_days"].as_array().unwrap().len(), 5);
     assert_eq!(
-        plan["latest_walk_forward"]["train_days"],
-        serde_json::json!(["2026-06-01", "2026-06-02", "2026-06-03"])
-    );
-    assert_eq!(plan["latest_walk_forward"]["validation_day"], "2026-06-04");
-    assert_eq!(plan["latest_walk_forward"]["test_day"], "2026-06-05");
-    assert_eq!(
-        plan["leave_one_day_out"]["folds"].as_array().unwrap().len(),
-        5
-    );
-    assert!(
-        report["result"]["candidates"][0]["fill_model_results"][0]["split_performance"]["test"]
-            ["markets"]
-            .as_u64()
-            .unwrap()
-            > 0
+        report["result"]["split_plan"]["scope"],
+        "selection_input_only"
     );
     assert_eq!(
         report["result"]["selection"]["status"],
-        "winner_fixed_before_test_open"
+        "validation_winner_fixed_test_not_evaluated"
     );
-    assert_eq!(report["result"]["candidates"][0]["selected"], true);
-    assert!(report["result"]["fold_results"].as_array().unwrap().len() >= 3);
+    assert_eq!(report["result"]["selection"]["robust_candidate"], false);
+    assert!(report["result"]["selection"]["sealed_test"].is_null());
+    assert_eq!(
+        report["result"]["candidates"][0]["fill_model_results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
 }
 
 #[test]
@@ -1398,6 +1772,9 @@ quote_style: [fair_minus_margin_only]
     .unwrap();
 
     let report = run_sweep(SweepOptions {
+        wallet_config: None,
+        test_input: None,
+        test_markets: None,
         input: events,
         markets: None,
         search: Some(search.clone()),
@@ -1455,6 +1832,9 @@ fn sweep_rejects_search_parameters_that_are_not_applied() {
     fs::write(&search, "version: 1\nmaker_margin: [0.01, 0.02]\n").unwrap();
 
     let error = run_sweep(SweepOptions {
+        wallet_config: None,
+        test_input: None,
+        test_markets: None,
         input: events,
         markets: None,
         search: Some(search),
@@ -1500,6 +1880,9 @@ fn sweep_search_rejects_zero_configured_runs_duplicate_json_and_multiple_version
         let search = dir.join(name);
         fs::write(&search, text).unwrap();
         let error = run_sweep(SweepOptions {
+            wallet_config: None,
+            test_input: None,
+            test_markets: None,
             input: events.clone(),
             markets: None,
             search: Some(search),
@@ -1515,64 +1898,39 @@ fn sweep_search_rejects_zero_configured_runs_duplicate_json_and_multiple_version
 }
 
 #[test]
-fn sweep_selection_is_invariant_to_the_sealed_final_test_day() {
+fn sweep_selection_is_invariant_to_a_physically_separate_holdout() {
     let first = run_leakage_sweep("sweep_leakage_up", "101");
     let second = run_leakage_sweep("sweep_leakage_down", "99");
-
+    let ranks = |report: &Value| {
+        report["result"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["candidate"].clone(),
+                    r["validation_rank"].clone(),
+                    r["validation_total_fill_model_net_pnl"].clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ranks(&first), ranks(&second));
     assert_eq!(
         first["result"]["selection"]["candidate"],
         second["result"]["selection"]["candidate"]
     );
-    assert_eq!(
-        first["result"]["candidates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| (
-                &row["candidate"],
-                &row["validation_rank"],
-                &row["validation_total_fill_model_net_pnl"]
-            ))
-            .collect::<Vec<_>>(),
-        second["result"]["candidates"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|row| (
-                &row["candidate"],
-                &row["validation_rank"],
-                &row["validation_total_fill_model_net_pnl"]
-            ))
-            .collect::<Vec<_>>()
-    );
-    assert_ne!(
-        first["result"]["selection"]["sealed_test"],
-        second["result"]["selection"]["sealed_test"]
-    );
-    assert!(first["result"]["candidates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|row| row["selected"] == false)
-        .all(|row| row["sealed_test"].is_null()));
+    assert!(first["result"]["selection"]["sealed_test"].is_null());
     for report in [&first, &second] {
-        let aggregate_winner = &report["result"]["selection"]["candidate"];
-        let final_day = &report["result"]["split_plan"]["latest_walk_forward"]["test_day"];
-        let final_fold = report["result"]["fold_results"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|fold| &fold["test_day"] == final_day)
-            .unwrap();
-        let fold_test_status = final_fold["sealed_test"]["status"].as_str().unwrap();
-        if fold_test_status == "opened_after_winner_fixed" {
-            assert_eq!(&final_fold["selected_candidate"], aggregate_winner);
-        } else {
-            assert_eq!(
-                fold_test_status,
-                "sealed_fold_winner_differs_from_fixed_aggregate_winner"
-            );
-            assert!(final_fold["sealed_test"]["fill_model_results"].is_null());
+        assert_eq!(
+            report["result"]["selection"]["status"],
+            "insufficient_validation_evidence_holdout_unopened"
+        );
+        assert_eq!(report["result"]["selection"]["robust_candidate"], false);
+        for row in report["result"]["candidates"].as_array().unwrap() {
+            if row["selected"] != true {
+                assert!(row["sealed_test"].is_null());
+            }
         }
     }
 }
@@ -1585,6 +1943,9 @@ fn sweep_report_rule_text_matches_fail_closed_computation() {
     write_events(&events, &filled_five_day_fixture("101"));
 
     let report = run_sweep(SweepOptions {
+        wallet_config: None,
+        test_input: None,
+        test_markets: None,
         input: events,
         markets: None,
         search: None,
@@ -1600,20 +1961,12 @@ fn sweep_report_rule_text_matches_fail_closed_computation() {
 
     assert!(robust_rule.contains("7-day circular block-bootstrap lower 95% bound"));
     assert!(robust_rule.contains("10000 resamples, at least 28 daily clusters"));
-    assert!(robust_rule.contains("non-negative net PnL under both models"));
+    assert!(robust_rule.contains("positive wallet-constrained PnL"));
     assert!(rendered.contains(robust_rule));
     assert!(report["result"]["test_sealing_rule"]
         .as_str()
         .unwrap()
-        .contains("final aggregate test remains sealed"));
-    assert!(report["result"]["fold_results"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|fold| fold["selection_rule"]
-            .as_str()
-            .unwrap()
-            .contains("single validation day")));
+        .contains("separate test input and separate market truth"));
     assert_eq!(report["result"]["candidates"].as_array().unwrap().len(), 1);
     assert_eq!(report["result"]["selection"]["robust_candidate"], false);
     assert!(report["result"]["candidates"][0]["fill_model_results"]
@@ -1628,6 +1981,7 @@ fn sweep_report_rule_text_matches_fail_closed_computation() {
 
 fn replay(dir: &Path, events: &Path, fill_model: FillModel) -> Value {
     run_replay(ReplayOptions {
+        wallet_config: None,
         input: events.to_path_buf(),
         markets: None,
         strategy_config: None,
@@ -1851,19 +2205,60 @@ fn filled_touch_fixture(book_ts: &str) -> String {
 
 fn run_leakage_sweep(name: &str, final_day_price: &str) -> Value {
     let dir = test_dir(name);
-    let events = dir.join("events.jsonl");
-    write_events(&events, &filled_five_day_fixture(final_day_price));
-    run_sweep(SweepOptions {
-        input: events,
+    let raw = dir.join("selection-raw.jsonl");
+    write_events(&raw, &filled_five_day_fixture("101"));
+    let test_raw = dir.join("holdout-raw.jsonl");
+    write_events(
+        &test_raw,
+        &filled_touch_fixture("2026-06-01T00:01:01+00:00")
+            .replace("2026-06-01", "2026-06-06")
+            .replace("m1", "holdout-m1")
+            .replace(
+                "\"price\":\"101\"",
+                &format!("\"price\":\"{final_day_price}\""),
+            ),
+    );
+    for (input, out) in [
+        (raw, dir.join("selection")),
+        (test_raw, dir.join("holdout")),
+    ] {
+        run_normalize(NormalizeOptions {
+            input,
+            out,
+            format: "jsonl-indexed-gzip-sharded".to_owned(),
+            overwrite: false,
+            decision_grade_projection: false,
+        })
+        .unwrap();
+    }
+    let options = SweepOptions {
+        wallet_config: None,
+        input: dir.join("selection"),
         markets: None,
+        test_input: Some(dir.join("holdout")),
+        test_markets: None,
         search: None,
         split: "walk_forward".to_owned(),
         max_experiments: 4,
         out: dir.join("sweep.json"),
         markdown: dir.join("sweep.md"),
         exclude_windows: Vec::new(),
-    })
-    .unwrap()
+    };
+    let report = run_sweep(options.clone()).unwrap();
+    assert!(!dir.join("sweep.winner-before-test.json").exists());
+    // An unreadable held-out shard must not be opened when validation fails.
+    fs::remove_dir_all(dir.join("holdout")).unwrap();
+    fs::create_dir(dir.join("holdout")).unwrap();
+    let rerun = run_sweep(options.clone()).unwrap();
+    assert_eq!(rerun["result"]["selection"], report["result"]["selection"]);
+    let mut same = options;
+    same.test_input = Some(same.input.clone());
+    same.out = dir.join("same.json");
+    assert!(run_sweep(same)
+        .unwrap_err()
+        .to_string()
+        .contains("disjoint paths"));
+    report
 }
 
 fn filled_five_day_fixture(final_day_price: &str) -> String {

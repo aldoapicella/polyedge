@@ -944,3 +944,25 @@ and `systemctl list-timers` checks. For rollback, restore the prior saved
 digests), run `sudo systemctl daemon-reload`, restart the two services, and
 repeat the health checks. Retain the prior images until the rollback window
 closes.
+
+### Missing funded rollout recording
+
+For the `cf701ac5` signer only, `polyedge-funded-signer-post-redemption-rollout-20260824`
+can produce a distinct recording-recovery certificate alongside its normal
+post-redemption attestation. Set `POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_INPUTS`
+to a root-owned, mode-0640 seven-source bundle and set the corresponding
+`RECORDING_RECOVERY_IMAGE` and `RECORDING_RECOVERY_REVISION` variables to the
+reviewed replacement image containing `funded-terminal-no-order-proof.mjs`.
+The verifier authenticates conditional Blob reads and binds the latest post-only
+no-order rejection, its released reservation, and a prior verified redemption
+to the complete current-runtime journal. A follow-up redemption check and ready
+heartbeat must both follow the rejection. It never submits an order or redemption.
+
+The guarded restart accepts this certificate through
+`POLYEDGE_GUARDED_RESTART_RECORDING_RECOVERY` and its `_SHA256` variable only in
+active repair mode, with no claimed prior rollout receipt. The certificate and
+its attestation must be fresh, hash-bound, and match the exact current runtime
+and replacement image. Normal queue, exposure, token, producer, disk, rollback,
+and post-restart readiness gates still apply. The resulting receipt records
+`recordingRecovery` and leaves `priorRollout` null; it does not reconstruct or
+claim an original guarded deployment.
