@@ -963,10 +963,11 @@ export async function migrateProtectedReserveState({
   }
 
   if (checkpoint?.migration_source_session_id !== undefined) {
+    // The verified checkpoint records the original flat rollover. Later target
+    // positions do not repeat migration; equity and ledger checks below still bind restart.
     if (currentEquityTarget
         && (fullyReconciled !== true
           || Number(openOrderCount) !== 0
-          || Number(positionCount) !== 0
           || Number(sourceUnresolvedReservationCount) !== 0)) {
       throw new Error("fail closed: unbounded rollover checkpoint requires a flat source account");
     }

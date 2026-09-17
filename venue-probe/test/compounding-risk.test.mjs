@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { runPersistentFundedDirectService } from "../src/funded-direct-service.mjs";
 import {
   discoverVerifiedAutomaticInternalSettlements,
   fundedSessionExpiryMs,
@@ -497,6 +498,9 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
     sourceUnresolvedReservationCount: 0,
     now: () => new Date("2026-09-16T00:05:00.000Z")
   };
+  const beforeInitial = new Map(fixture.container.values);
+  await assert.rejects(migrateProtectedReserveState({ ...input, positionCount: 1 }), /requires zero orders, positions/);
+  assert.deepEqual(fixture.container.values, beforeInitial);
   const first = await migrateProtectedReserveState(input);
   assert.equal(first.state.reserve_basis, "fully_reconciled_current_equity");
   assert.equal(first.state.reserve_monotonic, false);
@@ -527,6 +531,7 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
   const restartInput = {
     ...input,
     accountEquity: 48,
+    positionCount: 1,
     now: () => new Date("2026-09-16T00:06:00.000Z")
   };
   const recovered = await migrateProtectedReserveState(restartInput);
@@ -545,10 +550,26 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
   });
   assert.equal(second.state.migration_completed_at,
     first.state.migration_completed_at);
+  assert.equal(fixture.container.etags.get(fixture.targetManifest.capital_policy.state_blob_name), targetEtag);
+  assert.deepEqual(second.state, recovered.state);
+  const startupLogs = [];
+  await runPersistentFundedDirectService({
+    env: { FUNDED_DIRECT_SERVICE_ENABLED: "true", FUNDED_DIRECT_ENGINE: "persistent_v1",
+      FUNDED_DIRECT_SERVICE_BUS_NAMESPACE: "sb-test", FUNDED_DIRECT_SERVICE_BUS_QUEUE: "funded-test" },
+    createBusClient: () => ({ createReceiver: () => ({ close: async () => {} }), close: async () => {} }),
+    createProcessor: async () => ({ process: async () => assert.fail("startup must not submit orders") }),
+    createExecutor: async () => {
+      const resumed = await migrateProtectedReserveState(restartInput);
+      assert.deepEqual(resumed.state, recovered.state);
+      return { status: () => ({ ready: true }), close: async () => {} };
+    },
+    runRedemption: async () => assert.fail("initialization must not submit redemption"),
+    logger: event => { startupLogs.push(event); if (event.status === "persistent_service_started") process.emit("SIGTERM"); }
+  });
+  assert.equal(startupLogs.filter(event => event.status === "persistent_service_started").length, 1);
   for (const unsafe of [
     { fullyReconciled: false },
     { openOrderCount: 1 },
-    { positionCount: 1 },
     { sourceUnresolvedReservationCount: 1 },
     { accountEquity: 47 }
   ]) {
