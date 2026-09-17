@@ -9,6 +9,13 @@ case "$1" in is-active) [ "$3" = polyedge-parity-hourly.timer ] && exit 1; exit 
 EOF
 cat >"$tmp/bin/podman" <<'EOF'
 #!/usr/bin/env bash
+if [ "${FAKE_RECOVERY_TEST:-0}" = 1 ]; then
+  case "$1" in
+    run) /usr/bin/jq -e '.bundle==(.bundleBytesBase64|@base64d|fromjson) and .runtime.invocationId!=null and (.journal|length)>0' >/dev/null; cat "$FAKE_RECOVERY_PROOF"; exit;;
+    exec) case "${6:-}" in *tenant*) echo '{"tenant":"11111111-1111-1111-1111-111111111111","client":"22222222-2222-2222-2222-222222222222"}';; *) echo "${FAKE_UNRESOLVED:-0}";; esac; exit;;
+    image) if [[ "${4:-}" == *'{{.Os}}/{{.Architecture}}|'* ]]; then echo "linux/arm64|$POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_REVISION"; exit; fi;;
+  esac
+fi
 case "$1:$3" in
 inspect:'{{.Id}}') [ "$4" = polyedge-funded-intent-producer ] && printf "%064d\n" 2 || printf "%064d\n" 1;;
 inspect:'{{.Config.Image}}') [ "$4" = polyedge-funded-intent-producer ] && echo ghcr.io/aldoapicella/polyedge-rust-backend@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc || echo ghcr.io/aldoapicella/polyedge-venue-probe@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa;;
@@ -37,7 +44,7 @@ chmod 640 "$tmp/live" "$tmp/dry" "$tmp/settlement"
 cat >>"$tmp/bin/journalctl" <<'EOF'
 old_alert='{"schema":"polyedge.funded_direct_alert.v1","status":"recovered_before_health_baseline"}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$old_alert" '{__REALTIME_TIMESTAMP:(($n-120000000)|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'
 EOF
-run(){ env POLYEDGE_TEST_ALLOW_UNPRIVILEGED=1 POLYEDGE_TEST_SYSTEMCTL="$tmp/bin/systemctl" POLYEDGE_TEST_PODMAN="$tmp/bin/podman" POLYEDGE_TEST_JOURNALCTL="$tmp/bin/journalctl" POLYEDGE_TEST_RUNUSER="$tmp/bin/runuser" POLYEDGE_TEST_AZ="$tmp/bin/az" POLYEDGE_TEST_DISK_GUARD="$tmp/bin/guard" POLYEDGE_TEST_UID="$(id -u)" POLYEDGE_TEST_GID="$(id -g)" POLYEDGE_TEST_LOCK_FILE="$tmp/lock" POLYEDGE_POST_REDEMPTION_RUN_ID=venue-redemption-20260824182234412-7ef7b79f POLYEDGE_POST_REDEMPTION_TRANSACTION_HASH=0x676417d72ea63cb7346569caf8d1b2585332a5be97506919aba5e9ed4b51ded1 POLYEDGE_POST_REDEMPTION_CONDITION_ID=0xe79defc301b116f6f911912194a98e4d88be1d37dd37d5ff27be85dc4795600b POLYEDGE_POST_REDEMPTION_SETTLEMENT_BLOB=reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/internal-settlements/ef2057fff0b51ea73541efdd05bf378c18249c51b4bc9f72bcb774d5b9008e37.json POLYEDGE_POST_REDEMPTION_FRESH_AFTER=2026-08-24T18:22:34Z POLYEDGE_POST_REDEMPTION_HEALTH_AFTER="$(date -u -d '60 seconds ago' +%Y-%m-%dT%H:%M:%SZ)" POLYEDGE_POST_REDEMPTION_LIQUID_BEFORE=26.171637 POLYEDGE_POST_REDEMPTION_LIQUID_AFTER=31.171637 POLYEDGE_POST_REDEMPTION_PAYOUT=5 POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY="$tmp/live" POLYEDGE_POST_REDEMPTION_DRY_RUN="$tmp/dry" POLYEDGE_POST_REDEMPTION_SETTLEMENT="$tmp/settlement" POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR="$1" "$script"; }
+run(){ local output_dir=$1; shift; env POLYEDGE_TEST_ALLOW_UNPRIVILEGED=1 POLYEDGE_TEST_SYSTEMCTL="$tmp/bin/systemctl" POLYEDGE_TEST_PODMAN="$tmp/bin/podman" POLYEDGE_TEST_JOURNALCTL="$tmp/bin/journalctl" POLYEDGE_TEST_RUNUSER="$tmp/bin/runuser" POLYEDGE_TEST_AZ="$tmp/bin/az" POLYEDGE_TEST_DISK_GUARD="$tmp/bin/guard" POLYEDGE_TEST_UID="$(id -u)" POLYEDGE_TEST_GID="$(id -g)" POLYEDGE_TEST_LOCK_FILE="$tmp/lock" POLYEDGE_POST_REDEMPTION_RUN_ID=venue-redemption-20260824182234412-7ef7b79f POLYEDGE_POST_REDEMPTION_TRANSACTION_HASH=0x676417d72ea63cb7346569caf8d1b2585332a5be97506919aba5e9ed4b51ded1 POLYEDGE_POST_REDEMPTION_CONDITION_ID=0xe79defc301b116f6f911912194a98e4d88be1d37dd37d5ff27be85dc4795600b POLYEDGE_POST_REDEMPTION_SETTLEMENT_BLOB=reports/funded/dynamic-quote/sessions/dynamic-quote-funded-2026-08-13-v10/internal-settlements/ef2057fff0b51ea73541efdd05bf378c18249c51b4bc9f72bcb774d5b9008e37.json POLYEDGE_POST_REDEMPTION_FRESH_AFTER=2026-08-24T18:22:34Z POLYEDGE_POST_REDEMPTION_HEALTH_AFTER="$(date -u -d '60 seconds ago' +%Y-%m-%dT%H:%M:%SZ)" POLYEDGE_POST_REDEMPTION_LIQUID_BEFORE=26.171637 POLYEDGE_POST_REDEMPTION_LIQUID_AFTER=31.171637 POLYEDGE_POST_REDEMPTION_PAYOUT=5 POLYEDGE_POST_REDEMPTION_LIVE_SUMMARY="$tmp/live" POLYEDGE_POST_REDEMPTION_DRY_RUN="$tmp/dry" POLYEDGE_POST_REDEMPTION_SETTLEMENT="$tmp/settlement" POLYEDGE_POST_REDEMPTION_ATTESTATION_DIR="$output_dir" "$@" "$script"; }
 run "$tmp/out" >/dev/null
 receipt="$tmp/out/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json"; /usr/bin/jq -e '.status=="attested" and (.helperSha256|test("^sha256:[0-9a-f]{64}$")) and .authorizedDeadLetterBaseline==7 and .runtime.signer.restartCount==0 and .runtime.producer.revision=="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" and .runtime.producer.status=="running" and .heartbeat.automaticRedemptionEnabled==true and (.heartbeat.healthBaselineAtEpoch|type=="number") and .heartbeat.redemptionFailures==0 and .evidence.liveSummary.path != null and .servicesMutated==false' "$receipt" >/dev/null
 sed -i 's/"dry_run":true/"dry_run":false,"redemption_enabled":true/' "$tmp/dry"
@@ -49,6 +56,23 @@ sed -i 's/"market_channel_gaps":1/"market_channel_gaps":0/' "$tmp/bin/journalctl
 sed -i 's/nothing_to_redeem/not_redeemed/' "$tmp/dry"
 if run "$tmp/out-bad" >/dev/null 2>&1; then echo "bad follow-up unexpectedly attested" >&2; exit 1; fi
 sed -i 's/not_redeemed/nothing_to_redeem/' "$tmp/dry"
+# Exercise the proof-producing branch with bounded process/storage mocks.
+printf 'token' >"$tmp/token"; chmod 600 "$tmp/token"
+printf '{"documents":{}}\n' >"$tmp/source-bundle"; chmod 640 "$tmp/source-bundle"
+cat >"$tmp/bin/stat" <<'EOF'
+#!/usr/bin/env bash
+if [ "$2" = '%u:%g:%a:%h' ]; then echo '986:982:600:1'; else exec /usr/bin/stat "$@"; fi
+EOF
+chmod 755 "$tmp/bin/stat"
+jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.finished_ts=$ts' "$tmp/dry" >"$tmp/dry-fresh"; mv "$tmp/dry-fresh" "$tmp/dry"; chmod 640 "$tmp/dry"
+jq -n --arg live "sha256:$(sha256sum "$tmp/live"|cut -d' ' -f1)" --arg settlement "sha256:$(sha256sum "$tmp/settlement"|cut -d' ' -f1)" --arg bundle "sha256:$(sha256sum "$tmp/source-bundle"|cut -d' ' -f1)" --argjson since "$(( $(date -u +%s) - 120 ))" '{status:"verified_terminal_no_order",authenticatedSourcesVerified:true,readOnly:true,cleanSinceEpoch:$since,sourceBundleSha256:$bundle,redemption:{summarySha256:$live,settlementSha256:$settlement}}' >"$tmp/proof"
+run_recovery(){ local output=$1; shift; run "$output" PATH="$tmp/bin:$PATH" FAKE_RECOVERY_TEST=1 FAKE_RECOVERY_PROOF="$tmp/proof" POLYEDGE_TEST_TOKEN_FILE="$tmp/token" POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_INPUTS="$tmp/source-bundle" POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_IMAGE=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd POLYEDGE_POST_REDEMPTION_RECORDING_RECOVERY_REVISION=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee "$@"; }
+run_recovery "$tmp/out-recovery" >/dev/null
+jq -e '.status=="recording_recovered" and .sourceBundle.path!=null and .proof.authenticatedSourcesVerified==true and .originalGuardedDeploymentClaimed==false and .servicesMutated==false' "$tmp/out-recovery/recording-recovery-00000000000000000000000000000001.json" >/dev/null
+if run_recovery "$tmp/out-unresolved" FAKE_UNRESOLVED=1 >/dev/null 2>&1; then echo 'unresolved risk unexpectedly attested' >&2; exit 1; fi
+jq '.finished_ts="2026-01-01T00:00:00Z"' "$tmp/dry" >"$tmp/dry-stale"; mv "$tmp/dry-stale" "$tmp/dry"; chmod 640 "$tmp/dry"
+if run_recovery "$tmp/out-stale" >/dev/null 2>&1; then echo 'stale follow-up unexpectedly attested' >&2; exit 1; fi
+jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.finished_ts=$ts' "$tmp/dry" >"$tmp/dry-fresh"; mv "$tmp/dry-fresh" "$tmp/dry"; chmod 640 "$tmp/dry"
 cat >>"$tmp/bin/journalctl" <<'EOF'
 alert='{"schema":"polyedge.funded_direct_alert.v1","status":"websocket_gap_or_reconciliation_required"}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$alert" '{__REALTIME_TIMESTAMP:($n|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'
 EOF

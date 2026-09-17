@@ -1164,7 +1164,7 @@ async function writeBusyCompletion(container, config, selected, now) {
   });
 }
 
-function assertExistingAuthorizationBinding(authorization, config, session, selected) {
+export function assertExistingAuthorizationBinding(authorization, config, session, selected) {
   const value = authorization?.value;
   if (authorization?.blobName !== authorizationBlobName(config, session, selected.value) ||
       value?.schema !== AUTHORIZATION_SCHEMA ||
@@ -1181,7 +1181,7 @@ function assertExistingAuthorizationBinding(authorization, config, session, sele
   }
 }
 
-async function loadTerminalNoExposureReservation(container, selected, authorization, now) {
+export async function loadTerminalNoExposureReservation(container, selected, authorization, now) {
   const decisionId = selected.value.decision_id;
   const probeId = `funded-direct-${decisionId}`;
   const dates = [...new Set([
@@ -1230,7 +1230,7 @@ async function readJsonBlob(container, blobName) {
   return (await readJsonBlobDocument(container, blobName)).value;
 }
 
-async function authorizationWasConsumed(container, authorization, selected) {
+export async function authorizationWasConsumed(container, authorization, selected) {
   const authorizationId = clean(authorization.value?.authorization_id);
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/.test(authorizationId)) return false;
   const blobName = `reports/research/venue-probe/control/strategy-canary/consumed/${authorizationId}.json`;

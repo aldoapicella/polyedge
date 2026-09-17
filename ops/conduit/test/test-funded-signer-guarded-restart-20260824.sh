@@ -10,7 +10,7 @@ producer_image=ghcr.io/aldoapicella/polyedge-rust-backend@sha256:ddddddddddddddd
 approved_condition=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
-grep -F '"$journalctl" -u polyedge-funded-signer.service -n 5000 -o json --no-pager' "$helper" >/dev/null
+grep -F '"_SYSTEMD_INVOCATION_ID=$invocation_id" "CONTAINER_ID_FULL=$container" -o json --all --no-pager' "$helper" >/dev/null
 
 fixture() {
   local d=$1
@@ -31,7 +31,7 @@ fixture() {
 set -euo pipefail
 case "$1" in
  is-active) case "$3" in polyedge-funded-signer.service) test "$(cat "$FAKE/state/signer-active")" = 1;; polyedge-funded-intent-producer.service) test "$(cat "$FAKE/state/producer-active")" = 1;; polyedge-parity-hourly.timer) exit 3;; esac ;;
- stop) case "$2" in polyedge-funded-signer.service) printf '0\n' >"$FAKE/state/signer-active";; polyedge-funded-intent-producer.service) printf '0\n' >"$FAKE/state/producer-active";; esac ;;
+ stop) case "$2" in polyedge-funded-signer.service) printf '0\n' >"$FAKE/state/signer-active";; polyedge-funded-intent-producer.service) printf '0\n' >"$FAKE/state/producer-active"; if [ "${FAKE_RUNTIME_CHANGE:-0}" = 1 ]; then printf '%032d\n' 9 >"$FAKE/state/invocation"; printf '%064d\n' 9 >"$FAKE/state/container"; fi;; esac ;;
  start) case "$2" in polyedge-funded-signer.service) printf '1\n' >"$FAKE/state/signer-active"; printf 'after\n' >"$FAKE/state/phase"; printf '%032d\n' 3 >"$FAKE/state/invocation"; printf '%064d\n' 4 >"$FAKE/state/container";; polyedge-funded-intent-producer.service) printf '1\n' >"$FAKE/state/producer-active";; esac ;;
  restart) test "$2" = polyedge-funded-signer.service; printf 'after\n' >"$FAKE/state/phase"; printf '%032d\n' 3 >"$FAKE/state/invocation"; printf '%064d\n' 4 >"$FAKE/state/container" ;;
  daemon-reload) : ;;
@@ -42,7 +42,7 @@ EOF
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
- pull) : ;;
+ pull) if [ "${FAKE_EVIDENCE_CHANGE:-0}" = 1 ]; then printf '\n' >>"$FAKE/recovery.json"; fi ;;
  image) printf "%s\n" "linux/arm64|$FAKE_SIGNER_REVISION" ;;
  inspect)
   image=$FAKE_SIGNER_IMAGE; [ "$(cat "$FAKE/state/phase")" = after ] || image=${FAKE_PRIOR_SIGNER_IMAGE:-$FAKE_SIGNER_IMAGE}
@@ -68,6 +68,9 @@ ts="$(( $(date -u +%s) - 1 ))000000"
 if [ "${FAKE_REPAIR_PRE:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = before ]; then
   alert=$(/usr/bin/jq -nc '{schema:"polyedge.funded_direct_alert.v1",status:"known_repair_trigger"}')
   /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$alert" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
+fi
+if [ "${FAKE_LATE_ALERT:-0}" = 1 ] && [ "$(cat "$FAKE/state/phase")" = before ]; then
+  /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:"{\"schema\":\"polyedge.funded_direct_alert.v1\",\"status\":\"later_failure\"}"}'
 fi
 /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$started" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
 /usr/bin/jq -nc --arg ts "$ts" --arg inv "$(cat "$FAKE/state/invocation")" --arg container "$(cat "$FAKE/state/container")" --arg message "$message" '{__REALTIME_TIMESTAMP:$ts,_SYSTEMD_INVOCATION_ID:$inv,CONTAINER_ID_FULL:$container,MESSAGE:$message}'
@@ -169,4 +172,50 @@ test "$(cat "$stopped_repair_bad/state/signer-active")" = 0; test "$(cat "$stopp
 stopped_bad=$root/stopped-bad; fixture "$stopped_bad"; printf '0\n' >"$stopped_bad/state/signer-active"; printf '0\n' >"$stopped_bad/state/producer-active"; printf '{"status":"unsafe"}\n' >"$stopped_bad/preflight.json"; chmod 640 "$stopped_bad/preflight.json"
 if run "$stopped_bad" POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED=true POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT="$stopped_bad/preflight.json" POLYEDGE_GUARDED_RESTART_STOPPED_PREFLIGHT_SHA256="$(sha256sum "$stopped_bad/preflight.json" | cut -d' ' -f1)" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING="$stopped_bad/binding-proof.json" POLYEDGE_GUARDED_RESTART_STOPPED_BINDING_SHA256="$(sha256sum "$stopped_bad/binding-proof.json" | cut -d' ' -f1)"; then exit 1; fi
 test "$(cat "$stopped_bad/state/signer-active")" = 0; test "$(cat "$stopped_bad/state/producer-active")" = 0
+recovery_fixture() {
+  local d=$1 now
+  fixture "$d"; bind_repair_evidence "$d"; now=$(date -u +%s)
+  jq -n '{documents:(["authorization","consumption","intent","legacy_completion","redemption","reservation","settlement"] | map({key:.,value:{container:"test",path:.,etag:"0xABC",sha256:("a"*64)}}) | from_entries)}' >"$d/bundle.json"
+  jq --argjson now "$now" --arg user "$(id -u):$(id -g)" --arg producer "$producer_image" '
+    .createdAtUtc=($now|todateiso8601) | .servicesMutated=false | .helperSha256=("sha256:"+("f"*64)) |
+    .runtime.signer += {revision:"4208d541f193c85bd121692bdff46b8898f2c2fc",user:$user,restartCount:0} |
+    .runtime.producer={invocationId:.runtime.signer.invocationId,image:$producer,user:$user,restartCount:0} |
+    .heartbeat={capturedAtEpoch:($now-1)} | .redemption={transactionHash:"transaction",settlementBlob:"settlement"} |
+    .evidence={liveSummary:{sha256:"live"},internalSettlement:{sha256:"settlement"}}
+  ' "$d/lifecycle.json" >"$d/lifecycle.tmp"; mv "$d/lifecycle.tmp" "$d/lifecycle.json"
+  jq -n --slurpfile life "$d/lifecycle.json" --slurpfile bundle "$d/bundle.json" --arg path "$d/lifecycle.json" --arg sha "sha256:$(sha256sum "$d/lifecycle.json" | cut -d' ' -f1)" \
+    --arg bundle_path "$d/bundle.json" --arg bundle_sha "sha256:$(sha256sum "$d/bundle.json" | cut -d' ' -f1)" --arg target "$signer_image" --arg revision "$signer_revision" --argjson now "$now" '
+    $life[0] as $l | {schema:"polyedge.funded_signer_recording_recovery.v1",status:"recording_recovered",createdAtUtc:$l.createdAtUtc,
+    originalGuardedDeploymentClaimed:false,servicesMutated:false,azureDeletionAllowed:false,helperSha256:$l.helperSha256,
+    targetSigner:{image:$target,revision:$revision},lifecycle:{path:$path,sha256:$sha},runtime:$l.runtime,
+    sourceBundle:{path:$bundle_path,sha256:$bundle_sha},proof:{schema:"polyedge.terminal_no_order_proof.v1",status:"verified_terminal_no_order",
+    authenticatedSourcesVerified:true,readOnly:true,originalRolloutReceiptPresent:false,verifiedAtUtc:$l.createdAtUtc,
+    sourceBundleSha256:$bundle_sha,sources:$bundle[0].documents,runtime:($l.runtime.signer|{image,revision,invocationId,containerId}),
+    decisionId:("a"*64),reason:"post_only_crosses_book",cleanSinceEpoch:($now-120),
+    redemption:{summarySha256:"live",settlementSha256:"settlement",transactionHash:"transaction",settlementBlob:"settlement"}}}' >"$d/recovery.json"
+  chmod 640 "$d/lifecycle.json" "$d/bundle.json" "$d/recovery.json"
+}
+run_recovery() {
+  local d=$1; shift
+  run "$d" FAKE_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_PRIOR_SIGNER_IMAGE="$prior_signer_image" \
+    POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT= POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT_SHA256= \
+    POLYEDGE_GUARDED_RESTART_RECORDING_RECOVERY="$d/recovery.json" POLYEDGE_GUARDED_RESTART_RECORDING_RECOVERY_SHA256="$(sha256sum "$d/recovery.json" | cut -d' ' -f1)" \
+    POLYEDGE_GUARDED_RESTART_REPAIR_MODE=true POLYEDGE_GUARDED_RESTART_DEPLOY="$d/bin/deploy" POLYEDGE_GUARDED_RESTART_QUADLET="$d/quadlet" POLYEDGE_GUARDED_RESTART_ROLLBACK_DIR="$d/rollback" "$@"
+}
+prior_signer_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:cf701ac5ebdf1a66c10ed52feab9fbca3dfb6eb7937e2501c5a41f812a29f28f
+d=$root/recovery; recovery_fixture "$d"; run_recovery "$d"
+jq -e '.status=="validated" and .priorRollout==null and .recordingRecovery.path!=null and .producer.restored==true' "$d/ring/activation/receipt.json" >/dev/null
+for mutation in '.createdAtUtc="2026-01-01T00:00:00Z"' '.proof.verifiedAtUtc="2026-01-01T00:00:00Z"' '.runtime.signer.containerId=("0"*64)' '.targetSigner.revision=("0"*40)' '.proof.sources.intent.etag="changed"' '.proof.sourceBundleSha256=("sha256:"+("0"*64))'; do
+  d=$root/recovery-bad-$RANDOM; recovery_fixture "$d"; jq "$mutation" "$d/recovery.json" >"$d/mutated"; mv "$d/mutated" "$d/recovery.json"; chmod 640 "$d/recovery.json"
+  if run_recovery "$d"; then echo "invalid recovery accepted: $mutation" >&2; exit 1; fi
+  test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
+done
+for bad_env in FAKE_LATE_ALERT=1 FAKE_FAILED_MESSAGES=1 FAKE_EVIDENCE_CHANGE=1 POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT=claimed POLYEDGE_GUARDED_RESTART_RECORDING_RECOVERY_SHA256=0000000000000000000000000000000000000000000000000000000000000000; do
+  d=$root/recovery-bad-$RANDOM; recovery_fixture "$d"
+  if run_recovery "$d" "$bad_env"; then echo "unsafe recovery accepted: $bad_env" >&2; exit 1; fi
+  test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
+done
+d=$root/recovery-runtime-change; recovery_fixture "$d"
+if run_recovery "$d" FAKE_RUNTIME_CHANGE=1; then echo 'runtime change unexpectedly deployed' >&2; exit 1; fi
+test "$(cat "$d/state/phase")" = before; test "$(cat "$d/state/producer-active")" = 0; test ! -e "$d/ring/activation/receipt.json"
 printf 'funded guarded signer restart tests passed\n'
