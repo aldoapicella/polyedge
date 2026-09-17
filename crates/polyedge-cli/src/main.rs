@@ -50,6 +50,10 @@ const AZURE_LEASE_RENEWAL_SAFETY_MARGIN_SECONDS: u64 = 10;
 const RING_QUARANTINE_BLOB_PREFIX: &str =
     "events-oci-quarantine-v1/invalid-recorder-sequence-proof";
 const MAX_RING_QUARANTINE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RING_VERIFY_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_RING_VERIFY_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_RING_VERIFY_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RING_VERIFY_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 const QSET_V2_CONTAINER: &str = "polyedge-shadow-qset-events";
 const QSET_V2_PREFIX: &str = "shadow-events/campaign-2026-08-22-qset-v2";
 const QSET_V2_START: &str = "2026-08-22";
@@ -285,6 +289,16 @@ enum Command {
         max_bytes: Option<u64>,
         #[arg(long, default_value_t = 8)]
         prefetch_blobs: usize,
+    },
+    /// Verify a v4 recorder archive locally without uploading or deleting anything.
+    /// Bounds: 64 KiB manifest, 128 MiB archive, 1 GiB source, 16 MiB record.
+    RingVerify {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        payload: PathBuf,
+        #[arg(long, default_value = "events-oci-hot7-v1")]
+        blob_prefix: String,
     },
     /// Upload locally sealed recorder segments without listing Azure blobs.
     RingUpload {
@@ -1118,6 +1132,11 @@ async fn main() -> Result<()> {
             max_bytes,
             prefetch_blobs,
         )?),
+        Command::RingVerify {
+            manifest,
+            payload,
+            blob_prefix,
+        } => print_json(run_ring_verify(&manifest, &payload, &blob_prefix)?),
         Command::RingUpload {
             root,
             blob_prefix,
@@ -2921,6 +2940,100 @@ fn bench_replay(path: PathBuf) -> Result<serde_json::Value> {
     }))
 }
 
+fn run_ring_verify(
+    manifest_path: &Path,
+    payload_path: &Path,
+    blob_prefix: &str,
+) -> Result<serde_json::Value> {
+    let metadata = fs::symlink_metadata(manifest_path)?;
+    if !metadata.is_file() || metadata.len() > MAX_RING_VERIFY_MANIFEST_BYTES {
+        bail!("ring manifest exceeds verification size limit or is not a regular file");
+    }
+    let mut manifest_bytes = Vec::with_capacity(metadata.len() as usize + 1);
+    fs::File::open(manifest_path)?
+        .take(metadata.len() + 1)
+        .read_to_end(&mut manifest_bytes)?;
+    if manifest_bytes.len() as u64 != metadata.len() {
+        bail!("ring manifest size changed during verification");
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+    if manifest["schema_version"].as_u64() != Some(4)
+        || manifest["compression"].as_str() != Some("gzip")
+    {
+        bail!("ring verification requires a v4 gzip manifest");
+    }
+    let source_relative = ring_relative_path(&manifest, "segment_path")?;
+    let archive_relative = ring_relative_path(&manifest, "archive_path")?;
+    let blob_name = ring_blob_name(&manifest, blob_prefix)?;
+    validate_ring_identity(
+        &source_relative,
+        &archive_relative,
+        &blob_name,
+        blob_prefix,
+        manifest["segment_start_epoch"]
+            .as_i64()
+            .context("missing segment start")?,
+        manifest["segment_end_epoch"]
+            .as_i64()
+            .context("missing segment end")?,
+        Utc::now().timestamp(),
+    )?;
+    let expected_payload_bytes = manifest["bytes"]
+        .as_u64()
+        .context("missing ring archive size")?;
+    let expected_source_bytes = manifest["source_bytes"]
+        .as_u64()
+        .context("missing ring source size")?;
+    let metadata = fs::symlink_metadata(payload_path)?;
+    if !metadata.is_file()
+        || metadata.len() != expected_payload_bytes
+        || expected_payload_bytes > MAX_RING_VERIFY_PAYLOAD_BYTES
+        || expected_source_bytes > MAX_RING_VERIFY_SOURCE_BYTES
+    {
+        bail!("ring archive size mismatch or verification size limit exceeded");
+    }
+    // ponytail: buffer at most 128 MiB; use a hashing reader if larger segments are needed.
+    let mut payload = Vec::with_capacity(expected_payload_bytes as usize + 1);
+    fs::File::open(payload_path)?
+        .take(expected_payload_bytes + 1)
+        .read_to_end(&mut payload)?;
+    let payload_sha = sha256_prefixed(&payload);
+    if manifest["bytes"].as_u64() != Some(payload.len() as u64)
+        || ring_sha256(&manifest, "sha256")? != payload_sha
+    {
+        bail!("ring archive bytes or SHA-256 disagree with its manifest");
+    }
+    // Decode the exact bytes whose compressed hash passed, including all gzip members.
+    let decoder = flate2::read::MultiGzDecoder::new(payload.as_slice());
+    let decoder = decoder.take(
+        expected_source_bytes
+            .checked_add(1)
+            .context("ring source size overflow")?,
+    );
+    let (source_bytes, source_sha) = validate_ring_reader_v4(
+        BufReader::new(decoder),
+        &manifest,
+        MAX_RING_VERIFY_RECORD_BYTES,
+    )?;
+    if expected_source_bytes != source_bytes
+        || ring_sha256(&manifest, "source_sha256")? != source_sha
+    {
+        bail!("decompressed ring source disagrees with its manifest");
+    }
+    Ok(json!({
+        "status": "verified",
+        "schema_version": 4,
+        "blob_name": blob_name,
+        "manifest_sha256": sha256_prefixed(&manifest_bytes),
+        "payload_sha256": payload_sha,
+        "payload_bytes": payload.len(),
+        "source_sha256": source_sha,
+        "source_bytes": source_bytes,
+        "lines": manifest["lines"],
+        "recorder_runs": manifest["recorder_runs"],
+    }))
+}
+
 fn run_ring_upload(
     root: &Path,
     blob_prefix: &str,
@@ -4073,19 +4186,42 @@ fn validate_ring_source_v3(source_path: &Path, manifest: &serde_json::Value) -> 
 }
 
 fn validate_ring_source_v4(source_path: &Path, manifest: &serde_json::Value) -> Result<()> {
-    let runs = ring_manifest_v4_runs(manifest)?;
     let file = fs::File::open(source_path)
         .with_context(|| format!("opening sealed ring source {}", source_path.display()))?;
+    validate_ring_reader_v4(BufReader::new(file), manifest, u64::MAX).map(|_| ())
+}
+
+fn validate_ring_reader_v4(
+    mut reader: impl BufRead,
+    manifest: &serde_json::Value,
+    max_record_bytes: u64,
+) -> Result<(u64, String)> {
+    let runs = ring_manifest_v4_runs(manifest)?;
     let mut run_index = 0_usize;
     let mut seen_in_run = 0_u64;
-    for line in BufReader::new(file).lines() {
-        let line =
-            line.with_context(|| format!("reading sealed ring source {}", source_path.display()))?;
-        if line.trim().is_empty() || run_index == runs.len() {
+    let mut source_bytes = 0_u64;
+    let mut source_hash = Sha256::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes = (&mut reader)
+            .take(max_record_bytes.saturating_add(1))
+            .read_until(b'\n', &mut line)?;
+        if bytes as u64 > max_record_bytes {
+            bail!("ring event exceeds verification record size limit");
+        }
+        if bytes == 0 {
+            break;
+        }
+        source_bytes = source_bytes
+            .checked_add(bytes as u64)
+            .context("ring source size overflow")?;
+        source_hash.update(&line);
+        if line.iter().all(u8::is_ascii_whitespace) || run_index == runs.len() {
             bail!("sealed ring source contains a blank or excess event");
         }
         let event: serde_json::Value =
-            serde_json::from_str(&line).context("sealed ring source contains invalid JSON")?;
+            serde_json::from_slice(&line).context("sealed ring source contains invalid JSON")?;
         let run = &runs[run_index];
         let expected_sequence = run
             .first
@@ -4108,7 +4244,7 @@ fn validate_ring_source_v4(source_path: &Path, manifest: &serde_json::Value) -> 
     if run_index != runs.len() || seen_in_run != 0 {
         bail!("sealed ring source recorder runs do not exactly cover its manifest");
     }
-    Ok(())
+    Ok((source_bytes, format!("sha256:{:x}", source_hash.finalize())))
 }
 
 fn is_canonical_uuid_v4(value: &str) -> bool {
@@ -4373,17 +4509,19 @@ mod tests {
         accepted_ring_blob_prefix, lease_renewal_deadline, prepare_ring_quarantine_resolution,
         profitability_authorization_flags, publish_local_ring_quarantine_resolution,
         qset_v2_inventory_sha256, recover_ring_quarantine_staging, ring_blob_name,
-        ring_relative_path, ring_sha256, sha256_prefixed, terminate_lease_child_tree,
-        terminate_qset_v4_writer, terminate_qset_v5_writer, terminate_qset_v6_writer,
-        validate_local_ring_quarantine_resolution, validate_qset_v2_inventory,
-        validate_ring_identity, validate_ring_manifest_v3_sequence, validate_ring_manifest_v4_runs,
-        validate_ring_quarantine_source_size, validate_ring_source_v3, validate_ring_source_v4,
-        validate_ring_upload_receipt, AzureBlobItem, Cli, Command, Path, PathBuf, ResearchCommand,
+        ring_relative_path, ring_sha256, run_ring_verify, sha256_prefixed,
+        terminate_lease_child_tree, terminate_qset_v4_writer, terminate_qset_v5_writer,
+        terminate_qset_v6_writer, validate_local_ring_quarantine_resolution,
+        validate_qset_v2_inventory, validate_ring_identity, validate_ring_manifest_v3_sequence,
+        validate_ring_manifest_v4_runs, validate_ring_quarantine_source_size,
+        validate_ring_source_v3, validate_ring_source_v4, validate_ring_upload_receipt,
+        AzureBlobItem, Cli, Command, Path, PathBuf, ResearchCommand,
         MAX_RING_QUARANTINE_SOURCE_BYTES, RING_QUARANTINE_BLOB_PREFIX,
     };
     use clap::Parser;
     use serde_json::json;
     use std::fs;
+    use std::io::Write;
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
 
@@ -5109,6 +5247,136 @@ mod tests {
         )).unwrap();
         assert!(validate_ring_source_v4(&path, &manifest).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ring_verify_binds_gzip_source_and_recorder_runs_without_writes() {
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-ring-verify-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let manifest_path = root.join("manifest.json");
+        let payload_path = root.join("payload.gz");
+        let instance = "7c66d77b-a911-4f9b-95f2-98ca9395255e";
+        let source = format!(
+            "{{\"recorder_instance_id\":\"{instance}\",\"recorder_sequence\":41}}\n{{\"recorder_instance_id\":\"{instance}\",\"recorder_sequence\":42}}\n"
+        );
+        let encode = |source: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(source).unwrap();
+            encoder.finish().unwrap()
+        };
+        let payload = encode(source.as_bytes());
+        let manifest = json!({
+            "schema_version": 4, "compression": "gzip",
+            "segment_path": "segments/2026/08/29/00/1787961600.jsonl",
+            "archive_path": "archive/2026/08/29/00/1787961600.jsonl.gz",
+            "blob_name": "events-oci-hot7-v1/2026/08/29/00/1787961600.jsonl.gz",
+            "segment_start_epoch": 1787961600_i64, "segment_end_epoch": 1787962200_i64,
+            "bytes": payload.len(), "sha256": sha256_prefixed(&payload),
+            "source_bytes": source.len(), "source_sha256": sha256_prefixed(source.as_bytes()),
+            "lines": 2,
+            "recorder_runs": [{"recorder_instance_id": instance, "recorder_first_sequence": 41,
+                "recorder_last_sequence": 42, "recorder_event_count": 2}]
+        });
+        let verify = |manifest: &serde_json::Value, bytes: &[u8]| {
+            fs::write(&manifest_path, serde_json::to_vec(manifest).unwrap()).unwrap();
+            fs::write(&payload_path, bytes).unwrap();
+            run_ring_verify(&manifest_path, &payload_path, "events-oci-hot7-v1")
+        };
+        assert_eq!(verify(&manifest, &payload).unwrap()["status"], "verified");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(fs::read(&payload_path).unwrap(), payload);
+
+        let mut invalid = manifest.clone();
+        invalid["source_sha256"] = json!(sha256_prefixed(b"different source"));
+        assert!(verify(&invalid, &payload)
+            .unwrap_err()
+            .to_string()
+            .contains("decompressed"));
+        invalid = manifest.clone();
+        invalid["source_bytes"] = json!(source.len() + 1);
+        assert!(verify(&invalid, &payload).is_err());
+        assert!(verify(&manifest, &payload[..payload.len() - 1]).is_err());
+
+        // Even matching compressed and raw hashes cannot authorize a skipped sequence.
+        let skipped = source.replace(":42}", ":43}");
+        let skipped_payload = encode(skipped.as_bytes());
+        invalid = manifest.clone();
+        invalid["bytes"] = json!(skipped_payload.len());
+        invalid["sha256"] = json!(sha256_prefixed(&skipped_payload));
+        invalid["source_sha256"] = json!(sha256_prefixed(skipped.as_bytes()));
+        assert!(verify(&invalid, &skipped_payload)
+            .unwrap_err()
+            .to_string()
+            .contains("recorder runs"));
+
+        // Validate the complete gzip stream, including its trailer and any trailing data.
+        for invalid_payload in [
+            &payload[..payload.len() - 4],
+            &[payload.as_slice(), b"garbage"].concat(),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid["bytes"] = json!(invalid_payload.len());
+            invalid["sha256"] = json!(sha256_prefixed(invalid_payload));
+            assert!(verify(&invalid, invalid_payload).is_err());
+        }
+        invalid = manifest.clone();
+        invalid["source_bytes"] = json!(super::MAX_RING_VERIFY_SOURCE_BYTES + 1);
+        assert!(verify(&invalid, &payload)
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+
+        let oversized_record = format!(
+            "{{\"recorder_instance_id\":\"{instance}\",\"recorder_sequence\":41,\"padding\":\"{}\"}}\n",
+            "x".repeat(super::MAX_RING_VERIFY_RECORD_BYTES as usize)
+        );
+        let oversized_payload = encode(oversized_record.as_bytes());
+        invalid = manifest.clone();
+        invalid["bytes"] = json!(oversized_payload.len());
+        invalid["sha256"] = json!(sha256_prefixed(&oversized_payload));
+        invalid["source_bytes"] = json!(oversized_record.len());
+        invalid["source_sha256"] = json!(sha256_prefixed(oversized_record.as_bytes()));
+        invalid["lines"] = json!(1);
+        invalid["recorder_runs"][0]["recorder_last_sequence"] = json!(41);
+        invalid["recorder_runs"][0]["recorder_event_count"] = json!(1);
+        assert!(verify(&invalid, &oversized_payload)
+            .unwrap_err()
+            .to_string()
+            .contains("record size limit"));
+
+        // A sparse oversized archive must fail before allocation or decompression.
+        fs::File::create(&payload_path)
+            .unwrap()
+            .set_len(super::MAX_RING_VERIFY_PAYLOAD_BYTES + 1)
+            .unwrap();
+        invalid = manifest.clone();
+        invalid["bytes"] = json!(super::MAX_RING_VERIFY_PAYLOAD_BYTES + 1);
+        fs::write(&manifest_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(
+            run_ring_verify(&manifest_path, &payload_path, "events-oci-hot7-v1")
+                .unwrap_err()
+                .to_string()
+                .contains("size limit")
+        );
+        fs::File::create(&manifest_path)
+            .unwrap()
+            .set_len(super::MAX_RING_VERIFY_MANIFEST_BYTES + 1)
+            .unwrap();
+        assert!(
+            run_ring_verify(&manifest_path, &payload_path, "events-oci-hot7-v1")
+                .unwrap_err()
+                .to_string()
+                .contains("manifest exceeds")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
