@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
 import { Readable } from "node:stream";
 import { pathToFileURL } from "node:url";
 import {
@@ -156,7 +155,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   assert.deepEqual(process.argv.slice(2), ["--stdin"]);
   assert(!process.env.AZURE_STORAGE_ACCOUNT_KEY, "storage keys forbidden");
   assert.equal(process.env.AZURE_STORAGE_ACCOUNT_NAME, "stpolyedge6urdjr5nmwx7w");
-  const bytes = readFileSync(0), input = JSON.parse(bytes);
+  const parts = [];
+  for await (const part of process.stdin) parts.push(part);
+  const bytes = Buffer.concat(parts), input = JSON.parse(bytes);
   const bundleBytes = Buffer.from(input.bundleBytesBase64, "base64");
   assert.deepEqual(JSON.parse(bundleBytes), input.bundle);
   await verifyTerminalNoOrderProof(input);
