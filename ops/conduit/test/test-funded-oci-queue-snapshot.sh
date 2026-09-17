@@ -2,7 +2,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../.." && pwd)
 python3 - "$repo/ops/conduit/bin/polyedge-funded-oci-queue-snapshot" <<'PY'
-import contextlib, copy, io, json, pathlib, sys, types
+import contextlib, copy, io, json, pathlib, stat, sys, types
 from unittest.mock import patch
 path=pathlib.Path(sys.argv[1]); module={"__name__":"test", "__file__":str(path)}
 exec(compile(path.read_text(),str(path),"exec"),module)
@@ -44,7 +44,7 @@ class Storage:
 oci=types.SimpleNamespace(auth=types.SimpleNamespace(signers=types.SimpleNamespace(InstancePrincipalsSecurityTokenSigner=lambda:object())),
     retry=types.SimpleNamespace(NoneRetryStrategy=lambda:object()),queue=types.SimpleNamespace(QueueClient=lambda *a,**kw:Queue()),
     object_storage=types.SimpleNamespace(ObjectStorageClient=lambda *a,**kw:Storage()))
-module["bridge_binding"]=lambda:binding
+module["bridge_binding"]=lambda stopped=False:binding
 with patch.dict(sys.modules,{"oci":oci}), patch.object(module["os"],"geteuid",return_value=1000), patch.object(module["pwd"],"getpwnam",return_value=types.SimpleNamespace(pw_uid=1000)):
     cloud=module["read_cloud"](binding)
     wrong_channel=True
@@ -67,5 +67,23 @@ with patch.object(module["os"],"geteuid",return_value=0), patch.object(module["s
 result=json.loads(captured.getvalue())
 assert result["archiveDlq"]==value["archiveDlq"] and result["verifier"]["path"]==str(path.resolve())
 assert result["status"]=="observed_zero" and result["statisticsAreApproximate"] is True
+
+# Stopped capture reads one configured public URL and refuses an active process,
+# an alternate env file, duplicate values, and mutable configuration permissions.
+unit_state='inactive'; main_pid='0'; mode=0o600
+quadlet='EnvironmentFile=/etc/polyedge/funded-signer.env\n'
+env='PRIVATE_OTHER_VALUE=must-never-appear\nFUNDED_DIRECT_OCI_QUEUE_BRIDGE_URL=http://10.89.0.1:8182/v1/messages\n'
+def local_output(*args):
+    assert args[0]=='/usr/bin/systemctl'
+    return unit_state if args[-2]=='ActiveState' else main_pid
+def text_config(path): return quadlet if str(path).endswith('.container') else env
+with patch.dict(module,{'output':local_output}), patch.object(pathlib.Path,'read_text',text_config), patch.object(pathlib.Path,'lstat',side_effect=lambda:types.SimpleNamespace(st_mode=stat.S_IFREG|mode,st_uid=0,st_gid=0,st_nlink=1,st_size=128)):
+    assert module['stopped_consumer_url']()=={'url':'http://10.89.0.1:8182/v1/messages'}
+    for key,bad in [('unit_state','active'),('main_pid','123'),('mode',0o644),('quadlet','EnvironmentFile=/different\n'),('env',env+env)]:
+        previous=globals()[key];globals()[key]=bad
+        try: module['stopped_consumer_url']()
+        except AssertionError: pass
+        else: raise AssertionError('unsafe stopped configuration accepted: '+key)
+        globals()[key]=previous
 print("funded OCI queue read-only snapshot tests passed")
 PY

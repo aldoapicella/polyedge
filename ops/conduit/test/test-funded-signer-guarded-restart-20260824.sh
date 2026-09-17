@@ -354,4 +354,91 @@ for cause in helper_changed unsafe_mode failed_read; do
   if run_oci_recovery "$d" "${args[@]}"; then echo "unsafe OCI queue proof accepted: $cause" >&2; exit 1; fi
   test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
 done
+stopped_recovery_fixture() {
+  local d=$1 now failed_image failed_revision
+  fixture "$d"; now=$(date -u +%s)
+  failed_image=ghcr.io/aldoapicella/polyedge-venue-probe@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  failed_revision=ffffffffffffffffffffffffffffffffffffffff
+  printf 'Image=%s\n' "$prior_signer_image" >"$d/quadlet"; chmod 600 "$d/quadlet"
+  printf '0\n' >"$d/state/signer-active"; printf '0\n' >"$d/state/producer-active"
+  cp "$repo/ops/conduit/bin/polyedge-funded-redemption-preflight.mjs" "$d/bin/collector"; chmod 755 "$d/bin/collector"
+cat >"$d/bin/queue-snapshot" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$(cat "$FAKE/state/signer-active")" = 0 ]; then test "${1:-}" = --stopped; else test "$#" = 0; fi
+jq -c . "$FAKE/oci-snapshot.json"
+EOF
+  cat >"$d/bin/stopped-recovery" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$#" = 5 -a "$1" = --verify
+test "$3:$4:$5" = "$FAKE_SIGNER_IMAGE:$FAKE_SIGNER_REVISION:$FAKE_PRIOR_SIGNER_IMAGE"
+[ "${FAKE_STOPPED_VERIFIER_FAIL:-0}" = 0 ]
+count=0; [ ! -e "$FAKE/verifier-count" ] || count=$(cat "$FAKE/verifier-count")
+printf '%s\n' "$((count + 1))" >"$FAKE/verifier-count"
+jq ".approvedRedemptionPreflight.proof | ${FAKE_STOPPED_PROOF_MUTATION:-.}" "$2"
+EOF
+  chmod 755 "$d/bin/queue-snapshot" "$d/bin/stopped-recovery"
+  jq -n --arg path "$d/bin/queue-snapshot" --arg sha "sha256:$(sha256sum "$d/bin/queue-snapshot"|cut -d' ' -f1)" \
+    '{backend:"oci",schema:"polyedge.funded_oci_queue_snapshot.v1",status:"observed_zero",readOnly:true,
+      verifier:{path:$path,sha256:$sha},archiveDlq:{objectCount:1824,inventorySha256:("a"*64),exhaustiveListing:true}}' >"$d/oci-snapshot.json"
+  jq -n --arg condition "$approved_condition" --arg image "$signer_image" --arg revision "$signer_revision" --argjson now "$now" '
+    {schema:"polyedge.approved_redemption_preflight.v1",status:"approved_redemption_ready",read_only:true,redemption_submitted:false,
+     funder:"0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8",condition_id:$condition,target_image:$image,target_revision:$revision,
+     started_ts:($now|todateiso8601),finished_ts:($now|todateiso8601),block:{chain_id:137,number:"99",hash:("0x"+("d"*64)),timestamp:($now-2)},
+     open_order_count:0,unresolved_position_count:0,unresolved_reservation_count:0,
+     redemption_control:{terminal:true,readbacks:2,exists:false},position_inventory:{reader:"loadAccountPositions",complete:true,readbacks:2,rows:131,sha256:("a"*64)},payout_base_units:"5000000",
+     selection:{payout_source:"onchain_balances_and_payout_vector",available_winner_conditions:1,skipped_winner_conditions:0,selected_gross_payout:5,
+       selected:[{condition_id:$condition,asset_ids:["11","22"],onchain_balances_base_units:["5000000","0"],payout_numerators:["1","0"],
+                  payout_denominator:"1",onchain_expected_payout:5,gross_payout:5}]}}
+  ' >"$d/approved-preflight.json"
+  jq -n --slurpfile proof "$d/approved-preflight.json" --slurpfile q "$d/oci-snapshot.json" \
+    --arg created "$(date -u +%Y-%m-%dT%H:%M:%S).399Z" --arg target "$signer_image" --arg revision "$signer_revision" \
+    --arg prior "$prior_signer_image" --arg quadlet "$d/quadlet" --arg quadlet_sha "sha256:$(sha256sum "$d/quadlet"|cut -d' ' -f1)" \
+    --arg failed_image "$failed_image" --arg failed_revision "$failed_revision" --arg user "$(id -u):$(id -g)" \
+    --arg verifier "$d/bin/stopped-recovery" --arg verifier_sha "sha256:$(sha256sum "$d/bin/stopped-recovery"|cut -d' ' -f1)" \
+    --arg collector "$d/bin/collector" --arg collector_sha "sha256:$(sha256sum "$d/bin/collector"|cut -d' ' -f1)" '
+    {schema:"polyedge.funded_signer_stopped_recovery.v1",status:"attested",createdAtUtc:$created,readOnly:true,servicesMutated:false,azureDeletionAllowed:false,
+     targetSigner:{image:$target,revision:$revision},installedQuadlet:{path:$quadlet,sha256:$quadlet_sha,image:$prior},
+     lastRuntime:{invocationId:("5"*32),containerId:("6"*64),image:$failed_image,revision:$failed_revision,user:$user,restartCount:1},
+     failedRuntime:{invocationId:("1"*32),containerId:("2"*64),image:$failed_image,revision:$failed_revision,user:$user,restartCount:0},
+     verifier:{path:$verifier,sha256:$verifier_sha},approvedRedemptionPreflight:{collector:{path:$collector,sha256:$collector_sha},proof:$proof[0]},
+     queue:{before:$q[0],after:$q[0]}}
+  ' >"$d/stopped-recovery.json"
+  chmod 640 "$d/stopped-recovery.json" "$d/approved-preflight.json" "$d/oci-snapshot.json"
+}
+run_stopped_recovery() {
+  local d=$1; shift
+  run "$d" FAKE_PRIOR_SIGNER_IMAGE="$prior_signer_image" FAKE_AUTOMATIC_REDEMPTION=1 FAKE_APPROVED_CONDITION="$approved_condition" FAKE_COLD_AFTER_REPAIR=1 \
+    POLYEDGE_GUARDED_RESTART_PRIOR_SIGNER_IMAGE="$prior_signer_image" POLYEDGE_GUARDED_RESTART_REPAIR_MODE=true POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED=true \
+    POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION="$approved_condition" \
+    POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT= POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT_SHA256= \
+    POLYEDGE_GUARDED_RESTART_LIFECYCLE_EVIDENCE="$d/stopped-recovery.json" POLYEDGE_GUARDED_RESTART_LIFECYCLE_EVIDENCE_SHA256="$(sha256sum "$d/stopped-recovery.json"|cut -d' ' -f1)" \
+    POLYEDGE_GUARDED_RESTART_STOPPED_RECOVERY="$d/stopped-recovery.json" POLYEDGE_GUARDED_RESTART_STOPPED_RECOVERY_SHA256="$(sha256sum "$d/stopped-recovery.json"|cut -d' ' -f1)" \
+    POLYEDGE_GUARDED_RESTART_QUEUE_BACKEND=oci POLYEDGE_GUARDED_RESTART_QUEUE_SNAPSHOT_HELPER="$d/bin/queue-snapshot" \
+    POLYEDGE_GUARDED_RESTART_DEPLOY="$d/bin/deploy" POLYEDGE_GUARDED_RESTART_QUADLET="$d/quadlet" POLYEDGE_GUARDED_RESTART_ROLLBACK_DIR="$d/rollback" "$@"
+}
+d=$root/stopped-recovery; stopped_recovery_fixture "$d"; run_stopped_recovery "$d"
+test "$(cat "$d/verifier-count")" = 2
+jq -e --arg condition "$approved_condition" '.status=="validated" and .startMode=="stopped_repair_rollout" and
+  .priorRollout==null and .recordingRecovery==null and .stoppedRecovery.path!=null and .stoppedPreflight==null and .stoppedBinding==null and
+  .approvedAutomaticRedemptionCondition==$condition and .automaticRedemption.grossPayout==5 and
+  .approvedRedemptionPreflight.initialStopped.payout_base_units=="5000000" and
+  .approvedRedemptionPreflight.preDeployStopped.position_inventory.complete==true and .producer.restored==true' "$d/ring/activation/receipt.json" >/dev/null
+for cause in verifier target proof payout; do
+  d=$root/stopped-recovery-bad-$cause; stopped_recovery_fixture "$d"; args=()
+  case "$cause" in
+    verifier) args=(FAKE_STOPPED_VERIFIER_FAIL=1);;
+    target) jq '.targetSigner.image=("ghcr.io/aldoapicella/polyedge-venue-probe@sha256:"+("0"*64))' "$d/stopped-recovery.json" >"$d/cert.tmp"; mv "$d/cert.tmp" "$d/stopped-recovery.json"; chmod 640 "$d/stopped-recovery.json";;
+    proof) args=('FAKE_STOPPED_PROOF_MUTATION=.condition_id=("0x"+("b"*64))');;
+    payout) jq '.approvedRedemptionPreflight.proof.payout_base_units="6000000" | .approvedRedemptionPreflight.proof.selection.selected_gross_payout=6 | .approvedRedemptionPreflight.proof.selection.selected[0].gross_payout=6 | .approvedRedemptionPreflight.proof.selection.selected[0].onchain_expected_payout=6' "$d/stopped-recovery.json" >"$d/cert.tmp"; mv "$d/cert.tmp" "$d/stopped-recovery.json"; chmod 640 "$d/stopped-recovery.json";;
+  esac
+  if run_stopped_recovery "$d" "${args[@]}"; then echo "unsafe stopped recovery accepted: $cause" >&2; exit 1; fi
+  test "$(cat "$d/state/signer-active")" = 0; test "$(cat "$d/state/producer-active")" = 0
+  grep -Fx "Image=$prior_signer_image" "$d/quadlet" >/dev/null; test "$(cat "$d/state/phase")" = before
+done
+d=$root/stopped-recovery-rollback; stopped_recovery_fixture "$d"
+if run_stopped_recovery "$d" FAKE_BAD_POST=1; then echo 'unsafe stopped recovery runtime accepted' >&2; exit 1; fi
+test "$(cat "$d/state/signer-active")" = 0; test "$(cat "$d/state/producer-active")" = 0
+grep -Fx "Image=$prior_signer_image" "$d/quadlet" >/dev/null; test ! -e "$d/ring/activation/receipt.json"
 printf 'funded guarded signer restart tests passed\n'

@@ -9,6 +9,8 @@ umask 027
 need() { [ -n "${!1:-}" ] || { echo "missing required environment: $1" >&2; exit 64; }; }
 recording_recovery=${POLYEDGE_GUARDED_RESTART_RECORDING_RECOVERY:-}
 recording_recovery_sha=${POLYEDGE_GUARDED_RESTART_RECORDING_RECOVERY_SHA256:-}
+stopped_recovery=${POLYEDGE_GUARDED_RESTART_STOPPED_RECOVERY:-}
+stopped_recovery_sha=${POLYEDGE_GUARDED_RESTART_STOPPED_RECOVERY_SHA256:-}
 recovery_clean_since=0
 for v in POLYEDGE_GUARDED_RESTART_LIFECYCLE_EVIDENCE POLYEDGE_GUARDED_RESTART_LIFECYCLE_EVIDENCE_SHA256 \
   POLYEDGE_GUARDED_RESTART_SIGNER_IMAGE POLYEDGE_GUARDED_RESTART_SIGNER_REVISION POLYEDGE_GUARDED_RESTART_SIGNER_USER \
@@ -16,7 +18,7 @@ for v in POLYEDGE_GUARDED_RESTART_LIFECYCLE_EVIDENCE POLYEDGE_GUARDED_RESTART_LI
 
 prior_receipt=${POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT:-}
 prior_receipt_sha=${POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT_SHA256:-}
-if [ -z "$recording_recovery" ]; then
+if [ -z "$recording_recovery$stopped_recovery" ]; then
   need POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT; need POLYEDGE_GUARDED_RESTART_PRIOR_RECEIPT_SHA256
 fi
 lifecycle_evidence=$POLYEDGE_GUARDED_RESTART_LIFECYCLE_EVIDENCE
@@ -71,7 +73,7 @@ printf '%s\n' "$signer_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' || { echo 's
 printf "%s\n" "$prior_signer_image" | grep -Eq "^.+@sha256:[0-9a-f]{64}$" || { echo "prior signer image must be immutable" >&2; exit 64; }
 printf "%s\n" "$signer_revision" | grep -Eq "^[0-9a-f]{40}$" || { echo "signer revision must be a full Git SHA" >&2; exit 64; }
 printf '%s\n' "$producer_image" | grep -Eq '^.+@sha256:[0-9a-f]{64}$' || { echo 'producer image must be immutable' >&2; exit 64; }
-printf '%s\n' "${recording_recovery_sha:-$prior_receipt_sha}$lifecycle_evidence_sha" | grep -Eq '^[0-9a-f]{128}$' || { echo 'evidence hashes must be raw SHA-256 values' >&2; exit 64; }
+printf '%s\n' "${recording_recovery_sha:-${stopped_recovery_sha:-$prior_receipt_sha}}$lifecycle_evidence_sha" | grep -Eq '^[0-9a-f]{128}$' || { echo 'evidence hashes must be raw SHA-256 values' >&2; exit 64; }
 
 tmp=
 complete=false
@@ -108,7 +110,11 @@ queue_snapshot() {
     jq -e --arg path "$queue_helper" --arg sha "sha256:$(sha "$queue_helper")" \
       '.queue.before.backend=="oci" and .queue.after.backend=="oci" and
        .queue.before.verifier=={path:$path,sha256:$sha} and .queue.after.verifier==.queue.before.verifier' "$lifecycle_evidence" >/dev/null || return 1
-    "$queue_helper"
+    if [ -n "$stopped_recovery" ] && ! "$systemctl" is-active --quiet polyedge-funded-signer.service; then
+      "$queue_helper" --stopped
+    else
+      "$queue_helper"
+    fi
     return
   fi
   "$runuser" -u ubuntu -- "$az" servicebus queue show --subscription "$subscription" --resource-group "$resource_group" \
@@ -270,7 +276,7 @@ wait_automatic_redemption() {
   # A fresh signer receives market warmup from the paused producer. The active
   # recovery already proved zero risk; after verified redemption use the existing
   # strict cold-start gate, then require full readiness after producer restoration.
-  [ "$approved_preflight_after" = null ] || readiness=prestart
+  if [ "$stopped_restore" = true ] || [ "$approved_preflight_after" != null ]; then readiness=prestart; fi
   for _ in $(seq 1 "$wait_attempts"); do
     automatic_redemption=$(automatic_redemption_summary 2>/dev/null || true)
     if [ -n "$automatic_redemption" ] && wait_signer "$readiness"; then return 0; fi
@@ -279,13 +285,17 @@ wait_automatic_redemption() {
   return 1
 }
 validate_evidence() {
-  if [ -n "$recording_recovery" ]; then
+  local lifecycle_max=65536
+  if [ -n "$stopped_recovery" ]; then
+    lifecycle_max=1048576
+    secure_file "$stopped_recovery" 640 1048576 && [ "$(sha "$stopped_recovery")" = "$stopped_recovery_sha" ] || return 1
+  elif [ -n "$recording_recovery" ]; then
     secure_file "$recording_recovery" 640 65536 && [ "$(sha "$recording_recovery")" = "$recording_recovery_sha" ] || return 1
   else
     secure_file "$prior_receipt" 640 65536 && [ "$(sha "$prior_receipt")" = "$prior_receipt_sha" ] &&
       jq -e '.status == "validated" and (.azureDeletionAllowed? == false or .azureDeletionAuthorized? == false)' "$prior_receipt" >/dev/null || return 1
   fi
-    secure_file "$lifecycle_evidence" 640 65536 && [ "$(sha "$lifecycle_evidence")" = "$lifecycle_evidence_sha" ] &&
+    secure_file "$lifecycle_evidence" 640 "$lifecycle_max" && [ "$(sha "$lifecycle_evidence")" = "$lifecycle_evidence_sha" ] &&
     jq -e --arg repair "$repair_mode" '((.status == "validated" or .status == "succeeded") or ($repair == "true" and .status == "attested")) and (.azureDeletionAllowed? == false or .azureDeletionAuthorized? == false)' "$lifecycle_evidence" >/dev/null
 }
 validate_recording_recovery() {
@@ -361,6 +371,60 @@ validate_approved_preflight() {
     .selection.selected[0].gross_payout==.selection.selected_gross_payout and
     .selection.selected[0].onchain_expected_payout==.selection.selected_gross_payout
     ' <<<"$1" >/dev/null
+}
+validate_stopped_recovery_certificate() {
+  local verifier verifier_sha
+  secure_file "$quadlet" 600 65536 || return 1
+  verifier=$(jq -er '.verifier.path' "$stopped_recovery") || return 1
+  verifier_sha=$(jq -er '.verifier.sha256' "$stopped_recovery") || return 1
+  secure_file "$stopped_recovery" 640 1048576 || return 1
+  [ "$(sha "$stopped_recovery")" = "$stopped_recovery_sha" ] || return 1
+  secure_file "$verifier" 755 65536 || return 1
+  [ "sha256:$(sha "$verifier")" = "$verifier_sha" ] || return 1
+  jq -e --argjson now "$(date -u +%s)" --arg target "$signer_image" --arg revision "$signer_revision" \
+    --arg prior "$prior_signer_image" --arg user "$signer_user" --arg quadlet "$quadlet" \
+    --arg quadlet_sha "sha256:$(sha "$quadlet")" --arg verifier "$verifier" --arg verifier_sha "$verifier_sha" '
+      def fresh: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | . <= $now and . >= ($now - 1800);
+      def runtime: (.invocationId | test("^[0-9a-f]{32}$")) and
+        (.containerId | test("^[0-9a-f]{64}$")) and
+        (.image | test("^ghcr\\.io/aldoapicella/polyedge-venue-probe@sha256:[0-9a-f]{64}$")) and
+        (.revision | test("^[0-9a-f]{40}$")) and .user == $user and
+        (.restartCount | type == "number" and . >= 0 and . == floor);
+      . as $c |
+      $c.schema == "polyedge.funded_signer_stopped_recovery.v1" and $c.status == "attested" and
+      ($c.createdAtUtc | fresh) and $c.readOnly == true and $c.servicesMutated == false and
+      $c.azureDeletionAllowed == false and $c.targetSigner == {image:$target,revision:$revision} and
+      $c.installedQuadlet == {path:$quadlet,sha256:$quadlet_sha,image:$prior} and
+      ($c.lastRuntime | runtime) and ($c.failedRuntime | runtime) and
+      $c.failedRuntime.image == $c.lastRuntime.image and
+      $c.failedRuntime.revision == $c.lastRuntime.revision and
+      $c.failedRuntime.user == $c.lastRuntime.user and
+      $c.failedRuntime.invocationId != $c.lastRuntime.invocationId and
+      $c.failedRuntime.containerId != $c.lastRuntime.containerId and
+      $c.lastRuntime.restartCount >= $c.failedRuntime.restartCount and
+      $c.verifier == {path:$verifier,sha256:$verifier_sha} and
+      $c.approvedRedemptionPreflight.collector.path != null and
+      ($c.approvedRedemptionPreflight.collector.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+      $c.queue.before.backend == "oci" and $c.queue.after.backend == "oci"
+    ' "$stopped_recovery" >/dev/null
+}
+collect_stopped_recovery_preflight() {
+  local proof verifier verifier_sha
+  validate_stopped_recovery_certificate || return 1
+  verifier=$(jq -er '.verifier.path' "$stopped_recovery") || return 1
+  verifier_sha=$(jq -er '.verifier.sha256' "$stopped_recovery") || return 1
+  proof=$("$verifier" --verify "$stopped_recovery" "$signer_image" "$signer_revision" "$prior_signer_image") || return 1
+  [ "sha256:$(sha "$verifier")" = "$verifier_sha" ] || return 1
+  [ "$(sha "$stopped_recovery")" = "$stopped_recovery_sha" ] || return 1
+  validate_approved_preflight "$proof" || return 1
+  jq -e '.payout_base_units == "5000000" and .selection.selected_gross_payout == 5' <<<"$proof" >/dev/null || return 1
+  jq -e --argjson proof "$proof" '.approvedRedemptionPreflight.proof |
+    .payout_base_units==$proof.payout_base_units and .selection==$proof.selection and
+    .redemption_control==$proof.redemption_control and .position_inventory==$proof.position_inventory and
+    .open_order_count==$proof.open_order_count and
+    .unresolved_position_count==$proof.unresolved_position_count and
+    .unresolved_reservation_count==$proof.unresolved_reservation_count' "$stopped_recovery" >/dev/null || return 1
+  printf '%s\n' "$proof"
 }
 collect_approved_preflight() {
   local proof certified_sha
@@ -461,6 +525,7 @@ case "$allow_stopped" in true|false) :;; *) die 'POLYEDGE_GUARDED_RESTART_ALLOW_
 case "$repair_mode" in true|false) :;; *) die "POLYEDGE_GUARDED_RESTART_REPAIR_MODE must be true or false";; esac
 case "$repair_failed_messages" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_MESSAGES must be a non-negative integer';; esac
 case "$repair_failed_attempts" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_ATTEMPTS must be a non-negative integer';; esac
+[ -z "$recording_recovery$stopped_recovery" ] || [ -z "$recording_recovery" ] || [ -z "$stopped_recovery" ] || die 'active and stopped recovery evidence are mutually exclusive'
 [ "$prior_signer_image" = "$signer_image" ] || [ "$repair_mode" = true ] || die "signer image changes require explicit repair mode"
 if [ "$repair_mode" = true ]; then
   [ "$prior_signer_image" != "$signer_image" ] || die "repair mode requires a new image"
@@ -472,14 +537,25 @@ if [ -n "$recording_recovery" ]; then
   [ "$repair_failed_messages:$repair_failed_attempts" = '0:0' ] || die 'recording recovery requires zero failed counters'
   preflight_readiness=recording_recovery
 fi
+if [ -n "$stopped_recovery" ]; then
+  [ "$allow_stopped:$repair_mode:$queue_backend" = 'true:true:oci' ] || die 'stopped recovery requires stopped OCI repair mode'
+  [ -z "$prior_receipt$prior_receipt_sha$stopped_preflight$stopped_preflight_sha$stopped_binding$stopped_binding_sha" ] || die 'stopped recovery cannot claim prior or legacy stopped evidence'
+  [ "$lifecycle_evidence:$lifecycle_evidence_sha" = "$stopped_recovery:$stopped_recovery_sha" ] || die 'stopped recovery must be the lifecycle evidence'
+  [ "$repair_failed_messages:$repair_failed_attempts" = '0:0' ] || die 'stopped recovery does not accept legacy failure counters'
+fi
 if [ -n "$approved_automatic_redemption_condition" ]; then
   printf '%s\n' "$approved_automatic_redemption_condition" | grep -Eq '^0x[0-9a-f]{64}$' || die 'approved automatic redemption condition must be one lowercase condition ID'
   [ "$image_changed" = true ] && { [ "$allow_stopped" = true ] || [ -n "$recording_recovery" ]; } || die 'approved automatic redemption requires a stopped repair or an active recording recovery'
 fi
+if [ -n "$stopped_recovery" ]; then
+  [ -n "$approved_automatic_redemption_condition" ] || die 'stopped recovery requires one approved automatic redemption condition'
+fi
 if [ "$allow_stopped" = true ]; then
-  [ -n "$stopped_preflight" ] && [ -n "$stopped_binding" ] &&
-    printf '%s\n' "$stopped_preflight_sha$stopped_binding_sha" | grep -Eq '^[0-9a-f]{128}$' ||
-    die 'stopped restore requires immutable redemption and binding preflights with SHA-256 values'
+  if [ -z "$stopped_recovery" ]; then
+    [ -n "$stopped_preflight" ] && [ -n "$stopped_binding" ] &&
+      printf '%s\n' "$stopped_preflight_sha$stopped_binding_sha" | grep -Eq '^[0-9a-f]{128}$' ||
+      die 'stopped restore requires immutable redemption and binding preflights with SHA-256 values'
+  fi
 fi
 validate_evidence || die 'prior rollout or lifecycle evidence is not the approved immutable success evidence'
 if [ -n "$recording_recovery" ]; then
@@ -487,6 +563,10 @@ if [ -n "$recording_recovery" ]; then
   # Compare both consumers at journald microsecond precision; the native JS
   # proof serialized this boundary after two floating-point divisions.
   recovery_clean_since=$(jq -er '.proof.cleanSinceEpoch * 1000000 | round | . / 1000000' "$recording_recovery")
+fi
+if [ -n "$stopped_recovery" ]; then
+  approved_preflight_before=$(collect_stopped_recovery_preflight) || die 'stopped recovery certificate or initial preflight is invalid'
+  approved_payout=$(jq -er '.selection.selected_gross_payout' <<<"$approved_preflight_before")
 fi
 "$disk_guard" --assert-headroom
 [ ! -e "$pause_file" ] || die 'image pulls are paused'
@@ -503,12 +583,31 @@ queue_before=$(queue_snapshot) || die 'funded queue is unsafe'
 if [ "$allow_stopped" = true ]; then
   ! "$systemctl" is-active --quiet polyedge-funded-signer.service || die 'stopped restore requires an inactive signer'
   ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'stopped restore requires an inactive producer'
-  validate_stopped_preflight || die 'stopped restore preflight is unsafe, stale, or incomplete'
-  validate_stopped_binding || die 'stopped restore binding proof is unsafe, stale, or incomplete'
-  if [ "$image_changed" = true ]; then
-    validate_stopped_repair_evidence || die 'stopped repair evidence does not bind the exact last signer runtime'
-    old_invocation=$(jq -er '.signer.newInvocationId' "$prior_receipt")
-    old_container=$(jq -er '.signer.newContainerId' "$prior_receipt")
+  if [ -n "$stopped_recovery" ]; then
+    approved_preflight_after=$(collect_stopped_recovery_preflight) || die 'stopped recovery changed before deployment'
+    jq -e --argjson before "$approved_preflight_before" --argjson after "$approved_preflight_after" -n '
+      $before.payout_base_units==$after.payout_base_units and
+      $before.selection==$after.selection and $before.redemption_control==$after.redemption_control and
+      $before.position_inventory==$after.position_inventory and
+      $after.open_order_count==0 and $after.unresolved_position_count==0 and
+      $after.unresolved_reservation_count==0' >/dev/null || die 'stopped recovery preflight changed before deployment'
+    [ "$(queue_snapshot)" = "$queue_before" ] || die 'queue changed during stopped recovery verification'
+    token_safe || die 'funded signer token changed during stopped recovery verification'
+    ! "$systemctl" is-active --quiet polyedge-funded-signer.service || die 'signer started during stopped recovery verification'
+    ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'producer started during stopped recovery verification'
+    old_invocation=$(jq -er '.lastRuntime.invocationId' "$stopped_recovery")
+    old_container=$(jq -er '.lastRuntime.containerId' "$stopped_recovery")
+  else
+    validate_stopped_preflight || die 'stopped restore preflight is unsafe, stale, or incomplete'
+    validate_stopped_binding || die 'stopped restore binding proof is unsafe, stale, or incomplete'
+    if [ -n "$approved_automatic_redemption_condition" ]; then
+      approved_payout=$(jq -er '.selection.selected_gross_payout' "$stopped_preflight")
+    fi
+    if [ "$image_changed" = true ]; then
+      validate_stopped_repair_evidence || die 'stopped repair evidence does not bind the exact last signer runtime'
+      old_invocation=$(jq -er '.signer.newInvocationId' "$prior_receipt")
+      old_container=$(jq -er '.signer.newContainerId' "$prior_receipt")
+    fi
   fi
   stopped_restore=true
   restart_attempted=true
@@ -613,6 +712,7 @@ elif [ "$image_changed" = true ]; then start_mode=repair_rollout
 fi
 jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt" --arg prior_sha "sha256:$prior_receipt_sha" \
   --arg recovery "$recording_recovery" --arg recovery_sha "sha256:$recording_recovery_sha" \
+  --arg stopped_recovery "$stopped_recovery" --arg stopped_recovery_sha "sha256:$stopped_recovery_sha" \
   --arg lifecycle "$lifecycle_evidence" --arg lifecycle_sha "sha256:$lifecycle_evidence_sha" --arg helper_sha "sha256:$(sha "$0")" \
   --arg old_invocation "$old_invocation" --arg old_container "$old_container" --arg new_invocation "$new_invocation" --arg new_container "$new_container" \
   --arg signer_image "$signer_image" --arg prior_signer_image "$prior_signer_image" --arg signer_revision "$signer_revision" --arg rollback_copy "$rollback_copy" --arg signer_user "$signer_user" --arg producer_image "$producer_image" --arg producer_user "$producer_user" --arg producer_invocation "$producer_invocation" \
@@ -623,12 +723,12 @@ jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt
   --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" \
   --argjson queue_before "$queue_before" --argjson queue_after "$queue_after" --argjson disk_available "$available" \
   --argjson queue_quiet_seconds "$queue_quiet_seconds" \
-  '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:(if $recovery == "" then {path:$prior,sha256:$prior_sha} else null end),recordingRecovery:(if $recovery == "" then null else {path:$recovery,sha256:$recovery_sha} end),lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
+  '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:(if $recovery == "" and $stopped_recovery == "" then {path:$prior,sha256:$prior_sha} else null end),recordingRecovery:(if $recovery == "" then null else {path:$recovery,sha256:$recovery_sha} end),stoppedRecovery:(if $stopped_recovery == "" then null else {path:$stopped_recovery,sha256:$stopped_recovery_sha} end),lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
     startMode:$start_mode,
-    stoppedPreflight:(if ($start_mode | startswith("stopped_")) then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
-    stoppedBinding:(if ($start_mode | startswith("stopped_")) then {path:$stopped_binding,sha256:("sha256:" + $stopped_binding_sha)} else null end),
+    stoppedPreflight:(if ($start_mode | startswith("stopped_")) and $stopped_recovery == "" then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
+    stoppedBinding:(if ($start_mode | startswith("stopped_")) and $stopped_recovery == "" then {path:$stopped_binding,sha256:("sha256:" + $stopped_binding_sha)} else null end),
     approvedAutomaticRedemptionCondition:(if $approved_automatic_redemption_condition == "" then null else $approved_automatic_redemption_condition end),automaticRedemption:$automatic_redemption,
-    approvedRedemptionPreflight:(if $approved_preflight_before==null then null else {beforeProducerStop:$approved_preflight_before,afterProducerStop:$approved_preflight_after} end),
+    approvedRedemptionPreflight:(if $approved_preflight_before==null then null elif $stopped_recovery != "" then {initialStopped:$approved_preflight_before,preDeployStopped:$approved_preflight_after} else {beforeProducerStop:$approved_preflight_before,afterProducerStop:$approved_preflight_after} end),
     signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode | endswith("repair_rollout")),priorFailedMessages:(if $start_mode == "repair_rollout" then $repair_failed_messages else null end),priorFailedAttempts:(if $start_mode == "repair_rollout" then $repair_failed_attempts else null end),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
     producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode == "restart" or $start_mode == "repair_rollout"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before == $queue_after),producerStoppedQuietSeconds:$queue_quiet_seconds},
     unresolvedBindingRecords:0,disk:{availableBytes:$disk_available,minAvailableBytes:16106127360},parityTimerPaused:true,azureDeletionAuthorized:false}' >"$tmp"

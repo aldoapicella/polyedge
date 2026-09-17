@@ -1,0 +1,272 @@
+#!/usr/bin/python3 -I
+"""Read-only certificate for the 2026-09-17 interrupted signer startup repair."""
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+import uuid
+
+PREFIX = "ghcr.io/aldoapicella/polyedge-venue-probe@sha256:"
+PRIOR = PREFIX + "cf701ac5ebdf1a66c10ed52feab9fbca3dfb6eb7937e2501c5a41f812a29f28f"
+FAILED_IMAGE = PREFIX + "5fc37dcc5b3d22b1667305941f5956cb062d073a4933a40ce18bc007cac931a8"
+FAILED_REVISION = "503ee9edeff2f5d63faec1ca67f84276f344b3da"
+TARGET = PREFIX + "f539568bcb0cf3df583eaa86359c072d24df02cd7a4e98406895354fbf0e03dd"
+REVISION = "672d6b402c29685c6060c0ea66d13c4e97efc418"
+CONDITION = "0x5eb827783561eda38dfa71ab7bc5d4e3613d8d09b0488e20ab01c957b71818de"
+FAILED = {"invocationId": "3818c3af3ccd42c5a03066f59f50d715", "containerId": "9b88b8d5db81973b21a68b47bb8153ac2599e15c83ced134b31db2d5f4dc46e0", "image": FAILED_IMAGE, "revision": FAILED_REVISION, "user": "986:982", "restartCount": 0}
+LAST = {**FAILED, "invocationId": "3c73126a2630485bbe6b3853bb070981", "containerId": "744bfe9f8d1385f72f20c2d8d4dadd2c8d80c2009a61e0e8d2b9b81cacfd9c5a", "restartCount": 1}
+QUADLET = "/etc/containers/systemd/polyedge-funded-signer.container"
+COLLECTOR = "/usr/local/libexec/polyedge-funded-redemption-preflight.mjs"
+QUEUE = "/usr/local/libexec/polyedge-funded-oci-queue-snapshot"
+SELF = "/usr/local/libexec/polyedge-funded-stopped-recovery"
+PARENT = "/srv/polyedge-ring/parity/activation/20260917T055259Z-pagination-recovery/recording-recovery-385cc859c5b24a9093dfcbae0846f954.json"
+BASE = "reports/funded/dynamic-quote/sessions/"
+SOURCE = "dynamic-quote-funded-2026-08-13-v10"
+SESSION = "dynamic-quote-funded-2026-09-16-v11"
+
+
+def encoded(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def sha(value):
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def secure(path, mode, maximum=65536):
+    p = Path(path)
+    s = p.lstat()
+    assert stat.S_ISREG(s.st_mode) and s.st_uid == s.st_gid == 0
+    assert stat.S_IMODE(s.st_mode) == mode and s.st_nlink == 1 and 0 < s.st_size <= maximum
+    return p.read_bytes()
+
+
+def reference(path, mode=0o755):
+    return {"path": path, "sha256": sha(secure(path, mode))}
+
+
+def command(args, data=None, timeout=120, maximum=4 * 1024 * 1024):
+    result = subprocess.run(args, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=timeout, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"})
+    # Never echo child stderr: SDK failures can contain authenticated headers.
+    assert result.returncode == 0, "read-only child failed"
+    assert len(result.stdout) <= maximum
+    return result.stdout
+
+
+def stopped_services():
+    result = {}
+    for name in ("polyedge-funded-signer", "polyedge-funded-intent-producer"):
+        raw = command(["systemctl", "show", name + ".service", "-p", "ActiveState", "-p", "SubState",
+                       "-p", "MainPID", "-p", "InvocationID", "-p", "NRestarts", "-p", "ExecMainStatus"])
+        row = dict(line.split("=", 1) for line in raw.decode().splitlines())
+        assert row["MainPID"] == "0" and row["ActiveState"] in ("inactive", "failed")
+        result[name] = row
+    signer, producer = result.values()
+    assert signer["InvocationID"] == LAST["invocationId"] and signer["NRestarts"] == "1" and signer["ExecMainStatus"] == "137"
+    assert producer["InvocationID"] == "ebb3b67061904ebd9d90ca54a5f7b9f3" and producer["NRestarts"] == "0"
+    containers = json.loads(command(["podman", "ps", "-a", "--format", "json"]))
+    assert not any(name in ("polyedge-funded-signer", "polyedge-funded-intent-producer") or
+                   name.startswith("polyedge-stopped-read-") for row in containers for name in row.get("Names", []))
+    return result
+
+
+def startup_journal():
+    rows = []
+    for runtime in (FAILED, LAST):
+        raw = command(["journalctl", "-u", "polyedge-funded-signer.service",
+                       "_SYSTEMD_INVOCATION_ID=" + runtime["invocationId"], "-o", "json", "--all", "--no-pager"])
+        entries = [json.loads(line) for line in raw.splitlines()]
+        assert 1 <= len(entries) <= 100
+        events = []
+        for row in entries:
+            assert row["_SYSTEMD_INVOCATION_ID"] == runtime["invocationId"]
+            message = row["MESSAGE"]
+            assert isinstance(message, str) and len(message) <= 16384
+            try:
+                event = json.loads(message)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                assert row.get("CONTAINER_ID_FULL") == runtime["containerId"]
+                events.append(event)
+        if runtime == FAILED:
+            assert len(events) == 1 and events[0]["schema"] == "polyedge.funded_direct_service.v1"
+            assert events[0]["status"] == "failed_closed"
+            assert events[0]["error"] == "fail closed: unbounded rollover checkpoint requires a flat source account"
+        else:
+            assert events == [], "last startup emitted an unexpected application event"
+        times = []
+        for action in ("create", "start", "died", "remove"):
+            matches = [r for r in entries if "container " + action + " " + runtime["containerId"] + " (image=" + FAILED_IMAGE in r["MESSAGE"]]
+            assert len(matches) == 1 and "org.opencontainers.image.revision=" + FAILED_REVISION in matches[0]["MESSAGE"]
+            times.append(int(matches[0]["__REALTIME_TIMESTAMP"]))
+        assert all(left < right for left, right in zip(times, times[1:]))
+        if runtime == FAILED:
+            failure_time = int(next(r["__REALTIME_TIMESTAMP"] for r in entries if r.get("CONTAINER_ID_FULL") == runtime["containerId"]))
+            assert times[1] < failure_time < times[2]
+        rows.extend(entries)
+    rows.sort(key=lambda row: (int(row["__REALTIME_TIMESTAMP"]), row["__CURSOR"]))
+    return {"rows": rows, "sha256": sha(encoded(rows))}
+
+
+def run_node(source, *args):
+    secure("/etc/polyedge/funded-signer.env", 0o600, 131072)
+    name = "polyedge-stopped-read-" + uuid.uuid4().hex
+    secret_args = []
+    for suffix, target in (("private-key", "PRIVATE_KEY"), ("api-key", "API_KEY"), ("api-secret", "API_SECRET"), ("api-passphrase", "API_PASSPHRASE")):
+        spec = f"polyedge-polymarket-{suffix},type=env,target=POLYMARKET_{target}"
+        assert "Secret=" + spec in Path(QUADLET).read_text().splitlines()
+        secret_args.extend(["--secret", spec])
+    try:
+        return command(["podman", "run", "--rm", "--name", name, "--read-only", "-i", "--cap-drop", "ALL", "--user", "986:982",
+                        "--env-file", "/etc/polyedge/funded-signer.env", *secret_args,
+                        "-v", "/run/polyedge-federated-funded-signer:/run/credentials:ro", TARGET,
+                        "node", "--input-type=module", "-", *args], source)
+    finally:
+        command(["podman", "rm", "--force", "--ignore", name], timeout=30)
+
+
+CAPITAL_READ = r'''
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {storageContainer} from '/app/src/lib.mjs';
+import {createPublicClient,http,erc20Abi} from 'viem';
+import {polygon} from 'viem/chains';
+const proof=JSON.parse(process.argv[2]);
+const container=storageContainer({storageAccount:process.env.AZURE_STORAGE_ACCOUNT_NAME,storageContainer:process.env.AZURE_STORAGE_CONTAINER_NAME,azureClientId:process.env.AZURE_CLIENT_ID});
+const documents=[];
+for(const session of ['dynamic-quote-funded-2026-08-13-v10','dynamic-quote-funded-2026-09-16-v11']) {
+  for(const file of ['session.json','capital-reserve-state.json','unresolved-reservations-index.json']) {
+    const name=file==='unresolved-reservations-index.json' ? `reports/research/venue-probe/control/campaign-risk/${session}/${file}` : `reports/funded/dynamic-quote/sessions/${session}/${file}`, client=container.getBlobClient(name);
+    const response=await client.download(0,undefined,{abortSignal:AbortSignal.timeout(20000)});
+    const chunks=[];let size=0;for await(const chunk of response.readableStreamBody){size+=chunk.length;assert(size<=1048576);chunks.push(chunk)}
+    const bytes=Buffer.concat(chunks);assert(response.etag);
+    const head=await client.getProperties({conditions:{ifMatch:response.etag},abortSignal:AbortSignal.timeout(20000)});
+    assert.equal(head.etag,response.etag);assert.equal(head.contentLength,bytes.length);
+    documents.push({name,etag:response.etag,sha256:'sha256:'+createHash('sha256').update(bytes).digest('hex'),bytes:bytes.length,value:JSON.parse(bytes)});
+  }
+}
+const rpc=createPublicClient({chain:polygon,transport:http('https://polygon-bor-rpc.publicnode.com',{timeout:15000,retryCount:1})});
+assert.equal(await rpc.getChainId(),137);
+const block=await rpc.getBlock({blockNumber:BigInt(proof.block.number)});assert.equal(block.hash,proof.block.hash);
+const cash=await rpc.readContract({address:'0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb',abi:erc20Abi,functionName:'balanceOf',args:[proof.funder],blockNumber:block.number});
+assert.equal((await rpc.getBlock({blockNumber:block.number})).hash,block.hash);
+assert.equal(documents[3].sha256,'sha256:'+String(process.env.FUNDED_DIRECT_SESSION_MANIFEST_SHA256).replace(/^sha256:/,''));
+process.stdout.write(JSON.stringify({documents,cashBaseUnits:String(cash),equityBaseUnits:String(cash+BigInt(proof.payout_base_units))}));
+'''
+
+
+def validate_capital(value):
+    docs = value["documents"]
+    assert len(docs) == 6
+    source_manifest, source_state, source_index, target_manifest, target_state, target_index = docs
+    assert [d["name"] for d in docs] == [prefix + s + "/" + f for s in (SOURCE, SESSION) for prefix, f in
+        ((BASE, "session.json"), (BASE, "capital-reserve-state.json"), ("reports/research/venue-probe/control/campaign-risk/", "unresolved-reservations-index.json"))]
+    assert source_manifest["sha256"] == "sha256:c516c052fc5c01eed5403842ff24bf4b08512d6c38e8260e2d064580c82322f8"
+    assert target_manifest["sha256"] == "sha256:50d02e27dfb6652175f8515ed3437a1f716f83e490a578dce437e1ed0275a8a4"
+    assert source_state["sha256"] == "sha256:77514fd3897158600e5297207bdbe1497cdf014d2794d8bac98ed48d451c207f"
+    assert target_state["sha256"] == "sha256:2b6b1d3b0ecfed181dfb6b6775d3cc537f75d2c183b8f26147e70d38679fe3b1"
+    target = target_state["value"]
+    assert target["migration_source_session_sha256"] == source_manifest["sha256"]
+    assert target["migration_source_state_etag"] == source_state["etag"]
+    assert target["migration_completed_at"] == "2026-09-16T19:37:40.657Z"
+    assert target["session_id"] == SESSION and target["last_reconciled_equity"] == 46.778267
+    assert value["cashBaseUnits"] == "41778267" and value["equityBaseUnits"] == "46778267"
+    for doc, session in ((source_index, SOURCE), (target_index, SESSION)):
+        index = doc["value"]
+        assert index["schema"] == "polyedge.funded_unresolved_risk_reservation_index.v1" and index["schema_version"] == 1
+        assert index["campaign_id"] == session and index["unresolved_count"] == 0 and index["entries"] == []
+        assert index["entries_sha256"] == sha(encoded([]))
+    # Runtime still performs full manifest, settlement-ledger, reserve and equity validation.
+    return {**value, "documents": [{k: d[k] for k in ("name", "etag", "sha256", "bytes")} for d in docs]}
+
+
+def collect():
+    assert os.geteuid() == 0
+    started = stopped_services()
+    quadlet = reference(QUADLET, 0o600)
+    environment = reference("/etc/polyedge/funded-signer.env", 0o600)
+    assert [line for line in Path(QUADLET).read_text().splitlines() if line.startswith("EnvironmentFile=")] == ["EnvironmentFile=/etc/polyedge/funded-signer.env"]
+    assert [line for line in Path(QUADLET).read_text().splitlines() if line.startswith("Image=")] == ["Image=" + PRIOR]
+    image = json.loads(command(["podman", "image", "inspect", TARGET]))[0]
+    assert image["Architecture"] == "arm64" and image["Os"] == "linux" and image["Labels"]["org.opencontainers.image.revision"] == REVISION
+    parent = reference(PARENT, 0o640)
+    assert parent["sha256"] == "sha256:e08de067f5133f293c6c7d5f2d6749d0a364d387bbd6d776b8861915bcdce276"
+    previous = json.loads(secure(PARENT, 0o640))
+    assert previous["schema"] == "polyedge.funded_signer_recording_recovery.v1" and previous["status"] == "recording_recovered"
+    assert previous["targetSigner"] == {"image": FAILED_IMAGE, "revision": FAILED_REVISION}
+    assert previous["runtime"]["signer"]["invocationId"] == "385cc859c5b24a9093dfcbae0846f954"
+    assert previous["runtime"]["signer"]["image"] == PRIOR and previous["originalGuardedDeploymentClaimed"] is False
+    for name in ("sourceBundle", "lifecycle"):
+        ref = previous[name]
+        assert sha(secure(ref["path"], 0o640, 131072)) == ref["sha256"]
+    journal = startup_journal()
+    collector = reference(COLLECTOR)
+    quiet_started = time.monotonic()
+    before = json.loads(command([QUEUE, "--stopped"]))
+    assert before["verifier"] == reference(QUEUE)
+    proof = json.loads(run_node(secure(COLLECTOR, 0o755), "--collect", CONDITION, TARGET, REVISION))
+    assert proof["status"] == "approved_redemption_ready" and proof["payout_base_units"] == "5000000"
+    assert proof["target_image"] == TARGET and proof["target_revision"] == REVISION and proof["condition_id"] == CONDITION
+    assert proof["redemption_control"]["terminal"] is True and proof["redemption_control"]["readbacks"] == 2
+    capital = validate_capital(json.loads(run_node(CAPITAL_READ.encode(), json.dumps(proof))))
+    time.sleep(max(0, 10 - (time.monotonic() - quiet_started)))
+    after = json.loads(command([QUEUE, "--stopped"]))
+    assert time.monotonic() - quiet_started >= 10 and before == after and stopped_services() == started
+    assert reference(QUADLET, 0o600) == quadlet and reference(COLLECTOR) == collector
+    assert reference("/etc/polyedge/funded-signer.env", 0o600) == environment
+    assert startup_journal() == journal
+    return {"schema": "polyedge.funded_signer_stopped_recovery.v1", "status": "attested",
+            "createdAtUtc": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "readOnly": True, "servicesMutated": False, "azureDeletionAllowed": False,
+            "targetSigner": {"image": TARGET, "revision": REVISION},
+            "installedQuadlet": {**quadlet, "image": PRIOR}, "signerEnvironment": environment, "lastRuntime": LAST, "failedRuntime": FAILED,
+            "services": started, "startupJournal": journal, "priorRecordingRecovery": parent,
+            "verifier": reference(SELF), "approvedRedemptionPreflight": {"collector": collector, "proof": proof},
+            "capitalControls": capital, "queue": {"before": before, "after": after, "producerStoppedQuietSeconds": 10}}
+
+
+def stable_evidence(value):
+    value = json.loads(json.dumps(value))
+    del value["createdAtUtc"]
+    proof = value["approvedRedemptionPreflight"]["proof"]
+    for key in ("started_ts", "finished_ts", "block"):
+        del proof[key]
+    return value
+
+
+def verify(saved, current, now):
+    timestamp = dt.datetime.fromisoformat(saved["createdAtUtc"].replace("Z", "+00:00"))
+    assert 0 <= (now - timestamp).total_seconds() <= 1800
+    assert stable_evidence(saved) == stable_evidence(current), "stopped recovery evidence changed"
+    return current["approvedRedemptionPreflight"]["proof"]
+
+
+def main():
+    if sys.argv[1:] == ["--collect"]:
+        value = collect()
+    else:
+        assert len(sys.argv) == 6 and sys.argv[1] == "--verify"
+        assert sys.argv[3:] == [TARGET, REVISION, PRIOR]
+        saved = json.loads(secure(sys.argv[2], 0o640))
+        value = verify(saved, collect(), dt.datetime.now(dt.timezone.utc))
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        # Source location only; never print subprocess or Azure exception bodies.
+        tb = error.__traceback__
+        while tb.tb_next:
+            tb = tb.tb_next
+        print(f"stopped recovery failed: {type(error).__name__} at line {tb.tb_lineno}", file=sys.stderr)
+        sys.exit(1)
