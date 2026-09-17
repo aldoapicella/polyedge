@@ -102,6 +102,19 @@ for bad_env in FAKE_PREFLIGHT_FAIL=1 FAKE_PREFLIGHT_MUTATION=.unresolved_positio
   if run_approved "$output" "$bad_env" >/dev/null 2>&1; then echo "unsafe active approved preflight attested: $bad_env" >&2; exit 1; fi
   test ! -e "$output/recording-recovery-00000000000000000000000000000001.json"
 done
+cat >"$tmp/bin/queue-snapshot" <<'EOF'
+#!/usr/bin/env bash
+[ "${FAKE_OCI_SNAPSHOT_FAIL:-0}" = 0 ] || exit 1
+printf '%s\n' '{"backend":"oci","status":"observed_zero","readOnly":true,"archiveDlq":{"objectCount":1824,"inventorySha256":"fixed","exhaustiveListing":true}}'
+EOF
+chmod 755 "$tmp/bin/queue-snapshot"
+run_approved "$tmp/out-oci" POLYEDGE_POST_REDEMPTION_QUEUE_BACKEND=oci POLYEDGE_POST_REDEMPTION_QUEUE_SNAPSHOT_HELPER="$tmp/bin/queue-snapshot" >/dev/null
+jq -e '.queue.before.backend=="oci" and .queue.before==.queue.after and .authorizedDeadLetterBaseline==1824 and .servicesMutated==false' "$tmp/out-oci/post-redemption-venue-redemption-20260824182234412-7ef7b79f-attestation.json" >/dev/null
+for cause in unsafe_mode failed_read; do
+  chmod 755 "$tmp/bin/queue-snapshot"; args=()
+  if [ "$cause" = unsafe_mode ]; then chmod 777 "$tmp/bin/queue-snapshot"; else args=(FAKE_OCI_SNAPSHOT_FAIL=1); fi
+  if run_approved "$tmp/out-oci-$cause" POLYEDGE_POST_REDEMPTION_QUEUE_BACKEND=oci POLYEDGE_POST_REDEMPTION_QUEUE_SNAPSHOT_HELPER="$tmp/bin/queue-snapshot" "${args[@]}" >/dev/null 2>&1; then echo "unsafe OCI snapshot attested: $cause" >&2; exit 1; fi
+done
 cat >>"$tmp/bin/journalctl" <<'EOF'
 alert='{"schema":"polyedge.funded_direct_alert.v1","status":"websocket_gap_or_reconciliation_required"}'; /usr/bin/jq -cn --argjson n "$now" --arg m "$alert" '{__REALTIME_TIMESTAMP:($n|tostring),_SYSTEMD_INVOCATION_ID:"00000000000000000000000000000001",CONTAINER_ID_FULL:"0000000000000000000000000000000000000000000000000000000000000001",MESSAGE:$m}'
 EOF

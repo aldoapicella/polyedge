@@ -48,6 +48,8 @@ subscription=${POLYEDGE_GUARDED_RESTART_SUBSCRIPTION:-73783c0c-5a53-4f9b-b244-6f
 resource_group=${POLYEDGE_GUARDED_RESTART_RESOURCE_GROUP:-rg-polyedge-dev}
 namespace=${POLYEDGE_GUARDED_RESTART_NAMESPACE:-sb-polyedge-funded-cl-6urdjr5nmwx7w}
 queue=${POLYEDGE_GUARDED_RESTART_QUEUE:-funded-dynamic-quote-intents}
+queue_backend=${POLYEDGE_GUARDED_RESTART_QUEUE_BACKEND:-azure}
+queue_helper=${POLYEDGE_GUARDED_RESTART_QUEUE_SNAPSHOT_HELPER:-/usr/local/libexec/polyedge-funded-oci-queue-snapshot}
 allow_stopped=${POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED:-false}
 repair_mode=${POLYEDGE_GUARDED_RESTART_REPAIR_MODE:-false}
 repair_failed_messages=${POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_MESSAGES:-0}
@@ -79,6 +81,7 @@ image_changed=false
 rollback_copy=
 preflight_readiness=ready
 queue_before=
+queue_quiet_seconds=null
 old_invocation=
 old_container=
 automatic_redemption=null
@@ -98,6 +101,14 @@ container_id() { "$podman" inspect --format '{{.Id}}' "$1"; }
 nrestarts() { "$systemctl" show "$1.service" -p NRestarts --value; }
 
 queue_snapshot() {
+  if [ "$queue_backend" = oci ]; then
+    secure_file "$queue_helper" 755 65536 || return 1
+    jq -e --arg path "$queue_helper" --arg sha "sha256:$(sha "$queue_helper")" \
+      '.queue.before.backend=="oci" and .queue.after.backend=="oci" and
+       .queue.before.verifier=={path:$path,sha256:$sha} and .queue.after.verifier==.queue.before.verifier' "$lifecycle_evidence" >/dev/null || return 1
+    "$queue_helper"
+    return
+  fi
   "$runuser" -u ubuntu -- "$az" servicebus queue show --subscription "$subscription" --resource-group "$resource_group" \
     --namespace-name "$namespace" --name "$queue" --only-show-errors -o json |
     jq -ce 'if .status == "Active" and .countDetails.activeMessageCount == 0 and .countDetails.scheduledMessageCount == 0 and
@@ -426,6 +437,7 @@ trap 'exit 143' TERM
 exec 9>"$lock_file"
 flock -n 9 || { echo 'another PolyEdge utility is active' >&2; exit 75; }
 secure_file "$0" 755 65536 || die 'guarded restart helper is unsafe'
+case "$queue_backend" in azure|oci) :;; *) die 'queue backend must be azure or oci';; esac
 case "$allow_stopped" in true|false) :;; *) die 'POLYEDGE_GUARDED_RESTART_ALLOW_STOPPED must be true or false';; esac
 case "$repair_mode" in true|false) :;; *) die "POLYEDGE_GUARDED_RESTART_REPAIR_MODE must be true or false";; esac
 case "$repair_failed_messages" in ''|*[!0-9]*) die 'POLYEDGE_GUARDED_RESTART_REPAIR_FAILED_MESSAGES must be a non-negative integer';; esac
@@ -520,6 +532,18 @@ else
     [ "$(invocation polyedge-funded-signer)|$(container_id polyedge-funded-signer)" = "$old_invocation|$old_container" ] || die 'signer runtime changed during approved redemption preflight'
     approved_preflight_valid=true
   fi
+  if [ "$queue_backend" = oci ]; then
+    # OCI counts are approximate. Require a quiet interval with the producer
+    # stopped, repeated zero stats, and an idle signer before changing its image.
+    read -r quiet_started _ < /proc/uptime
+    sleep 10
+    ! "$systemctl" is-active --quiet polyedge-funded-intent-producer.service || die 'producer restarted during queue quiet interval'
+    wait_signer "$preflight_readiness" "$prior_signer_image" && binding_safe && token_safe || die 'signer became unsafe during queue quiet interval'
+    [ "$(queue_snapshot)" = "$queue_before" ] || die 'queue changed during quiet interval'
+    [ "$(invocation polyedge-funded-signer)|$(container_id polyedge-funded-signer)" = "$old_invocation|$old_container" ] || die 'signer runtime changed during queue quiet interval'
+    read -r quiet_ended _ < /proc/uptime
+    queue_quiet_seconds=$(awk -v start="$quiet_started" -v end="$quiet_ended" 'BEGIN {if (end-start<10) exit 1; printf "%.2f", end-start}') || die 'queue quiet interval was too short'
+  fi
   restart_attempted=true
   if [ "$image_changed" = true ]; then
     deploy_output=$(POLYEDGE_ROLLBACK_DIR="$rollback_dir" "$deploy" polyedge-funded-signer "$signer_image")
@@ -577,6 +601,7 @@ jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt
   --argjson approved_preflight_before "$approved_preflight_before" --argjson approved_preflight_after "$approved_preflight_after" \
   --argjson repair_failed_messages "$repair_failed_messages" --argjson repair_failed_attempts "$repair_failed_attempts" \
   --argjson queue_before "$queue_before" --argjson queue_after "$queue_after" --argjson disk_available "$available" \
+  --argjson queue_quiet_seconds "$queue_quiet_seconds" \
   '{schemaVersion:1,status:"validated",createdAtUtc:$created,priorRollout:(if $recovery == "" then {path:$prior,sha256:$prior_sha} else null end),recordingRecovery:(if $recovery == "" then null else {path:$recovery,sha256:$recovery_sha} end),lifecycleEvidence:{path:$lifecycle,sha256:$lifecycle_sha},helperSha256:$helper_sha,
     startMode:$start_mode,
     stoppedPreflight:(if ($start_mode | startswith("stopped_")) then {path:$stopped_preflight,sha256:("sha256:" + $stopped_preflight_sha)} else null end),
@@ -584,7 +609,7 @@ jq -n --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg prior "$prior_receipt
     approvedAutomaticRedemptionCondition:(if $approved_automatic_redemption_condition == "" then null else $approved_automatic_redemption_condition end),automaticRedemption:$automatic_redemption,
     approvedRedemptionPreflight:(if $approved_preflight_before==null then null else {beforeProducerStop:$approved_preflight_before,afterProducerStop:$approved_preflight_after} end),
     signer:{image:$signer_image,priorImage:$prior_signer_image,revision:$signer_revision,rollbackCopy:(if $rollback_copy == "" then null else $rollback_copy end),repairMode:($start_mode | endswith("repair_rollout")),priorFailedMessages:(if $start_mode == "repair_rollout" then $repair_failed_messages else null end),priorFailedAttempts:(if $start_mode == "repair_rollout" then $repair_failed_attempts else null end),user:$signer_user,oldInvocationId:(if $old_invocation == "" then null else $old_invocation end),oldContainerId:(if $old_container == "" then null else $old_container end),newInvocationId:$new_invocation,newContainerId:$new_container,nRestarts:0,failedAttempts:0,redemptionFailures:0},
-    producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode == "restart" or $start_mode == "repair_rollout"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before.deadLetterMessageCount == $queue_after.deadLetterMessageCount)},
+    producer:{image:$producer_image,user:$producer_user,invocationId:$producer_invocation,nRestarts:0,stoppedForRestart:($start_mode == "restart" or $start_mode == "repair_rollout"),restored:true},queue:{before:$queue_before,after:$queue_after,existingDlqPreserved:($queue_before == $queue_after),producerStoppedQuietSeconds:$queue_quiet_seconds},
     unresolvedBindingRecords:0,disk:{availableBytes:$disk_available,minAvailableBytes:16106127360},parityTimerPaused:true,azureDeletionAuthorized:false}' >"$tmp"
 chown "$expected_uid:$expected_gid" "$tmp"
 chmod 0640 "$tmp"

@@ -280,4 +280,36 @@ for bad_env in FAKE_AUTOMATIC_REDEMPTION=0 FAKE_AUTOMATIC_PAYOUT=6 POLYEDGE_GUAR
   if [ "$bad_env" = POLYEDGE_GUARDED_RESTART_APPROVED_AUTOMATIC_REDEMPTION_CONDITION= ]; then test "$(cat "$d/state/phase")" = before
   else test "$(cat "$d/state/producer-active")" = 0; test "$(cat "$d/state/signer-active")" = 0; grep -Fx "Image=$prior_signer_image" "$d/quadlet" >/dev/null; fi
 done
+oci_recovery_fixture() {
+  local d=$1
+  approved_recovery_fixture "$d"
+  cat >"$d/bin/queue-snapshot" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "${FAKE_OCI_SNAPSHOT_FAIL:-0}" = 0 ] || exit 1
+count=1824
+if [ "$(cat "$FAKE/state/producer-active")" = 0 ]; then count=${FAKE_OCI_ARCHIVE_AFTER_STOP:-1824}; fi
+jq -c --argjson count "$count" '.archiveDlq.objectCount=$count' "$FAKE/oci-snapshot.json"
+EOF
+  chmod 755 "$d/bin/queue-snapshot"
+  jq -n --arg path "$d/bin/queue-snapshot" --arg sha "sha256:$(sha256sum "$d/bin/queue-snapshot"|cut -d' ' -f1)" \
+    '{backend:"oci",schema:"polyedge.funded_oci_queue_snapshot.v1",status:"observed_zero",readOnly:true,
+      verifier:{path:$path,sha256:$sha},archiveDlq:{objectCount:1824,inventorySha256:("a"*64),exhaustiveListing:true}}' >"$d/oci-snapshot.json"
+  jq --slurpfile q "$d/oci-snapshot.json" '.queue={before:$q[0],after:$q[0]}' "$d/lifecycle.json" >"$d/lifecycle.tmp"; mv "$d/lifecycle.tmp" "$d/lifecycle.json"
+  jq --arg sha "sha256:$(sha256sum "$d/lifecycle.json"|cut -d' ' -f1)" '.lifecycle.sha256=$sha' "$d/recovery.json" >"$d/recovery.tmp"; mv "$d/recovery.tmp" "$d/recovery.json"
+  chmod 640 "$d/lifecycle.json" "$d/recovery.json"
+}
+run_oci_recovery() { local d=$1; shift; run_approved_recovery "$d" POLYEDGE_GUARDED_RESTART_QUEUE_BACKEND=oci POLYEDGE_GUARDED_RESTART_QUEUE_SNAPSHOT_HELPER="$d/bin/queue-snapshot" "$@"; }
+d=$root/oci-recovery; oci_recovery_fixture "$d"; run_oci_recovery "$d" FAKE_COLD_AFTER_REPAIR=1
+jq -e '.queue.before.backend=="oci" and .queue.before.archiveDlq.objectCount==1824 and .queue.existingDlqPreserved==true and .queue.producerStoppedQuietSeconds>=10 and .producer.restored==true and (.queue.before|has("scheduledMessageCount")|not)' "$d/ring/activation/receipt.json" >/dev/null
+d=$root/oci-dlq-changed; oci_recovery_fixture "$d"
+if run_oci_recovery "$d" FAKE_OCI_ARCHIVE_AFTER_STOP=1825; then echo 'changed OCI DLQ accepted' >&2; exit 1; fi
+test "$(cat "$d/state/producer-active")" = 0; test "$(cat "$d/state/phase")" = before
+for cause in helper_changed unsafe_mode failed_read; do
+  d=$root/oci-bad-$cause; oci_recovery_fixture "$d"
+  args=()
+  case "$cause" in helper_changed) printf '\n' >>"$d/bin/queue-snapshot";; unsafe_mode) chmod 777 "$d/bin/queue-snapshot";; failed_read) args=(FAKE_OCI_SNAPSHOT_FAIL=1);; esac
+  if run_oci_recovery "$d" "${args[@]}"; then echo "unsafe OCI queue proof accepted: $cause" >&2; exit 1; fi
+  test "$(cat "$d/state/producer-active")" = 1; test "$(cat "$d/state/phase")" = before
+done
 printf 'funded guarded signer restart tests passed\n'
