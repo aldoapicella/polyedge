@@ -11,7 +11,9 @@ Absent executable observations remain explicit missing evidence. This cannot
 repair a previously failed frozen experiment.
 
 Only primary paper capture also requests public REST books while a markout is
-pending. Actual response receipt time remains the observation time. The raw
+pending. A request gets at most one second, capped by the remaining observation
+deadline; the OCI host measured about 500 ms per fresh public-book request.
+Actual response receipt time remains the observation time. The raw
 response must be durably recorded before it can complete a markout; the snapshot
 does not feed strategy decisions, paper fills or risk state. Reservations protect
 an on-time response during its durable write, without extending the deadline.

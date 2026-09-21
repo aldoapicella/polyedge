@@ -36,6 +36,11 @@ on:
       - '.github/workflows/build-oci-images.yml'
   workflow_dispatch:
     inputs:
+      native_arm64:
+        description: Build natively for ARM64-only OCI deployments
+        required: false
+        default: false
+        type: boolean
       deploy_unit:
         description: Existing PolyEdge Quadlet unit name on conduit
         required: false
@@ -189,7 +194,7 @@ jobs:
   publish:
     if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.deploy_image_digest == '')
     name: ${{ matrix.name }} (publish)
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.native_arm64 && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write
@@ -214,21 +219,24 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: docker/setup-qemu-action@v4
+        if: ${{ !inputs.native_arm64 }}
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build and publish immutable multi-architecture image
+      - name: Build and publish immutable image
         id: image
         env:
           IMAGE: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           BUILD_ARGS: ${{ matrix.build_args }}
           GITHUB_TOKEN: ${{ github.token }}
+          PLATFORMS: ${{ inputs.native_arm64 && 'linux/arm64' || 'linux/amd64,linux/arm64' }}
+          IMAGE_VARIANT: ${{ inputs.native_arm64 && '-arm64' || '' }}
         run: |
           set -euo pipefail
-          reference="$IMAGE:sha-$GITHUB_SHA"
+          reference="$IMAGE:sha-$GITHUB_SHA$IMAGE_VARIANT"
           args=(
             --file "${{ matrix.dockerfile }}"
-            --platform linux/amd64,linux/arm64
+            --platform "$PLATFORMS"
             --provenance=mode=max
             --sbom=true
             --tag "$reference"
@@ -241,10 +249,10 @@ jobs:
           docker buildx imagetools inspect --raw "$reference" > manifest.json
           digest=sha256:$(sha256sum manifest.json | awk '{print $1}')
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          jq -e '
+          jq -e --arg platforms "$PLATFORMS" '
             .manifests
             | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture)
-            | sort == ["amd64", "arm64"]
+            | sort == ($platforms | split(",") | map(split("/")[1]) | sort)
           ' manifest.json
           printf '%s\n' "digest=$digest" >> "$GITHUB_OUTPUT"
           printf '%s\n' "reference=$IMAGE@$digest" >> "$GITHUB_OUTPUT"
@@ -261,7 +269,7 @@ jobs:
   publish-research-validation:
     if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.deploy_image_digest == '')
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.native_arm64 && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     permissions:
       contents: read
       packages: write
@@ -269,14 +277,16 @@ jobs:
       - uses: actions/checkout@v5
 
       - uses: docker/setup-qemu-action@v4
+        if: ${{ !inputs.native_arm64 }}
 
       - uses: docker/setup-buildx-action@v4
 
       - name: Build validation image from the published backend digest
         env:
-          BACKEND: ghcr.io/${{ github.repository_owner }}/polyedge-rust-backend:sha-${{ github.sha }}
-          IMAGE: ghcr.io/${{ github.repository_owner }}/polyedge-research-validation:sha-${{ github.sha }}
+          BACKEND: ghcr.io/${{ github.repository_owner }}/polyedge-rust-backend:sha-${{ github.sha }}${{ inputs.native_arm64 && '-arm64' || '' }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/polyedge-research-validation:sha-${{ github.sha }}${{ inputs.native_arm64 && '-arm64' || '' }}
           GITHUB_TOKEN: ${{ github.token }}
+          PLATFORMS: ${{ inputs.native_arm64 && 'linux/arm64' || 'linux/amd64,linux/arm64' }}
         run: |
           set -euo pipefail
           printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
@@ -285,7 +295,7 @@ jobs:
           [[ "$backend_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           docker buildx build \
             --file Dockerfile.research-validation \
-            --platform linux/amd64,linux/arm64 \
+            --platform "$PLATFORMS" \
             --build-arg "BASE_IMAGE=${BACKEND%:*}@$backend_digest" \
             --provenance=mode=max \
             --sbom=true \
@@ -294,10 +304,10 @@ jobs:
           docker buildx imagetools inspect --raw "$IMAGE" > manifest.json
           digest=sha256:$(sha256sum manifest.json | awk '{print $1}')
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          jq -e '
+          jq -e --arg platforms "$PLATFORMS" '
             .manifests
             | map(select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | .platform.architecture)
-            | sort == ["amd64", "arm64"]
+            | sort == ($platforms | split(",") | map(split("/")[1]) | sort)
           ' manifest.json
           printf '### research-validation\n\n- `%s@%s`\n' "${IMAGE%:*}" "$digest" >> "$GITHUB_STEP_SUMMARY"
 

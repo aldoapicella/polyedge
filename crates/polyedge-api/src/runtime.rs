@@ -63,7 +63,9 @@ const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
 const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
 const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MARKOUT_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const MARKOUT_CAPTURE_REQUEST_MAX: Duration = Duration::from_millis(200);
+// Fresh public-book requests from the OCI host take about 500ms. The caller
+// still caps this budget at the original observation deadline.
+const MARKOUT_CAPTURE_REQUEST_MAX: Duration = Duration::from_secs(1);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
 const ESSENTIAL_FEED_MAX_AGE_SECONDS: i64 = 5 * 60;
