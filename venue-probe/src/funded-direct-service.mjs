@@ -238,7 +238,7 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     if (!(config.autoRedemptionMinSecondsToExpiry >= 10 &&
         config.autoRedemptionMaxSecondsToExpiry <= 300 &&
         config.autoRedemptionMinSecondsToExpiry < config.autoRedemptionMaxSecondsToExpiry)) {
-      errors.push("automatic redemption window must remain within the configured minimum and 300 seconds of the final 360 seconds");
+      errors.push("automatic redemption window must remain between the configured minimum and 300 seconds after expiry");
     }
     if (!env.POLYMARKET_RELAYER_API_KEY) {
       errors.push("POLYMARKET_RELAYER_API_KEY is required for automatic redemption");
@@ -405,7 +405,7 @@ export async function runPersistentFundedDirectService({
     poll_interval_ms: config.pollIntervalMs,
     signal_to_send_slo_ms: config.signalToSendSloMs,
     automatic_redemption_enabled: config.autoRedemptionEnabled,
-    automatic_redemption_window_seconds_to_expiry: config.autoRedemptionEnabled
+    automatic_redemption_window_seconds_after_expiry: config.autoRedemptionEnabled
       ? {
           minimum: config.autoRedemptionMinSecondsToExpiry,
           maximum: config.autoRedemptionMaxSecondsToExpiry
@@ -743,6 +743,7 @@ export async function runPersistentFundedDirectService({
   };
   try {
     while (!stopping) {
+      if (executor.status()?.warmed_market) maybeStartAutomaticRedemption();
       if (activeWorkflow) await new Promise((resolve) => setImmediate(resolve));
       if (config.maxMessages > 0 && processedMessages + failedAttempts >= config.maxMessages) {
         stopping = true;
@@ -847,16 +848,17 @@ export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config)
   const market = executorStatus?.warmed_market;
   const checkedAtMs = Number(nowMs);
   const endMs = Number.isFinite(checkedAtMs)
-    ? (Math.floor(checkedAtMs / FUNDED_BTC_MARKET_INTERVAL_MS) + 1) *
+    ? Math.floor(checkedAtMs / FUNDED_BTC_MARKET_INTERVAL_MS) *
       FUNDED_BTC_MARKET_INTERVAL_MS
     : Number.NaN;
   const warmedEndMs = Date.parse(String(market?.market_end_ts || ""));
   const remainingSeconds = (endMs - checkedAtMs) / 1_000;
+  const secondsSinceExpiry = -remainingSeconds;
   const eligible = Number.isFinite(checkedAtMs) &&
     Number.isFinite(endMs) &&
-    Number.isFinite(remainingSeconds) &&
-    remainingSeconds >= config.autoRedemptionMinSecondsToExpiry &&
-    remainingSeconds <= config.autoRedemptionMaxSecondsToExpiry;
+    Number.isFinite(secondsSinceExpiry) &&
+    secondsSinceExpiry >= config.autoRedemptionMinSecondsToExpiry &&
+    secondsSinceExpiry <= config.autoRedemptionMaxSecondsToExpiry;
   return {
     eligible,
     market_id: warmedEndMs === endMs ? market?.market_id || null : null,
@@ -864,6 +866,9 @@ export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config)
     clock_source: "btc_15m_utc_boundary",
     remaining_seconds: Number.isFinite(remainingSeconds)
       ? Math.round(remainingSeconds * 1_000) / 1_000
+      : null,
+    seconds_since_expiry: Number.isFinite(secondsSinceExpiry)
+      ? Math.round(secondsSinceExpiry * 1_000) / 1_000
       : null
   };
 }

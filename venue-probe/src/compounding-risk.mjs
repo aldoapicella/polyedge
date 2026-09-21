@@ -498,11 +498,11 @@ export function verifyAutomaticSettlementEvidence({
         && String(row?.side || "").toUpperCase() === "BUY"
         && normalizedAddress(row?.proxyWallet) === wallet
         && normalizedAsset(row?.asset) === tokenId
+        // Data API uses block time, which may lag CLOB match time; the exact
+        // transaction hash is the cross-source identity.
         && normalizedHash(row?.transactionHash) === group.transaction_hash
         && normalizedHash(row?.conditionId) === conditionId
         && Number.isFinite(activityTimestampMs(row?.timestamp))
-        && Math.abs(activityTimestampMs(row.timestamp) - group.timestamp_ms) <=
-          ACTIVITY_MATCH_TOLERANCE_MS
     );
     if (!candidates.length
         || !moneyEqual(sum(candidates, "size"), group.size)

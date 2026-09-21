@@ -1382,6 +1382,14 @@ test("automatic settlement binds exact reservation, CLOB, Data API, wallet, and 
   assert.equal(state.protected_reserve, 5.729586);
 });
 
+test("automatic settlement accepts delayed onchain trade activity with the exact transaction binding", () => {
+  const fixture = verifyFixture();
+  fixture.activity[0].timestamp = (fillTimestampMs + 60 * 60 * 1_000) / 1_000;
+  const settlement = verifyAutomaticSettlementEvidence(fixture);
+  assert.equal(settlement.condition_id, automaticCondition);
+  assert.deepEqual(settlement.fill_transaction_hashes, [automaticFillTransaction]);
+});
+
 test("automatic settlement backfills an exact zero-matched full fill", async () => {
   const reservation = automaticReservation({
     schema_version: 1,

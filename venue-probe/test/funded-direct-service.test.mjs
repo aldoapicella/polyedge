@@ -160,7 +160,7 @@ test("OCI queue bridge is exclusive and preserves receive settlement semantics",
   assert.equal(calls.every(({ signal }) => signal instanceof AbortSignal), true);
 });
 
-test("automatic redemption remains strictly inside the final no-trade window", () => {
+test("automatic redemption runs only in the first five minutes after expiry", () => {
   const config = loadFundedDirectServiceConfig(automaticRedemptionEnv());
   assert.equal(config.autoRedemptionMaxSecondsToExpiry, 300);
   const status = (marketEndTs = "2026-07-30T12:15:00Z") => ({
@@ -171,38 +171,40 @@ test("automatic redemption remains strictly inside the final no-trade window", (
   });
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
-    Date.parse("2026-07-30T12:09:00Z"),
+    Date.parse("2026-07-30T12:14:59Z"),
     config
   ).eligible, false);
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
-    Date.parse("2026-07-30T12:10:00Z"),
+    Date.parse("2026-07-30T12:15:30Z"),
     config
   ).eligible, true);
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
-    Date.parse("2026-07-30T12:14:30Z"),
+    Date.parse("2026-07-30T12:20:00Z"),
     config
   ).eligible, true);
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
-    Date.parse("2026-07-30T12:14:31Z"),
+    Date.parse("2026-07-30T12:20:01Z"),
     config
   ).eligible, false);
   const futureWarmup = fundedRedemptionMaintenanceWindow(
     status("2026-07-30T12:30:00Z"),
-    Date.parse("2026-07-30T12:10:00Z"),
+    Date.parse("2026-07-30T12:15:30Z"),
     config
   );
   assert.equal(futureWarmup.eligible, true);
   assert.equal(futureWarmup.market_id, null);
   assert.equal(futureWarmup.market_end_ts, "2026-07-30T12:15:00.000Z");
+  assert.equal(futureWarmup.remaining_seconds, -30);
+  assert.equal(futureWarmup.seconds_since_expiry, 30);
   assert.equal(futureWarmup.clock_source, "btc_15m_utc_boundary");
   assert.throws(
     () => loadFundedDirectServiceConfig(automaticRedemptionEnv({
       FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "301"
     })),
-    /300 seconds of the final 360 seconds/
+    /300 seconds after expiry/
   );
 });
 
@@ -997,8 +999,8 @@ test("persistent service waits for the prior revision lease before receiving mes
   );
 });
 
-test("persistent service runs redemption under the inherited lease after entering the no-trade window", async () => {
-  const now = Date.parse("2026-07-30T12:10:00Z");
+test("persistent service runs redemption under the inherited lease after market expiry", async () => {
+  const now = Date.parse("2026-07-30T12:15:30Z");
   const bus = fakeBus([{
     messageId: "warmup-next-market",
     deliveryCount: 1,
@@ -1054,7 +1056,7 @@ test("persistent service runs redemption under the inherited lease after enterin
 });
 
 test("persistent service coalesces a duplicate warmup while redemption maintenance is running", async () => {
-  const now = Date.parse("2026-07-30T12:10:00Z");
+  const now = Date.parse("2026-07-30T12:15:30Z");
   const warmup = (messageId) => ({
     messageId,
     deliveryCount: 1,
