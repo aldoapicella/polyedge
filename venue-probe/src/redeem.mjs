@@ -178,7 +178,7 @@ async function run() {
     clob.getBalanceAllowance({ asset_type: AssetType.COLLATERAL, signature_type: config.signatureType }),
     fetchActivity(),
     readRedemptionControl(),
-    config.dustRedemptionEnabled
+    shouldLoadUnresolvedReservations(config)
       ? loadCampaignUnresolvedRiskReservationRecords(config)
       : []
   ]);
@@ -245,11 +245,24 @@ async function run() {
     }))
   });
 
-  if (selection.selected.length && hasUnselectedUnresolvedRiskReservations(unresolvedReservations, selection)) {
+  if (config.dustRedemptionEnabled && selection.selected.length &&
+      hasUnselectedUnresolvedRiskReservations(unresolvedReservations, selection)) {
     return baseSummary("redemption_deferred_unrelated_unresolved_reservation", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
   }
   if (!selection.selected.length) {
-    return baseSummary("nothing_to_redeem", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
+    return baseSummary(
+      unresolvedReservations.length
+        ? "redemption_pending_unresolved_reservations"
+        : "nothing_to_redeem",
+      geoblock,
+      account.address,
+      liquidBefore,
+      selection,
+      approvals,
+      calls,
+      recentRedemptions,
+      portfolio
+    );
   }
   if (config.dryRun) {
     return baseSummary("redemption_ready_no_transaction", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
@@ -273,7 +286,7 @@ async function run() {
   if (!Array.isArray(finalOrders) || finalOrders.length) throw new Error("fail closed: open-order state changed before redemption");
   const [finalPositions, finalReservations] = await Promise.all([
     fetchRedemptionPositions(config),
-    config.dustRedemptionEnabled
+    shouldLoadUnresolvedReservations(config)
       ? loadCampaignUnresolvedRiskReservationRecords(config)
       : []
   ]);
@@ -282,7 +295,8 @@ async function run() {
       enabled: config.dustRedemptionEnabled
     }));
   assertStableRedemptionSelection(selection, finalSelection);
-  if (hasUnselectedUnresolvedRiskReservations(finalReservations, finalSelection)) {
+  if (config.dustRedemptionEnabled &&
+      hasUnselectedUnresolvedRiskReservations(finalReservations, finalSelection)) {
     return baseSummary("redemption_deferred_unrelated_unresolved_reservation", geoblock, account.address, liquidBefore, selection, approvals, calls, recentRedemptions, portfolio);
   }
 
@@ -1072,6 +1086,10 @@ export function hasUnselectedUnresolvedRiskReservations(records, selection) {
   const selected = new Set((selection?.selected || []).map((row) => String(row.condition_id || "").toLowerCase()));
   return (records || []).some((record) =>
     !selected.has(String(record?.reservation?.condition_id || "").toLowerCase()));
+}
+
+export function shouldLoadUnresolvedReservations(config) {
+  return config?.fundedServiceManaged === true || config?.dustRedemptionEnabled === true;
 }
 
 export async function fetchGammaMarket(marketId, { fetchImpl = fetch } = {}) {

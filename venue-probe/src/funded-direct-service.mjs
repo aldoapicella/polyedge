@@ -238,7 +238,7 @@ export function loadFundedDirectServiceConfig(env = process.env) {
     if (!(config.autoRedemptionMinSecondsToExpiry >= 10 &&
         config.autoRedemptionMaxSecondsToExpiry <= 300 &&
         config.autoRedemptionMinSecondsToExpiry < config.autoRedemptionMaxSecondsToExpiry)) {
-      errors.push("automatic redemption window must remain between the configured minimum and 300 seconds after expiry");
+      errors.push("automatic redemption drain confirmation must remain between the configured minimum and 300 seconds after expiry");
     }
     if (!env.POLYMARKET_RELAYER_API_KEY) {
       errors.push("POLYMARKET_RELAYER_API_KEY is required for automatic redemption");
@@ -379,6 +379,7 @@ export async function runPersistentFundedDirectService({
   let redemptionFailures = 0;
   let lastRedemptionStatus = null;
   let lastRedemptionCheckMs = 0;
+  let lastDrainedRedemptionBoundaryTs = null;
   const signalToSendSamples = [];
   let stopping = false;
   const stop = () => { stopping = true; };
@@ -405,10 +406,10 @@ export async function runPersistentFundedDirectService({
     poll_interval_ms: config.pollIntervalMs,
     signal_to_send_slo_ms: config.signalToSendSloMs,
     automatic_redemption_enabled: config.autoRedemptionEnabled,
-    automatic_redemption_window_seconds_after_expiry: config.autoRedemptionEnabled
+    automatic_redemption_after_expiry: config.autoRedemptionEnabled
       ? {
-          minimum: config.autoRedemptionMinSecondsToExpiry,
-          maximum: config.autoRedemptionMaxSecondsToExpiry
+          start_after_seconds: config.autoRedemptionMinSecondsToExpiry,
+          drain_confirmation_after_seconds: config.autoRedemptionMaxSecondsToExpiry
         }
       : null,
     cloud_only: true,
@@ -429,6 +430,10 @@ export async function runPersistentFundedDirectService({
       );
       redemptionResults += 1;
       lastRedemptionStatus = result?.status || "unknown";
+      if (result?.status === "nothing_to_redeem" &&
+          window.seconds_since_expiry >= config.autoRedemptionMaxSecondsToExpiry) {
+        lastDrainedRedemptionBoundaryTs = window.market_end_ts;
+      }
       logger({
         schema: "polyedge.funded_redemption_service.v1",
         status: "automatic_redemption_cycle_completed",
@@ -688,16 +693,23 @@ export async function runPersistentFundedDirectService({
     };
     void task.then(clear, clear);
   };
+  const busyValidations = new Set();
   const maybeStartAutomaticRedemption = () => {
-    if (!config.autoRedemptionEnabled || activeWorkflow) return;
+    if (!config.autoRedemptionEnabled) return false;
     const checkedAt = now();
-    if (checkedAt - lastRedemptionCheckMs < config.autoRedemptionIntervalMs) return;
+    if (checkedAt - lastRedemptionCheckMs < config.autoRedemptionIntervalMs) return false;
+    const window = fundedRedemptionMaintenanceWindow(executor.status(), checkedAt, config);
+    if (window.eligible && window.market_end_ts !== lastDrainedRedemptionBoundaryTs) {
+      if (activeWorkflow || busyValidations.size) return true;
+      lastRedemptionCheckMs = checkedAt;
+      redemptionChecks += 1;
+      trackActiveWorkflow(runAutomaticRedemption(window), "maintenance");
+      return true;
+    }
     lastRedemptionCheckMs = checkedAt;
     redemptionChecks += 1;
-    const window = fundedRedemptionMaintenanceWindow(executor.status(), checkedAt, config);
-    if (window.eligible) trackActiveWorkflow(runAutomaticRedemption(window), "maintenance");
+    return false;
   };
-  const busyValidations = new Set();
   let nextExpiredMarketRecoveryAtMs = 0;
   const maybeRecoverExpiredMarket = async () => {
     if (activeWorkflow || busyValidations.size > 0) return;
@@ -743,15 +755,23 @@ export async function runPersistentFundedDirectService({
   };
   try {
     while (!stopping) {
-      if (executor.status()?.warmed_market) maybeStartAutomaticRedemption();
-      if (activeWorkflow) await new Promise((resolve) => setImmediate(resolve));
+      if (activeWorkflowKind === "maintenance") {
+        await activeWorkflow;
+        continue;
+      }
       if (config.maxMessages > 0 && processedMessages + failedAttempts >= config.maxMessages) {
         stopping = true;
         break;
       }
+      if (maybeStartAutomaticRedemption()) {
+        await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
+        continue;
+      }
+      if (activeWorkflow) await new Promise((resolve) => setImmediate(resolve));
       if (busyValidations.size >= FUNDED_BUSY_VALIDATION_LIMIT ||
           (config.maxMessages > 0 && processedMessages + failedAttempts + busyValidations.size + (activeWorkflowKind === "intent" ? 1 : 0) >= config.maxMessages)) {
-        await Promise.race([activeWorkflow, ...busyValidations].filter(Boolean));
+        const inFlight = [activeWorkflow, ...busyValidations].filter(Boolean);
+        if (inFlight.length) await Promise.race(inFlight);
         continue;
       }
       const incoming = streaming
@@ -759,7 +779,6 @@ export async function runPersistentFundedDirectService({
         : (await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs }))[0] || null;
       if (!incoming) {
         await maybeRecoverExpiredMarket();
-        maybeStartAutomaticRedemption();
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }
@@ -802,7 +821,6 @@ export async function runPersistentFundedDirectService({
           }
         } else {
           await processWarmup(entry);
-          maybeStartAutomaticRedemption();
         }
         continue;
       }
@@ -857,8 +875,7 @@ export function fundedRedemptionMaintenanceWindow(executorStatus, nowMs, config)
   const eligible = Number.isFinite(checkedAtMs) &&
     Number.isFinite(endMs) &&
     Number.isFinite(secondsSinceExpiry) &&
-    secondsSinceExpiry >= config.autoRedemptionMinSecondsToExpiry &&
-    secondsSinceExpiry <= config.autoRedemptionMaxSecondsToExpiry;
+    secondsSinceExpiry >= config.autoRedemptionMinSecondsToExpiry;
   return {
     eligible,
     market_id: warmedEndMs === endMs ? market?.market_id || null : null,

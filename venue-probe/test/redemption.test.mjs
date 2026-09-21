@@ -23,6 +23,7 @@ import {
   recoveryEvidenceOwnershipAfterResume,
   rejectedRelayerSubmissionMatches,
   safeRelayerErrorDetail,
+  shouldLoadUnresolvedReservations,
   shouldUploadRedemptionEvidence,
   validateCanonicalRecoveryJournal
 } from "../src/redeem.mjs";
@@ -38,6 +39,12 @@ import {
   selectRedeemableConditions,
   summarizeRecentRedemptions
 } from "../src/redemption.mjs";
+
+test("funded redemption always inventories unresolved reservations", () => {
+  assert.equal(shouldLoadUnresolvedReservations({ fundedServiceManaged: true }), true);
+  assert.equal(shouldLoadUnresolvedReservations({ dustRedemptionEnabled: true }), true);
+  assert.equal(shouldLoadUnresolvedReservations({}), false);
+});
 
 const owner = "0xc9f6f0D01e5eEf2446819Ce21C4f1F9b688A9921";
 const funder = "0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8";

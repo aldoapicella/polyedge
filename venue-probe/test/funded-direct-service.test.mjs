@@ -160,7 +160,7 @@ test("OCI queue bridge is exclusive and preserves receive settlement semantics",
   assert.equal(calls.every(({ signal }) => signal instanceof AbortSignal), true);
 });
 
-test("automatic redemption runs only in the first five minutes after expiry", () => {
+test("automatic redemption retries after expiry until the next boundary", () => {
   const config = loadFundedDirectServiceConfig(automaticRedemptionEnv());
   assert.equal(config.autoRedemptionMaxSecondsToExpiry, 300);
   const status = (marketEndTs = "2026-07-30T12:15:00Z") => ({
@@ -173,7 +173,7 @@ test("automatic redemption runs only in the first five minutes after expiry", ()
     status(),
     Date.parse("2026-07-30T12:14:59Z"),
     config
-  ).eligible, false);
+  ).eligible, true);
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
     Date.parse("2026-07-30T12:15:30Z"),
@@ -187,6 +187,16 @@ test("automatic redemption runs only in the first five minutes after expiry", ()
   assert.equal(fundedRedemptionMaintenanceWindow(
     status(),
     Date.parse("2026-07-30T12:20:01Z"),
+    config
+  ).eligible, true);
+  assert.equal(fundedRedemptionMaintenanceWindow(
+    status(),
+    Date.parse("2026-07-30T12:29:59Z"),
+    config
+  ).eligible, true);
+  assert.equal(fundedRedemptionMaintenanceWindow(
+    status("2026-07-30T12:30:00Z"),
+    Date.parse("2026-07-30T12:30:01Z"),
     config
   ).eligible, false);
   const futureWarmup = fundedRedemptionMaintenanceWindow(
@@ -204,8 +214,62 @@ test("automatic redemption runs only in the first five minutes after expiry", ()
     () => loadFundedDirectServiceConfig(automaticRedemptionEnv({
       FUNDED_DIRECT_AUTO_REDEMPTION_MAX_SECONDS_TO_EXPIRY: "301"
     })),
-    /300 seconds after expiry/
+    /drain confirmation.*300 seconds after expiry/
   );
+});
+
+test("post-expiry maintenance cannot starve behind a nonempty funded intent queue", async () => {
+  const now = Date.parse("2026-07-30T12:16:05Z");
+  let clockReads = 0;
+  const decisionTs = new Date(now - 500).toISOString();
+  const bus = fakeBus([["first", "a"], ["second", "b"]].map(([suffix, hex]) => ({
+    messageId: `funded-intent-${suffix}`,
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: hex.repeat(64),
+      decision_ts: decisionTs
+    }
+  })));
+  let processCalls = 0;
+  let maintenanceRuns = 0;
+  const order = [];
+  await runPersistentFundedDirectService({
+    env: automaticRedemptionEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
+    now: () => clockReads++ === 0
+      ? Date.parse("2026-07-30T12:15:05Z")
+      : now,
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => {},
+      execute: async () => {},
+      runMaintenance: async (task) => {
+        maintenanceRuns += 1;
+        order.push("maintenance");
+        return task({ lease: { assertHealthy() {} } });
+      },
+      status: () => ({
+        warmed_market: {
+          market_id: "btc-market",
+          market_end_ts: "2026-07-30T12:15:00Z"
+        }
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => {
+        processCalls += 1;
+        order.push(`intent-${processCalls}`);
+        return { status: "already_completed_idempotent" };
+      }
+    }),
+    runRedemption: async () => ({ status: "redemption_pending_unresolved_reservations" }),
+    logger: () => {}
+  });
+  assert.equal(processCalls, 2);
+  assert.equal(maintenanceRuns, 1);
+  assert.deepEqual(order, ["intent-1", "maintenance", "intent-2"]);
+  assert.deepEqual(bus.completed, ["funded-intent-first", "funded-intent-second"]);
 });
 
 function fakeBus(messages) {
@@ -1056,7 +1120,8 @@ test("persistent service runs redemption under the inherited lease after market 
 });
 
 test("persistent service coalesces a duplicate warmup while redemption maintenance is running", async () => {
-  const now = Date.parse("2026-07-30T12:15:30Z");
+  const now = Date.parse("2026-07-30T12:16:05Z");
+  let clockReads = 0;
   const warmup = (messageId) => ({
     messageId,
     deliveryCount: 1,
@@ -1074,7 +1139,9 @@ test("persistent service coalesces a duplicate warmup while redemption maintenan
   const maintenanceStartedPromise = new Promise((resolve) => { maintenanceStarted = resolve; });
   const resultPromise = runPersistentFundedDirectService({
     env: automaticRedemptionEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
-    now: () => now,
+    now: () => clockReads++ === 0
+      ? Date.parse("2026-07-30T12:15:05Z")
+      : now,
     createBusClient: () => bus.client,
     createExecutor: async () => ({
       warmMarket: async (value) => { warmedMarket = value; },
@@ -1098,11 +1165,13 @@ test("persistent service coalesces a duplicate warmup while redemption maintenan
   for (let attempt = 0; attempt < 40 && bus.completed.length < 2; attempt += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
-  assert.deepEqual(bus.received, ["warmup-first", "warmup-duplicate"]);
-  assert.deepEqual(bus.completed, ["warmup-first", "warmup-duplicate"]);
+  assert.deepEqual(bus.received, ["warmup-first"]);
+  assert.deepEqual(bus.completed, ["warmup-first"]);
   assert.deepEqual(bus.deadLettered, []);
   releaseMaintenance();
   const result = await resultPromise;
+  assert.deepEqual(bus.received, ["warmup-first", "warmup-duplicate"]);
+  assert.deepEqual(bus.completed, ["warmup-first", "warmup-duplicate"]);
   assert.equal(result.failed_messages, 0);
   assert.equal(result.redemption_results, 1);
 });
