@@ -84,6 +84,13 @@ class SnapshotTest(unittest.TestCase):
         with self.assertRaises(snapshot.SnapshotError):
             snapshot.restore(self.client, Path(self.tmp.name) / "other-normalized", self.receipt)
 
+    def test_restore_rejects_nested_stale_native_basename(self):
+        snapshot.publish(self.client, self.root, self.receipt, evict=True)
+        stale = self.root / "stale"; stale.mkdir()
+        (stale / "books.jsonl.gz").write_bytes(b"stale")
+        with self.assertRaises(snapshot.SnapshotError):
+            snapshot.restore(self.client, self.root, self.receipt)
+
     def test_changed_manifest_payload_path_is_rejected(self):
         manifest = json.loads((self.root / "events_manifest.json").read_text())
         manifest["files"]["market"]["path"] = "/tmp/not-normalized"

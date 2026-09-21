@@ -300,6 +300,9 @@ def restore(client: Any, normalized: Path, receipt: Path) -> dict[str, Any]:
     if root != Path(value["normalized_path"]):
         raise SnapshotError("restore destination differs from receipt normalized directory")
     root.mkdir(parents=True, exist_ok=True)
+    receipt_paths = {Path(row["path"]) for row in value["files"]}
+    if set(_files(root)) - receipt_paths:
+        raise SnapshotError("restore destination contains files outside the receipt inventory")
     temp = Path(tempfile.mkdtemp(prefix=".primary-normalized-restore-", dir=root.parent))
     try:
         for row in value["files"]:
@@ -317,6 +320,8 @@ def restore(client: Any, normalized: Path, receipt: Path) -> dict[str, Any]:
                 os.link(staged, target)  # atomic creation; never overwrites a raced local file
             except FileExistsError as error:
                 raise SnapshotError(f"restore refuses raced local file: {relative}") from error
+        if set(_files(root)) != receipt_paths:
+            raise SnapshotError("restore did not produce the exact receipt inventory")
     finally:
         shutil.rmtree(temp, ignore_errors=True)
     return value
