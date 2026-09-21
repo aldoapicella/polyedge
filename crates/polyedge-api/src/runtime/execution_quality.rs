@@ -7,11 +7,19 @@ use polyedge_feeds::MarketChannelEvent;
 use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::str::FromStr;
 
 const MARKOUT_HORIZONS_SECONDS: [i64; 3] = [1, 5, 30];
 const MAX_MARKOUT_OBSERVATION_DELAY_MS: i64 = 2_000;
+const MARKOUT_HISTORY_SECONDS: i64 = 32;
+// Keep one full 32-second observation window at 700 updates/second, with a
+// hard cap if a venue exceeds that observed rate.
+const MAX_MARKOUT_HISTORY_PER_TOKEN: usize = 32_768;
+const MAX_MARKOUT_HISTORY_TOKENS: usize = 256;
+// A global cap keeps a broad token set from multiplying the per-token cap.
+const MAX_MARKOUT_HISTORY_TOTAL: usize = 65_536;
+const MAX_PENDING_MARKOUT_REST_TOKENS: usize = 16;
 const REGISTRATION_QUEUE_POSITION_SCHEMA: &str = "polyedge.paper_registration_queue_position.v1";
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -68,10 +76,27 @@ struct PendingMarkout {
     horizon_seconds: i64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug)]
+struct ObservedMarkoutBook {
+    observed_ts: DateTime<Utc>,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+    last_trade_price: Option<Decimal>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingMarkoutObservationRequest {
+    pub(super) token_id: TokenId,
+    pub(super) deadline: DateTime<Utc>,
+}
+
+#[derive(Default)]
 pub(super) struct ExecutionQualityTracker {
     orders: BTreeMap<OrderId, TrackedOrder>,
     pending_markouts: Vec<PendingMarkout>,
+    markout_books: BTreeMap<TokenId, VecDeque<ObservedMarkoutBook>>,
+    latest_markout_observation_ts: Option<DateTime<Utc>>,
+    markout_snapshot_reservations: BTreeMap<TokenId, DateTime<Utc>>,
     next_fill_id: u64,
 }
 
@@ -263,92 +288,143 @@ impl ExecutionQualityTracker {
                 }),
             });
         }
-        let mark_price = match (book.best_bid(), book.best_ask()) {
-            (Some(bid), Some(ask)) => Some((bid.price + ask.price) / Decimal::TWO),
-            (Some(bid), None) => Some(bid.price),
-            (None, Some(ask)) => Some(ask.price),
-            (None, None) => book.last_trade_price,
-        };
+        due.extend(self.observe_markout_snapshot(book));
+        due
+    }
+
+    /// Applies an independently observed, durably recorded public book only to
+    /// research markout capture. It intentionally does not update live book
+    /// state, queue position, paper fills, feed health, or strategy inputs.
+    pub(super) fn observe_markout_snapshot(&mut self, book: &BookState) -> Vec<QualityEvent> {
+        let observed = ObservedMarkoutBook::from(book);
+        self.remember_markout_book(book);
+        self.observe_pending_markouts(&book.token_id, &observed)
+    }
+
+    pub(super) fn begin_markout_snapshot_reservation(
+        &mut self,
+        request: &PendingMarkoutObservationRequest,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if now > request.deadline
+            || self
+                .markout_snapshot_reservations
+                .contains_key(&request.token_id)
+        {
+            return false;
+        }
+        let active = self.pending_markouts.iter().any(|markout| {
+            markout.token_id == request.token_id
+                && markout.fill_ts + Duration::seconds(markout.horizon_seconds) <= now
+                && markout.fill_ts
+                    + Duration::seconds(markout.horizon_seconds)
+                    + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS)
+                    == request.deadline
+        });
+        if active {
+            self.markout_snapshot_reservations
+                .insert(request.token_id.clone(), request.deadline);
+        }
+        active
+    }
+
+    pub(super) fn finish_markout_snapshot_reservation(
+        &mut self,
+        book: &BookState,
+    ) -> Vec<QualityEvent> {
+        self.markout_snapshot_reservations.remove(&book.token_id);
+        self.observe_markout_snapshot(book)
+    }
+
+    pub(super) fn cancel_markout_snapshot_reservation(
+        &mut self,
+        token_id: &TokenId,
+        now: DateTime<Utc>,
+    ) -> Vec<QualityEvent> {
+        self.markout_snapshot_reservations.remove(token_id);
+        self.expire_markouts(now)
+    }
+
+    pub(super) fn expire_markouts(&mut self, now: DateTime<Utc>) -> Vec<QualityEvent> {
+        self.prune_markout_histories(now);
+        let reservations = self.markout_snapshot_reservations.clone();
+        let mut due = Vec::new();
+        let mut pending = Vec::with_capacity(self.pending_markouts.len());
+        for markout in self.pending_markouts.drain(..) {
+            let deadline = markout.fill_ts
+                + Duration::seconds(markout.horizon_seconds)
+                + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
+            if now > deadline && reservations.get(&markout.token_id) != Some(&deadline) {
+                due.push(missing_markout_event(
+                    markout,
+                    "markout_observation_deadline_exceeded",
+                ));
+            } else {
+                pending.push(markout);
+            }
+        }
+        self.pending_markouts = pending;
+        due
+    }
+
+    pub(super) fn pending_markout_observation_requests(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Vec<PendingMarkoutObservationRequest> {
+        let mut deadlines = BTreeMap::<TokenId, DateTime<Utc>>::new();
+        for markout in &self.pending_markouts {
+            let target = markout.fill_ts + Duration::seconds(markout.horizon_seconds);
+            let deadline = target + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
+            if target <= now && now <= deadline {
+                deadlines
+                    .entry(markout.token_id.clone())
+                    .and_modify(|current| *current = (*current).min(deadline))
+                    .or_insert(deadline);
+            }
+        }
+        let mut requests = deadlines
+            .into_iter()
+            .map(|(token_id, deadline)| PendingMarkoutObservationRequest { token_id, deadline })
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            left.deadline
+                .cmp(&right.deadline)
+                .then_with(|| left.token_id.cmp(&right.token_id))
+        });
+        requests.truncate(MAX_PENDING_MARKOUT_REST_TOKENS);
+        requests
+    }
+
+    fn observe_pending_markouts(
+        &mut self,
+        token_id: &TokenId,
+        book: &ObservedMarkoutBook,
+    ) -> Vec<QualityEvent> {
+        let observed_ts = book.observed_ts;
+        let reservations = self.markout_snapshot_reservations.clone();
+        let mut due = Vec::new();
         let mut pending = Vec::with_capacity(self.pending_markouts.len());
         for markout in self.pending_markouts.drain(..) {
             let horizon_ts = markout.fill_ts + Duration::seconds(markout.horizon_seconds);
-            if markout.token_id != book.token_id || observed_ts < horizon_ts {
+            if &markout.token_id != token_id || observed_ts < horizon_ts {
                 pending.push(markout);
             } else if observed_ts
                 > horizon_ts + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS)
             {
-                due.push(QualityEvent {
-                    event_type: "paper_fill_markout_missing",
-                    payload: json!({
-                        "fill_id": markout.fill_id,
-                        "fill_source": markout.source,
-                        "order_id": markout.order_id,
-                        "market_id": markout.market_id,
-                        "token_id": markout.token_id,
-                        "side": markout.side,
-                        "fill_price": markout.fill_price.to_string(),
-                        "fill_size": markout.fill_size.to_string(),
-                        "fee_per_share": markout.fee_per_share.to_string(),
-                        "fill_ts": markout.fill_ts,
-                        "horizon_seconds": markout.horizon_seconds,
-                        "reason": "markout_observation_deadline_exceeded",
-                        "research_only": true
-                    }),
-                });
-            } else {
-                let executable_mark_price = match markout.side {
-                    Side::Buy => book.best_bid().map(|level| level.price),
-                    Side::Sell => book.best_ask().map(|level| level.price),
-                };
-                let (Some(mark_price), Some(executable_mark_price)) =
-                    (mark_price, executable_mark_price)
-                else {
+                let deadline =
+                    horizon_ts + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
+                if reservations.get(&markout.token_id) == Some(&deadline) {
                     pending.push(markout);
-                    continue;
-                };
-                let per_share = match markout.side {
-                    Side::Buy => mark_price - markout.fill_price,
-                    Side::Sell => markout.fill_price - mark_price,
-                };
-                let net_per_share = per_share - markout.fee_per_share;
-                let executable_per_share = match markout.side {
-                    Side::Buy => executable_mark_price - markout.fill_price,
-                    Side::Sell => markout.fill_price - executable_mark_price,
-                };
-                let net_executable_per_share = executable_per_share - markout.fee_per_share;
-                due.push(QualityEvent {
-                    event_type: "paper_fill_markout",
-                    payload: json!({
-                        "fill_id": markout.fill_id,
-                        "fill_source": markout.source,
-                        "order_id": markout.order_id,
-                        "market_id": markout.market_id,
-                        "token_id": markout.token_id,
-                        "side": markout.side,
-                        "fill_price": markout.fill_price.to_string(),
-                        "fill_size": markout.fill_size.to_string(),
-                        "fee_per_share": markout.fee_per_share.to_string(),
-                        "fill_ts": markout.fill_ts,
-                        "horizon_seconds": markout.horizon_seconds,
-                        "mark_price": mark_price.to_string(),
-                        "markout_per_share": per_share.to_string(),
-                        "markout_pnl": (per_share * markout.fill_size).to_string(),
-                        "net_markout_per_share": net_per_share.to_string(),
-                        "net_markout_pnl": (net_per_share * markout.fill_size).to_string(),
-                        "executable_mark_price": executable_mark_price.to_string(),
-                        "executable_markout_per_share": executable_per_share.to_string(),
-                        "executable_markout_pnl": (executable_per_share * markout.fill_size).to_string(),
-                        "net_executable_markout_per_share": net_executable_per_share.to_string(),
-                        "net_executable_markout_pnl": (net_executable_per_share * markout.fill_size).to_string(),
-                        "best_bid": book.best_bid().map(|level| level.price.to_string()),
-                        "best_ask": book.best_ask().map(|level| level.price.to_string()),
-                        "observed_ts": observed_ts,
-                        "observation_delay_ms": observed_ts.signed_duration_since(
-                            markout.fill_ts + Duration::seconds(markout.horizon_seconds)
-                        ).num_milliseconds().max(0),
-                        "research_only": true
-                    }),
-                });
+                } else {
+                    due.push(missing_markout_event(
+                        markout,
+                        "markout_observation_deadline_exceeded",
+                    ));
+                }
+            } else if let Some(event) = completed_markout_event(markout.clone(), book) {
+                due.push(event);
+            } else {
+                pending.push(markout);
             }
         }
         self.pending_markouts = pending;
@@ -371,7 +447,7 @@ impl ExecutionQualityTracker {
                     .get(&order_id)
                     .map(|order| (order.side.clone(), order.market_id.clone()))
                     .unwrap_or((Side::Buy, report.market_id.clone()));
-                self.schedule_markouts(
+                events.extend(self.schedule_markouts(
                     "touch_fill",
                     order_id.clone(),
                     market_id,
@@ -385,7 +461,7 @@ impl ExecutionQualityTracker {
                         Decimal::ZERO
                     },
                     report.local_ts,
-                );
+                ));
                 if matches!(
                     report.status.as_str(),
                     "paper_filled" | "paper_filled_maker"
@@ -583,7 +659,7 @@ impl ExecutionQualityTracker {
             }
         }
         for (order_id, market_id, token_id, side, price, size, ts) in scheduled {
-            self.schedule_markouts(
+            events.extend(self.schedule_markouts(
                 "queue_shadow_fill",
                 order_id,
                 market_id,
@@ -593,7 +669,7 @@ impl ExecutionQualityTracker {
                 size,
                 Decimal::ZERO,
                 ts,
-            );
+            ));
         }
         events
     }
@@ -652,7 +728,7 @@ impl ExecutionQualityTracker {
         fill_size: Decimal,
         fee_per_share: Decimal,
         fill_ts: DateTime<Utc>,
-    ) {
+    ) -> Vec<QualityEvent> {
         self.next_fill_id += 1;
         let fill_id = format!("paper-quality-{}-{}", order_id, self.next_fill_id);
         self.pending_markouts
@@ -673,7 +749,241 @@ impl ExecutionQualityTracker {
                         horizon_seconds,
                     }),
             );
+        self.resolve_markouts_from_history()
     }
+
+    fn remember_markout_book(&mut self, book: &BookState) {
+        let observed = ObservedMarkoutBook::from(book);
+        self.prune_markout_histories(observed.observed_ts);
+        self.markout_books.retain(|_, history| !history.is_empty());
+        if !self.markout_books.contains_key(&book.token_id)
+            && self.markout_books.len() >= MAX_MARKOUT_HISTORY_TOKENS
+        {
+            if let Some(token_id) = self
+                .markout_books
+                .iter()
+                .min_by_key(|(_, history)| history.back().map(|entry| entry.observed_ts))
+                .map(|(token_id, _)| token_id.clone())
+            {
+                self.markout_books.remove(&token_id);
+            }
+        }
+        let history = self.markout_books.entry(book.token_id.clone()).or_default();
+        if history
+            .back()
+            .is_none_or(|entry| entry.observed_ts <= observed.observed_ts)
+        {
+            history.push_back(observed);
+        } else {
+            // Normal local observation time is monotonic. Keep the uncommon
+            // out-of-order input ordered so lower-bound searches and eviction
+            // remain correct without scanning the full retained history.
+            let index = match history
+                .make_contiguous()
+                .binary_search_by_key(&observed.observed_ts, |entry| entry.observed_ts)
+            {
+                Ok(index) | Err(index) => index,
+            };
+            history.insert(index, observed);
+        }
+        while history.len() > MAX_MARKOUT_HISTORY_PER_TOKEN {
+            history.pop_front();
+        }
+        self.trim_markout_history_total();
+    }
+
+    fn prune_markout_histories(&mut self, observed_ts: DateTime<Utc>) {
+        let latest = self
+            .latest_markout_observation_ts
+            .map_or(observed_ts, |current| current.max(observed_ts));
+        self.latest_markout_observation_ts = Some(latest);
+        let cutoff = latest - Duration::seconds(MARKOUT_HISTORY_SECONDS);
+        self.markout_books.retain(|_, history| {
+            while history
+                .front()
+                .is_some_and(|entry| entry.observed_ts < cutoff)
+            {
+                history.pop_front();
+            }
+            !history.is_empty()
+        });
+    }
+
+    fn trim_markout_history_total(&mut self) {
+        while self
+            .markout_books
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>()
+            > MAX_MARKOUT_HISTORY_TOTAL
+        {
+            let Some(token_id) = self
+                .markout_books
+                .iter()
+                .filter_map(|(token_id, history)| {
+                    history
+                        .front()
+                        .map(|entry| (token_id.clone(), entry.observed_ts))
+                })
+                .min_by_key(|(_, observed_ts)| *observed_ts)
+                .map(|(token_id, _)| token_id)
+            else {
+                break;
+            };
+            let remove = self
+                .markout_books
+                .get_mut(&token_id)
+                .is_some_and(|history| {
+                    history.pop_front();
+                    history.is_empty()
+                });
+            if remove {
+                self.markout_books.remove(&token_id);
+            }
+        }
+    }
+
+    pub(super) fn pending_market_markouts(&self, market_id: &MarketId) -> Vec<QualityEvent> {
+        self.pending_markouts
+            .iter()
+            .filter(|markout| &markout.market_id == market_id)
+            .cloned()
+            .map(|markout| missing_markout_event(markout, "market_settled_before_observation"))
+            .collect()
+    }
+
+    fn resolve_markouts_from_history(&mut self) -> Vec<QualityEvent> {
+        let mut due = Vec::new();
+        let mut pending = Vec::with_capacity(self.pending_markouts.len());
+        for markout in self.pending_markouts.drain(..) {
+            let horizon_ts = markout.fill_ts + Duration::seconds(markout.horizon_seconds);
+            let deadline = horizon_ts + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
+            let history = self.markout_books.get(&markout.token_id);
+            let event = history.and_then(|books| {
+                let index = books
+                    .binary_search_by_key(&horizon_ts, |book| book.observed_ts)
+                    .unwrap_or_else(|index| index);
+                books.iter().skip(index).find_map(|book| {
+                    (book.observed_ts <= deadline)
+                        .then(|| completed_markout_event(markout.clone(), book))
+                        .flatten()
+                })
+            });
+            if let Some(event) = event {
+                due.push(event);
+            } else if history
+                .and_then(|books| books.back())
+                .is_some_and(|book| book.observed_ts >= deadline)
+            {
+                // All admissible observations are already retained and the
+                // same token has advanced through the deadline. A later book
+                // cannot repair this frozen window.
+                due.push(missing_markout_event(
+                    markout,
+                    "markout_observation_deadline_exceeded",
+                ));
+            } else {
+                pending.push(markout);
+            }
+        }
+        self.pending_markouts = pending;
+        due
+    }
+}
+
+impl From<&BookState> for ObservedMarkoutBook {
+    fn from(book: &BookState) -> Self {
+        Self {
+            observed_ts: book.local_ts,
+            best_bid: book.best_bid().map(|level| level.price),
+            best_ask: book.best_ask().map(|level| level.price),
+            last_trade_price: book.last_trade_price,
+        }
+    }
+}
+
+fn missing_markout_event(markout: PendingMarkout, reason: &'static str) -> QualityEvent {
+    QualityEvent {
+        event_type: "paper_fill_markout_missing",
+        payload: json!({
+            "fill_id": markout.fill_id,
+            "fill_source": markout.source,
+            "order_id": markout.order_id,
+            "market_id": markout.market_id,
+            "token_id": markout.token_id,
+            "side": markout.side,
+            "fill_price": markout.fill_price.to_string(),
+            "fill_size": markout.fill_size.to_string(),
+            "fee_per_share": markout.fee_per_share.to_string(),
+            "fill_ts": markout.fill_ts,
+            "horizon_seconds": markout.horizon_seconds,
+            "reason": reason,
+            "research_only": true
+        }),
+    }
+}
+
+fn completed_markout_event(
+    markout: PendingMarkout,
+    book: &ObservedMarkoutBook,
+) -> Option<QualityEvent> {
+    let mark_price = match (book.best_bid, book.best_ask) {
+        (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
+        (Some(bid), None) => Some(bid),
+        (None, Some(ask)) => Some(ask),
+        (None, None) => book.last_trade_price,
+    };
+    let executable_mark_price = match markout.side {
+        Side::Buy => book.best_bid,
+        Side::Sell => book.best_ask,
+    };
+    let (Some(mark_price), Some(executable_mark_price)) = (mark_price, executable_mark_price)
+    else {
+        return None;
+    };
+    let per_share = match markout.side {
+        Side::Buy => mark_price - markout.fill_price,
+        Side::Sell => markout.fill_price - mark_price,
+    };
+    let net_per_share = per_share - markout.fee_per_share;
+    let executable_per_share = match markout.side {
+        Side::Buy => executable_mark_price - markout.fill_price,
+        Side::Sell => markout.fill_price - executable_mark_price,
+    };
+    let net_executable_per_share = executable_per_share - markout.fee_per_share;
+    Some(QualityEvent {
+        event_type: "paper_fill_markout",
+        payload: json!({
+            "fill_id": markout.fill_id,
+            "fill_source": markout.source,
+            "order_id": markout.order_id,
+            "market_id": markout.market_id,
+            "token_id": markout.token_id,
+            "side": markout.side,
+            "fill_price": markout.fill_price.to_string(),
+            "fill_size": markout.fill_size.to_string(),
+            "fee_per_share": markout.fee_per_share.to_string(),
+            "fill_ts": markout.fill_ts,
+            "horizon_seconds": markout.horizon_seconds,
+            "mark_price": mark_price.to_string(),
+            "markout_per_share": per_share.to_string(),
+            "markout_pnl": (per_share * markout.fill_size).to_string(),
+            "net_markout_per_share": net_per_share.to_string(),
+            "net_markout_pnl": (net_per_share * markout.fill_size).to_string(),
+            "executable_mark_price": executable_mark_price.to_string(),
+            "executable_markout_per_share": executable_per_share.to_string(),
+            "executable_markout_pnl": (executable_per_share * markout.fill_size).to_string(),
+            "net_executable_markout_per_share": net_executable_per_share.to_string(),
+            "net_executable_markout_pnl": (net_executable_per_share * markout.fill_size).to_string(),
+            "best_bid": book.best_bid.map(|value| value.to_string()),
+            "best_ask": book.best_ask.map(|value| value.to_string()),
+            "observed_ts": book.observed_ts,
+            "observation_delay_ms": book.observed_ts.signed_duration_since(
+                markout.fill_ts + Duration::seconds(markout.horizon_seconds)
+            ).num_milliseconds().max(0),
+            "research_only": true
+        }),
+    })
 }
 
 fn decimal_text(value: Option<&str>) -> Option<Decimal> {
@@ -1298,6 +1608,191 @@ mod tests {
         assert!(tracker
             .observe_book(&book("0.51", "4", "0.52", "4", ts(4)))
             .is_empty());
+    }
+
+    #[test]
+    fn delayed_fill_recovers_timely_history_for_queue_and_touch_markouts() {
+        let mut queue = ExecutionQualityTracker::default();
+        queue
+            .register_order(
+                &decision(),
+                &report("paper_resting", Decimal::ZERO, None, ts(-1)),
+                None,
+                0,
+            )
+            .unwrap();
+        queue.observe_book(&book("0.51", "10", "0.52", "4", ts(0)));
+        for second in [1, 5, 30] {
+            queue.observe_book(&book("0.51", "10", "0.52", "4", ts(second)));
+        }
+        let mut delayed_trade = trade("0.49", "20", ts(0));
+        delayed_trade.recorded_ts = ts(31);
+        let queue_events = queue.observe_market_event(&delayed_trade);
+        assert_eq!(
+            queue_events
+                .iter()
+                .filter(|event| event.event_type == "paper_fill_markout")
+                .count(),
+            3
+        );
+        for second in [1, 5, 30] {
+            assert!(queue_events.iter().any(|event| {
+                event.event_type == "paper_fill_markout"
+                    && event.payload["fill_source"] == "queue_shadow_fill"
+                    && event.payload["horizon_seconds"] == second
+                    && event.payload["observed_ts"].as_str().and_then(parse_ts) == Some(ts(second))
+            }));
+        }
+
+        let mut touch = ExecutionQualityTracker::default();
+        for second in [1, 5, 30] {
+            touch.observe_book(&book("0.51", "10", "0.52", "4", ts(second)));
+        }
+        let touch_events = touch.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        assert_eq!(
+            touch_events
+                .iter()
+                .filter(|event| event.event_type == "paper_fill_markout")
+                .count(),
+            3
+        );
+        assert!(touch_events.iter().all(|event| {
+            event.event_type != "paper_fill_markout" || event.payload["fill_source"] == "touch_fill"
+        }));
+    }
+
+    #[test]
+    fn markout_history_emits_missing_immediately_after_retained_postdeadline_book() {
+        let mut tracker = ExecutionQualityTracker::default();
+        let mut wrong_token = book("0.51", "10", "0.52", "4", ts(1));
+        wrong_token.token_id = TokenId::new("other-token");
+        tracker.observe_book(&wrong_token);
+        let mut one_sided = book("0.51", "10", "0.52", "4", ts(1));
+        one_sided.bids.clear();
+        tracker.observe_book(&one_sided);
+        tracker.observe_book(&book("0.51", "10", "0.52", "4", ts(4)));
+
+        let immediate = tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        assert_eq!(immediate.len(), 1);
+        assert_eq!(immediate[0].event_type, "paper_fill_markout_missing");
+        assert_eq!(immediate[0].payload["horizon_seconds"], 1);
+
+        let later_missing = tracker.observe_book(&book("0.51", "10", "0.52", "4", ts(33)));
+        assert_eq!(later_missing.len(), 2);
+        assert!(immediate.iter().chain(&later_missing).all(|event| {
+            event.event_type == "paper_fill_markout_missing"
+                && event.payload["reason"] == "markout_observation_deadline_exceeded"
+        }));
+    }
+
+    #[test]
+    fn out_of_order_history_stays_sorted_and_prunes_from_the_front() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.remember_markout_book(&book("0.51", "10", "0.52", "4", ts(34)));
+        tracker.remember_markout_book(&book("0.51", "10", "0.52", "4", ts(2)));
+        let history = &tracker.markout_books[&TokenId::new("token")];
+        assert!(history
+            .iter()
+            .zip(history.iter().skip(1))
+            .all(|(left, right)| left.observed_ts <= right.observed_ts));
+        assert_eq!(history.front().map(|book| book.observed_ts), Some(ts(2)));
+
+        tracker.remember_markout_book(&book("0.51", "10", "0.52", "4", ts(35)));
+        assert!(tracker.markout_books[&TokenId::new("token")]
+            .iter()
+            .all(|book| book.observed_ts >= ts(3)));
+
+        tracker.expire_markouts(ts(67));
+        assert!(tracker.markout_books[&TokenId::new("token")]
+            .iter()
+            .all(|book| book.observed_ts >= ts(35)));
+    }
+
+    #[test]
+    fn markout_only_snapshot_resolves_a_timely_quiet_feed_window() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        let events = tracker.observe_markout_snapshot(&book("0.51", "4", "0.52", "4", ts(1)));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "paper_fill_markout");
+        assert_eq!(events[0].payload["horizon_seconds"], 1);
+        assert_eq!(tracker.pending_markout_observation_requests(ts(1)).len(), 0);
+    }
+
+    #[test]
+    fn reserved_timely_snapshot_beats_late_book_and_delayed_processing() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        let request = tracker
+            .pending_markout_observation_requests(ts(1))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(tracker.begin_markout_snapshot_reservation(&request, ts(1)));
+
+        // The regular feed advances past the deadline while a response that was
+        // actually received at t+2 waits for durable recorder admission.
+        assert!(tracker
+            .observe_book(&book("0.51", "4", "0.52", "4", ts(4)))
+            .is_empty());
+        assert!(tracker.expire_markouts(ts(4)).is_empty());
+
+        let events =
+            tracker.finish_markout_snapshot_reservation(&book("0.51", "4", "0.52", "4", ts(2)));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "paper_fill_markout");
+        assert_eq!(
+            events[0].payload["observed_ts"].as_str().and_then(parse_ts),
+            Some(ts(2))
+        );
+    }
+
+    #[test]
+    fn markout_history_evicts_old_and_excess_books() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_book(&book("0.51", "10", "0.52", "4", ts(1)));
+        let mut later_token = book("0.51", "10", "0.52", "4", ts(34));
+        later_token.token_id = TokenId::new("later-token");
+        tracker.remember_markout_book(&later_token);
+        assert!(!tracker.markout_books.contains_key(&TokenId::new("token")));
+        tracker.observe_book(&book("0.51", "10", "0.52", "4", ts(34)));
+        let history = &tracker.markout_books[&TokenId::new("token")];
+        assert!(history.iter().all(|entry| entry.observed_ts >= ts(2)));
+
+        for _ in 0..=MAX_MARKOUT_HISTORY_PER_TOKEN {
+            tracker.remember_markout_book(&book("0.51", "10", "0.52", "4", ts(34)));
+        }
+        assert_eq!(
+            tracker.markout_books[&TokenId::new("token")].len(),
+            MAX_MARKOUT_HISTORY_PER_TOKEN
+        );
+
+        for index in 0..=MAX_MARKOUT_HISTORY_TOKENS {
+            let mut other = book("0.51", "10", "0.52", "4", ts(34));
+            other.token_id = TokenId::new(format!("token-{index}"));
+            tracker.remember_markout_book(&other);
+        }
+        assert_eq!(tracker.markout_books.len(), MAX_MARKOUT_HISTORY_TOKENS);
     }
 
     #[test]

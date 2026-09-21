@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Run the fixed primary pilot, preregister once, then collect selection days."""
+import hashlib
+import json
+import os
+import subprocess
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+try:
+    from preregister_primary import validate_source_proof, verify_frozen
+except ModuleNotFoundError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'research'))
+    from preregister_primary import validate_source_proof, verify_frozen
+
+
+def digest(path):
+    return 'sha256:' + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load_verified_day(work, day, git_sha):
+    normalized = work / f'data/research/daily/{day}/normalized'
+    marker_path = normalized / '.polyedge-daily-complete.json'
+    marker = json.loads(marker_path.read_text())
+    manifest = normalized / 'events_manifest.json'
+    manifest_sha = digest(manifest)
+    if (marker.get('schema_version') != 1 or marker.get('date') != day
+            or marker.get('git_sha') != git_sha
+            or marker.get('events_manifest_sha256') != manifest_sha):
+        raise ValueError('local completion marker is not bound to the requested day')
+    gate_relative = Path(marker.get('quality_gate_path', ''))
+    if (gate_relative.is_absolute() or '..' in gate_relative.parts
+            or not str(gate_relative).startswith('reports/research/staging/')):
+        raise ValueError('unsafe gate path')
+    gate_path = work / gate_relative
+    if gate_path.is_symlink() or not gate_path.is_file() or digest(gate_path) != marker.get('quality_gate_sha256'):
+        raise ValueError('completion gate hash mismatch')
+    gate = json.loads(gate_path.read_text())
+    inventory = json.loads(manifest.read_text()).get('raw_source_inventory', {}).get('canonical_sha256')
+    if (gate.get('schema') != 'polyedge.primary_data_quality_gate.v1'
+            or gate.get('status') != 'passed' or gate.get('date') != day
+            or gate.get('git_sha') != git_sha
+            or gate.get('normalized_manifest_sha256') != manifest_sha
+            or gate.get('source_inventory_sha256') != inventory
+            or marker.get('raw_source_inventory_sha256') != inventory):
+        raise ValueError('local completion gate is not fully bound')
+    audit, execution = gate_path.parent / 'data_audit.json', gate_path.parent / 'execution_quality.json'
+    if (audit.is_symlink() or execution.is_symlink() or not audit.is_file() or not execution.is_file()
+            or gate.get('data_audit_sha256') != digest(audit)
+            or gate.get('execution_quality_sha256') != digest(execution)):
+        raise ValueError('local completion report hash mismatch')
+    identities = gate.get('runtime_identity', {}).get('identities', [])
+    if len(identities) != 1 or identities[0].get('git_sha') != git_sha:
+        raise ValueError('local completion capture revision differs')
+    return dict(normalized=normalized, marker=marker, gate=gate, gate_path=gate_path,
+                audit=audit, execution=execution)
+
+
+def main(config_path=Path('/etc/polyedge/primary-research.json'),
+         work=Path('/srv/polyedge-ring/jobs/research'), today=None):
+    config = json.loads(config_path.read_text())
+    output = Path(config['experiment_directory'])
+    day = ((today or datetime.now(timezone.utc).date()) - timedelta(days=1)).isoformat()
+    pilot = config['pilot_date']
+    if day < pilot:
+        print(json.dumps(dict(status='waiting_for_closed_pilot', pilot_date=pilot)))
+        return
+    if day != pilot:
+        protocol = verify_frozen(output, config['start_date'])
+        if protocol['executables']['git_sha'] != config['git_sha']:
+            raise ValueError('configured capture revision differs from frozen experiment')
+        start, end = protocol['training']['start_inclusive'][:10], protocol['validation']['end_exclusive'][:10]
+        if day < start or day >= end:
+            print(json.dumps(dict(status='outside_selection_read_window', date=day,
+                                  holdout_opened=False, next_stage='frozen selection and carry audit')))
+            return
+        if day > start:
+            previous = (date.fromisoformat(day) - timedelta(days=1)).isoformat()
+            previous_day = load_verified_day(work, previous, config['git_sha'])
+            proof = json.loads((work / f'reports/research/source-bindings/{previous}.json').read_text())
+            validate_source_proof(proof, previous_day['gate'])
+    environment = dict(os.environ, POLYEDGE_RESEARCH_DATE=day, POLYEDGE_DATA_QUALITY_ONLY='true')
+    subprocess.run(['/usr/local/libexec/polyedge-run-job', 'daily'], env=environment, check=True)
+    current = load_verified_day(work, day, config['git_sha'])
+    source = work / f'reports/research/source-bindings/{day}.json'
+    subprocess.run([config['oci_python'], '/usr/local/libexec/verify_primary_oci_day.py',
+                    '--date', day, '--normalized-manifest', str(current['normalized'] / 'events_manifest.json'),
+                    '--out', str(source)], check=True)
+    validate_source_proof(json.loads(source.read_text()), current['gate'])
+    snapshot = work / f'reports/research/source-bindings/{day}-normalized.json'
+    subprocess.run([config['oci_python'], '/usr/local/libexec/primary_normalized_snapshot.py',
+                    'publish', '--normalized', str(current['normalized']),
+                    '--receipt', str(snapshot), '--evict'], check=True)
+    if day == pilot and not output.exists():
+        subprocess.run([config['oci_python'], '/usr/local/libexec/preregister_primary.py',
+                        '--pilot-gate', str(current['gate_path']), '--source-proof', str(source),
+                        '--audit', str(current['audit']), '--execution-quality', str(current['execution']),
+                        '--candidate-plan', config['candidate_plan'], '--wallet', config['wallet'],
+                        '--registry', config['registry'], '--binary', config['binary'],
+                        '--git-sha', config['git_sha'], '--start', config['start_date'],
+                        '--out', str(output), '--publish'], check=True)
+    if day == pilot:
+        verify_frozen(output, config['start_date'])
+    print(json.dumps(dict(status='day_verified', date=day, candidate_evaluations=0,
+                          holdout_opened=False)))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        # No credentials, subprocess environment or provider exception bodies.
+        reason = str(error) if isinstance(error, (ValueError, FileNotFoundError)) else type(error).__name__
+        print(json.dumps(dict(status='blocked', reason=reason)))
+        raise SystemExit(1)

@@ -14,7 +14,7 @@ use execution_intent::{
     IntentExecutionModel, IntentPublisher, IntentPublisherConfig, IntentPublisherPreparation,
 };
 use execution_quality::{deterministic_probe, ExecutionQualityTracker};
-use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeSettings};
+use polyedge_config::{embedded_git_sha, ExecutionMode, RuntimeRole, RuntimeSettings};
 use polyedge_domain::{
     BookState, DecisionAction, ExecutionReport, FairValue, MarketId, MarketSpec, ReferencePrice,
     RuntimeEvent, TokenId, TradeDecision,
@@ -62,6 +62,8 @@ const RECORDER_COMPLETED_DURABLE_BATCH_LIMIT: usize = 10_000;
 const REQUIRED_RECORDER_ATTEMPTS: usize = 3;
 const STARTUP_PROVENANCE_ATTEMPTS: usize = 5;
 const RUNTIME_PROVENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MARKOUT_CAPTURE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const MARKOUT_CAPTURE_REQUEST_MAX: Duration = Duration::from_millis(200);
 const EXACT_REFERENCE_HISTORY_LIMIT: usize = 1_200;
 const PENDING_SETTLEMENT_RETENTION_SECONDS: i64 = 6 * 60 * 60;
 const ESSENTIAL_FEED_MAX_AGE_SECONDS: i64 = 5 * 60;
@@ -752,6 +754,9 @@ impl RuntimeController {
         } else {
             info!("Direct Binance bookTicker feed disabled by configuration");
         }
+        if self.markout_capture_enabled() {
+            background_tasks.push(self.spawn_markout_capture_loop());
+        }
         *self
             .inner
             .feed_task
@@ -763,6 +768,151 @@ impl RuntimeController {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(background_tasks);
         info!("Rust PolyEdge runtime started in paper mode");
+    }
+
+    fn markout_capture_enabled(&self) -> bool {
+        self.inner.settings.deploy.runtime_role == RuntimeRole::Primary
+            && self.inner.settings.live.execution_mode == ExecutionMode::Paper
+    }
+
+    fn spawn_markout_capture_loop(&self) -> JoinHandle<()> {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(MARKOUT_CAPTURE_POLL_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if runtime.inner.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                let now = Utc::now();
+                let (expired, requests) = {
+                    let mut engine = runtime.inner.engine.lock().await;
+                    let expired = engine.execution_quality.expire_markouts(now);
+                    let requests = engine
+                        .execution_quality
+                        .pending_markout_observation_requests(now);
+                    (expired, requests)
+                };
+                for event in expired {
+                    runtime
+                        .record_event(event.event_type, event.payload, None, None)
+                        .await;
+                }
+                for request in requests {
+                    let reserved = {
+                        let mut engine = runtime.inner.engine.lock().await;
+                        engine
+                            .execution_quality
+                            .begin_markout_snapshot_reservation(&request, Utc::now())
+                    };
+                    if !reserved {
+                        continue;
+                    }
+                    let remaining = request.deadline.signed_duration_since(Utc::now());
+                    let Ok(remaining) = remaining.to_std() else {
+                        runtime
+                            .cancel_markout_snapshot_reservation(&request.token_id)
+                            .await;
+                        continue;
+                    };
+                    if remaining.is_zero() {
+                        runtime
+                            .cancel_markout_snapshot_reservation(&request.token_id)
+                            .await;
+                        continue;
+                    }
+                    let timeout = remaining.min(MARKOUT_CAPTURE_REQUEST_MAX);
+                    let settings = runtime.inner.settings.clone();
+                    let token_id = request.token_id.clone();
+                    // Await the single worker rather than dropping a timed-out
+                    // JoinHandle. The synchronous client has the same overall
+                    // deadline, so this serial loop cannot accumulate orphaned
+                    // requests while a peer drips a response.
+                    let fetched = tokio::task::spawn_blocking(move || {
+                        polyedge_feeds::fetch_markout_book_snapshot(&settings, &token_id, timeout)
+                    })
+                    .await;
+                    match fetched {
+                        Ok(Ok(snapshot)) => runtime.record_markout_rest_snapshot(snapshot).await,
+                        Ok(Err(error)) => {
+                            debug!(
+                                token_id = %request.token_id,
+                                error = %error,
+                                "research markout REST snapshot was unavailable"
+                            );
+                            runtime
+                                .cancel_markout_snapshot_reservation(&request.token_id)
+                                .await;
+                        }
+                        Err(error) => {
+                            warn!(
+                                token_id = %request.token_id,
+                                error = %error,
+                                "research markout REST snapshot worker failed"
+                            );
+                            runtime
+                                .cancel_markout_snapshot_reservation(&request.token_id)
+                                .await;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    async fn record_markout_rest_snapshot(&self, snapshot: polyedge_feeds::MarkoutBookSnapshot) {
+        let payload = json!({
+            "schema": "polyedge.paper_markout_rest_snapshot.v1",
+            "source": "polymarket_clob_rest",
+            "requested_token_id": snapshot.book.token_id,
+            "request_ts": snapshot.request_ts,
+            "received_ts": snapshot.received_ts,
+            "observed_ts": snapshot.book.local_ts,
+            "exchange_ts": snapshot.book.exchange_ts,
+            "best_bid": snapshot.book.best_bid().map(|level| level.price.to_string()),
+            "best_ask": snapshot.book.best_ask().map(|level| level.price.to_string()),
+            "book_hash": snapshot.book.book_hash,
+            "raw_payload": snapshot.raw_payload,
+            "research_only": true,
+            "strategy_book_updated": false,
+            "feed_health_updated": false,
+            "paper_fill_updated": false
+        });
+        // The snapshot itself is required evidence. Do not allow it to create
+        // a completed markout unless the raw response and receive timestamps
+        // have first been durably appended and flushed.
+        if !self
+            .record_required_events(vec![("paper_markout_rest_snapshot".to_owned(), payload)])
+            .await
+        {
+            self.cancel_markout_snapshot_reservation(&snapshot.book.token_id)
+                .await;
+            return;
+        }
+        let quality_events = {
+            let mut engine = self.inner.engine.lock().await;
+            engine
+                .execution_quality
+                .finish_markout_snapshot_reservation(&snapshot.book)
+        };
+        for event in quality_events {
+            self.record_event(event.event_type, event.payload, None, None)
+                .await;
+        }
+    }
+
+    async fn cancel_markout_snapshot_reservation(&self, token_id: &TokenId) {
+        let events = {
+            let mut engine = self.inner.engine.lock().await;
+            engine
+                .execution_quality
+                .cancel_markout_snapshot_reservation(token_id, Utc::now())
+        };
+        for event in events {
+            self.record_event(event.event_type, event.payload, None, None)
+                .await;
+        }
     }
 
     fn runtime_tasks_running(&self) -> bool {
@@ -3380,8 +3530,9 @@ impl RuntimeController {
             let mut engine = self.inner.engine.lock().await;
             let mut risk_preview = engine.risk.clone();
             let cleared_position = risk_preview.clear_market(&market.market_id);
-            let mut quality_preview = engine.execution_quality.clone();
-            let missing_markouts = quality_preview.clear_market(&market.market_id);
+            let missing_markouts = engine
+                .execution_quality
+                .pending_market_markouts(&market.market_id);
             let journal_id = paper_settlement_journal_id(&market, &start_reference, reference);
             let mut unbound_events = missing_markouts
                 .into_iter()
@@ -5469,6 +5620,90 @@ mod tests {
             controller.inner.data.read().await.feed_status["PolymarketClobMarket"],
             accepted_status
         );
+    }
+
+    #[tokio::test]
+    async fn durable_rest_snapshot_precedes_its_markout_record() {
+        let controller = RuntimeController::new(RuntimeSettings::default());
+        let fill_ts = Utc::now();
+        let token_id = TokenId::new("markout-rest-token");
+        {
+            let mut engine = controller.inner.engine.lock().await;
+            engine
+                .execution_quality
+                .observe_execution_report(&ExecutionReport {
+                    order_id: Some(OrderId::new("markout-rest-order")),
+                    market_id: MarketId::new("markout-rest-market"),
+                    token_id: Some(token_id.clone()),
+                    status: "paper_filled".to_owned(),
+                    filled_size: Decimal::from(5),
+                    avg_price: Some(Decimal::new(50, 2)),
+                    fee: Decimal::ZERO,
+                    local_ts: fill_ts,
+                    raw: BTreeMap::new(),
+                });
+        }
+        let observed_ts = fill_ts + chrono::Duration::seconds(1);
+        controller
+            .record_markout_rest_snapshot(polyedge_feeds::MarkoutBookSnapshot {
+                book: BookState {
+                    token_id,
+                    bids: vec![BookLevel {
+                        price: Decimal::new(51, 2),
+                        size: Decimal::from(4),
+                    }],
+                    asks: vec![BookLevel {
+                        price: Decimal::new(52, 2),
+                        size: Decimal::from(4),
+                    }],
+                    last_trade_price: None,
+                    exchange_ts: None,
+                    local_ts: observed_ts,
+                    book_hash: Some("rest-test".to_owned()),
+                },
+                raw_payload: json!({"asset_id": "markout-rest-token"}),
+                request_ts: fill_ts,
+                received_ts: observed_ts,
+            })
+            .await;
+        let events = controller.inner.data.read().await.recent_events.clone();
+        let snapshot = events
+            .iter()
+            .position(|event| event.event_type == "paper_markout_rest_snapshot")
+            .unwrap();
+        let markout = events
+            .iter()
+            .position(|event| event.event_type == "paper_fill_markout")
+            .unwrap();
+        assert!(snapshot < markout);
+        let parse = |value: &Value| {
+            value
+                .as_str()
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
+        };
+        assert_eq!(
+            parse(&events[snapshot].data["received_ts"]),
+            Some(observed_ts)
+        );
+        assert_eq!(
+            parse(&events[markout].data["observed_ts"]),
+            Some(observed_ts)
+        );
+    }
+
+    #[test]
+    fn markout_capture_is_limited_to_primary_paper_runtime() {
+        let primary = RuntimeController::new(RuntimeSettings::default());
+        assert!(primary.markout_capture_enabled());
+
+        let mut shadow_settings = RuntimeSettings::default();
+        shadow_settings.deploy.runtime_role = RuntimeRole::ProfitabilityShadow;
+        assert!(!RuntimeController::new(shadow_settings).markout_capture_enabled());
+
+        let mut live_settings = RuntimeSettings::default();
+        live_settings.live.execution_mode = ExecutionMode::Live;
+        assert!(!RuntimeController::new(live_settings).markout_capture_enabled());
     }
 
     #[tokio::test]

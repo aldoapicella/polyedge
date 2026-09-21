@@ -9,8 +9,9 @@ use tokio::sync::mpsc;
 
 pub use discovery::discover_markets;
 pub use streams::{
-    fetch_chainlink_reference, run_binance_book_ticker_feed, run_market_feed,
-    run_market_feed_generation, run_market_feed_generation_with_lease, run_rtds_feed,
+    fetch_chainlink_reference, fetch_markout_book_snapshot, run_binance_book_ticker_feed,
+    run_market_feed, run_market_feed_generation, run_market_feed_generation_with_lease,
+    run_rtds_feed, MarkoutBookSnapshot,
 };
 
 use polyedge_domain::{BookState, ReferencePrice, TokenId};

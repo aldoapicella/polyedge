@@ -27,6 +27,15 @@ const MARKET_RETAINED_DELTA_BYTES: usize = 1024 * 1024;
 const MARKET_RETAINED_DELTA_CHILDREN: usize = 1024;
 const MARKET_RETAINED_FIELD_BYTES: usize = 4 * 1024;
 const MARKET_READY_HEARTBEAT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MARKOUT_SNAPSHOT_USER_AGENT: &str = "polyedge-research/1.0";
+
+#[derive(Clone, Debug)]
+pub struct MarkoutBookSnapshot {
+    pub book: BookState,
+    pub raw_payload: Value,
+    pub request_ts: chrono::DateTime<Utc>,
+    pub received_ts: chrono::DateTime<Utc>,
+}
 
 struct ClobTerminalGuard(ClobGenerationLease);
 
@@ -1340,6 +1349,54 @@ pub fn fetch_chainlink_reference(
     }))
 }
 
+/// Fetches one public CLOB snapshot for research markout capture. Callers must
+/// supply a timeout no longer than their remaining observation window.
+pub fn fetch_markout_book_snapshot(
+    settings: &RuntimeSettings,
+    token_id: &TokenId,
+    request_timeout: Duration,
+) -> Result<MarkoutBookSnapshot, FeedError> {
+    let timeout = request_timeout.max(Duration::from_millis(1));
+    let url = crate::util::with_query(
+        &format!(
+            "{}/book",
+            settings.target.polymarket_clob_url.trim_end_matches('/')
+        ),
+        &[("token_id".to_owned(), token_id.to_string())],
+    )?;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .timeout_connect(timeout)
+        .timeout_read(timeout)
+        .build();
+    let request_ts = Utc::now();
+    let response = agent
+        .get(url.as_str())
+        .set("User-Agent", MARKOUT_SNAPSHOT_USER_AGENT)
+        .call()
+        .map_err(ureq_error)?;
+    let text = response
+        .into_string()
+        .map_err(|error| FeedError::HttpTransport(error.to_string()))?;
+    let received_ts = Utc::now();
+    let raw_payload: Value = serde_json::from_str(&text)?;
+    let mut book = strict_snapshot(&raw_payload)?;
+    if &book.token_id != token_id {
+        return Err(FeedError::MarketProtocol(
+            "CLOB markout snapshot asset_id does not match requested token".to_owned(),
+        ));
+    }
+    // Receipt time is the sole admissibility timestamp. Exchange time remains
+    // diagnostic provenance and must never move the local observation window.
+    book.local_ts = received_ts;
+    Ok(MarkoutBookSnapshot {
+        book,
+        raw_payload,
+        request_ts,
+        received_ts,
+    })
+}
+
 async fn publish(sender: &mpsc::Sender<FeedEvent>, event: FeedEvent) -> Result<(), FeedError> {
     sender
         .send(event)
@@ -1630,6 +1687,170 @@ fn extract_timestamp(payload: &Value) -> Option<chrono::DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn mock_markout_book_server(
+        body: Value,
+        delay: Duration,
+    ) -> (String, thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+            }
+            if !delay.is_zero() {
+                thread::sleep(delay);
+            }
+            let response = body.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    fn mock_markout_book_drip_server(
+        body: Value,
+        interval: Duration,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let response = body.to_string();
+            if write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len(),
+            )
+            .is_err()
+            {
+                return;
+            }
+            for byte in response.bytes() {
+                if stream.write_all(&[byte]).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                thread::sleep(interval);
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[test]
+    fn markout_snapshot_fetch_uses_user_agent_exact_token_and_receive_time() {
+        let (url, server) = mock_markout_book_server(
+            json!({
+                "asset_id": "token",
+                "bids": [{"price": "0.51", "size": "4"}],
+                "asks": [{"price": "0.52", "size": "4"}],
+                "timestamp": "2026-09-21T00:00:00Z"
+            }),
+            Duration::ZERO,
+        );
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_clob_url = url;
+        let snapshot = fetch_markout_book_snapshot(
+            &settings,
+            &TokenId::new("token"),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        let request = server.join().unwrap();
+        assert!(request.starts_with("GET /book?token_id=token HTTP/1.1"));
+        assert!(request.contains("User-Agent: polyedge-research/1.0"));
+        assert_eq!(snapshot.book.token_id, TokenId::new("token"));
+        assert_eq!(snapshot.book.local_ts, snapshot.received_ts);
+        assert!(snapshot.received_ts >= snapshot.request_ts);
+        assert_eq!(
+            snapshot.book.exchange_ts,
+            parse_event_ts(snapshot.raw_payload.get("timestamp"))
+        );
+    }
+
+    #[test]
+    fn markout_snapshot_fetch_rejects_wrong_token_and_late_response() {
+        let (url, server) = mock_markout_book_server(
+            json!({
+                "asset_id": "other-token",
+                "bids": [{"price": "0.51", "size": "4"}],
+                "asks": [{"price": "0.52", "size": "4"}]
+            }),
+            Duration::ZERO,
+        );
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_clob_url = url;
+        assert!(fetch_markout_book_snapshot(
+            &settings,
+            &TokenId::new("token"),
+            Duration::from_millis(100),
+        )
+        .is_err());
+        server.join().unwrap();
+
+        let (url, server) = mock_markout_book_server(
+            json!({
+                "asset_id": "token",
+                "bids": [{"price": "0.51", "size": "4"}],
+                "asks": [{"price": "0.52", "size": "4"}]
+            }),
+            Duration::from_millis(50),
+        );
+        settings.target.polymarket_clob_url = url;
+        assert!(fetch_markout_book_snapshot(
+            &settings,
+            &TokenId::new("token"),
+            Duration::from_millis(5),
+        )
+        .is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn markout_snapshot_fetch_has_an_overall_deadline_for_slow_drips() {
+        let (url, server) = mock_markout_book_drip_server(
+            json!({
+                "asset_id": "token",
+                "bids": [{"price": "0.51", "size": "4"}],
+                "asks": [{"price": "0.52", "size": "4"}]
+            }),
+            Duration::from_millis(5),
+        );
+        let mut settings = RuntimeSettings::default();
+        settings.target.polymarket_clob_url = url;
+        let started = std::time::Instant::now();
+        assert!(fetch_markout_book_snapshot(
+            &settings,
+            &TokenId::new("token"),
+            Duration::from_millis(30),
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
 
     #[test]
     fn clob_anchor_replaces_repeated_snapshot_and_keeps_strict_wire_validation() {

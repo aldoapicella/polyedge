@@ -859,71 +859,7 @@ pub fn publish_daily_directory(
     let execution_quality_path = source_dir.join("execution_quality.json");
     if execution_quality_path.is_file() {
         let execution_quality: serde_json::Value = read_json(&execution_quality_path)?;
-        let result = execution_quality
-            .get("result")
-            .unwrap_or(&execution_quality);
-        let (queue_snapshot_coverage, queue_snapshot_applicable) = execution_completion_metric(
-            result,
-            "/queue_snapshot_coverage",
-            "/queue_snapshot_applicable",
-            "/queue_snapshot_expected_orders",
-            "queue snapshot coverage",
-        )?;
-        quality.coverage_breakdown.queue_snapshot_coverage = queue_snapshot_coverage;
-        quality.coverage_breakdown.queue_snapshot_applicable = queue_snapshot_applicable;
-        let (queue_position_coverage, queue_position_applicable) = execution_completion_metric(
-            result,
-            "/queue_position_coverage",
-            "/queue_position_applicable",
-            "/queue_position_expected_orders",
-            "bound inferred-size-ahead coverage",
-        )?;
-        quality.coverage_breakdown.queue_position_coverage = queue_position_coverage;
-        quality.coverage_breakdown.queue_position_applicable = queue_position_applicable;
-        let (markout_1s_completion, markout_1s_applicable) = execution_completion_metric(
-            result,
-            "/markouts/1/completion_rate",
-            "/markouts/1/applicable",
-            "/markouts/1/expected",
-            "1s markout completion",
-        )?;
-        quality.coverage_breakdown.markout_1s_completion = markout_1s_completion;
-        quality.coverage_breakdown.markout_1s_applicable = markout_1s_applicable;
-        let (markout_5s_completion, markout_5s_applicable) = execution_completion_metric(
-            result,
-            "/markouts/5/completion_rate",
-            "/markouts/5/applicable",
-            "/markouts/5/expected",
-            "5s markout completion",
-        )?;
-        quality.coverage_breakdown.markout_5s_completion = markout_5s_completion;
-        quality.coverage_breakdown.markout_5s_applicable = markout_5s_applicable;
-        let (markout_30s_completion, markout_30s_applicable) = execution_completion_metric(
-            result,
-            "/markouts/30/completion_rate",
-            "/markouts/30/applicable",
-            "/markouts/30/expected",
-            "30s markout completion",
-        )?;
-        quality.coverage_breakdown.markout_30s_completion = markout_30s_completion;
-        quality.coverage_breakdown.markout_30s_applicable = markout_30s_applicable;
-        for warning in execution_quality
-            .pointer("/result/warnings")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(value_as_message)
-        {
-            quality.warnings.push(classify_warning(warning));
-        }
-        quality.warnings.sort_by(|left, right| {
-            left.rule_id
-                .cmp(&right.rule_id)
-                .then(left.message.cmp(&right.message))
-        });
-        quality
-            .warnings
-            .dedup_by(|left, right| left.rule_id == right.rule_id && left.message == right.message);
+        hydrate_execution_quality(&mut quality, &execution_quality)?;
     }
     let mut run = AtomicDailyRun::begin_with_runtime_role(
         output_root,
@@ -960,6 +896,180 @@ pub fn publish_daily_directory(
         manifest: *manifest,
         latest,
     })
+}
+
+/// Evaluates one local normalized UTC day with the exact quality hydration used
+/// by daily bundle publication, without creating a bundle or promoting it.
+pub fn check_primary_daily_quality(
+    date: NaiveDate,
+    git_sha: &str,
+    audit_path: &Path,
+    execution_quality_path: &Path,
+    normalized: &Path,
+) -> Result<serde_json::Value, ResearchError> {
+    if !polyedge_config::is_full_git_sha(git_sha) {
+        return Err(ResearchError::InvalidInput(
+            "primary daily quality requires a full git SHA".to_owned(),
+        ));
+    }
+    let audit: serde_json::Value = read_json(audit_path)?;
+    let manifest_path = normalized.join("events_manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)?;
+    let manifest_sha256 = sha256_bytes(&manifest_bytes);
+    let normalized = fs::canonicalize(normalized)?;
+    verify_quality_report_identity(
+        &audit,
+        "polyedge-rs research audit",
+        git_sha,
+        &normalized,
+        &manifest_sha256,
+    )?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+    let inventory: super::RawSourceInventory =
+        serde_json::from_value(manifest.get("raw_source_inventory").cloned().ok_or_else(
+            || {
+                ResearchError::InvalidInput(
+                    "normalized events manifest is missing raw_source_inventory".to_owned(),
+                )
+            },
+        )?)?;
+    super::validate_raw_source_inventory(&inventory)?;
+    let execution_quality: serde_json::Value = read_json(execution_quality_path)?;
+    verify_quality_report_identity(
+        &execution_quality,
+        "polyedge-rs research execution-quality",
+        git_sha,
+        &normalized,
+        &manifest_sha256,
+    )?;
+    let mut quality = quality_from_audit_for_date(&audit, date, &RuntimeRole::Primary);
+    hydrate_execution_quality(&mut quality, &execution_quality)?;
+    let passed = quality.promotion_allowed();
+    let runtime_identity = audit
+        .get("result")
+        .unwrap_or(&audit)
+        .get("runtime_provenance")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::json!({
+        "schema": "polyedge.primary_data_quality_gate.v1",
+        "schema_version": 1,
+        "date": date,
+        "git_sha": git_sha,
+        "status": if passed { "passed" } else { "failed" },
+        "promotion_eligible": false,
+        "normalized_manifest_sha256": manifest_sha256.clone(),
+        "source_inventory_sha256": inventory.canonical_sha256.clone(),
+        "runtime_identity": runtime_identity,
+        "source": {
+            "events_manifest_sha256": manifest_sha256,
+            "raw_source_inventory_sha256": inventory.canonical_sha256,
+        },
+        "data_audit_sha256": sha256_bytes(&fs::read(audit_path)?),
+        "execution_quality_sha256": sha256_bytes(&fs::read(execution_quality_path)?),
+        "data_quality": quality,
+    }))
+}
+
+fn verify_quality_report_identity(
+    report: &serde_json::Value,
+    command: &str,
+    git_sha: &str,
+    normalized: &Path,
+    manifest_sha256: &str,
+) -> Result<(), ResearchError> {
+    if report.get("command").and_then(serde_json::Value::as_str) != Some(command) {
+        return Err(ResearchError::InvalidInput(format!(
+            "primary daily quality report command must equal {command}"
+        )));
+    }
+    if report.get("git_sha").and_then(serde_json::Value::as_str) != Some(git_sha) {
+        return Err(ResearchError::InvalidInput(
+            "primary daily quality report git SHA differs from the requested revision".to_owned(),
+        ));
+    }
+    let input = report
+        .get("input_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            ResearchError::InvalidInput("primary daily quality report has no input_path".to_owned())
+        })?;
+    if fs::canonicalize(input)? != normalized {
+        return Err(ResearchError::InvalidInput(
+            "primary daily quality report input_path differs from the normalized day".to_owned(),
+        ));
+    }
+    verify_daily_input_manifest(report, manifest_sha256)
+}
+
+fn hydrate_execution_quality(
+    quality: &mut DataQualitySummary,
+    execution_quality: &serde_json::Value,
+) -> Result<(), ResearchError> {
+    let result = execution_quality.get("result").unwrap_or(execution_quality);
+    let (queue_snapshot_coverage, queue_snapshot_applicable) = execution_completion_metric(
+        result,
+        "/queue_snapshot_coverage",
+        "/queue_snapshot_applicable",
+        "/queue_snapshot_expected_orders",
+        "queue snapshot coverage",
+    )?;
+    quality.coverage_breakdown.queue_snapshot_coverage = queue_snapshot_coverage;
+    quality.coverage_breakdown.queue_snapshot_applicable = queue_snapshot_applicable;
+    let (queue_position_coverage, queue_position_applicable) = execution_completion_metric(
+        result,
+        "/queue_position_coverage",
+        "/queue_position_applicable",
+        "/queue_position_expected_orders",
+        "bound inferred-size-ahead coverage",
+    )?;
+    quality.coverage_breakdown.queue_position_coverage = queue_position_coverage;
+    quality.coverage_breakdown.queue_position_applicable = queue_position_applicable;
+    let (markout_1s_completion, markout_1s_applicable) = execution_completion_metric(
+        result,
+        "/markouts/1/completion_rate",
+        "/markouts/1/applicable",
+        "/markouts/1/expected",
+        "1s markout completion",
+    )?;
+    quality.coverage_breakdown.markout_1s_completion = markout_1s_completion;
+    quality.coverage_breakdown.markout_1s_applicable = markout_1s_applicable;
+    let (markout_5s_completion, markout_5s_applicable) = execution_completion_metric(
+        result,
+        "/markouts/5/completion_rate",
+        "/markouts/5/applicable",
+        "/markouts/5/expected",
+        "5s markout completion",
+    )?;
+    quality.coverage_breakdown.markout_5s_completion = markout_5s_completion;
+    quality.coverage_breakdown.markout_5s_applicable = markout_5s_applicable;
+    let (markout_30s_completion, markout_30s_applicable) = execution_completion_metric(
+        result,
+        "/markouts/30/completion_rate",
+        "/markouts/30/applicable",
+        "/markouts/30/expected",
+        "30s markout completion",
+    )?;
+    quality.coverage_breakdown.markout_30s_completion = markout_30s_completion;
+    quality.coverage_breakdown.markout_30s_applicable = markout_30s_applicable;
+    for warning in execution_quality
+        .pointer("/result/warnings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(value_as_message)
+    {
+        quality.warnings.push(classify_warning(warning));
+    }
+    quality.warnings.sort_by(|left, right| {
+        left.rule_id
+            .cmp(&right.rule_id)
+            .then(left.message.cmp(&right.message))
+    });
+    quality
+        .warnings
+        .dedup_by(|left, right| left.rule_id == right.rule_id && left.message == right.message);
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

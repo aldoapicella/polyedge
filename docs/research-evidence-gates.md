@@ -2,6 +2,75 @@
 
 Research runs remain separate from funded execution and qset promotion. The default replay wallet is the existing paper campaign wallet; it is not an authenticated current funded balance.
 
+## Primary capture and prospective collection
+
+The primary paper collector retains recent actual book observations for delayed
+source-timestamp fills. It preserves the original fill and observation times;
+the 1/5/30-second horizons and inclusive two-second deadline remain unchanged.
+Absent executable observations remain explicit missing evidence. This cannot
+repair a previously failed frozen experiment.
+
+Only primary paper capture also requests public REST books while a markout is
+pending. Actual response receipt time remains the observation time. The raw
+response must be durably recorded before it can complete a markout; the snapshot
+does not feed strategy decisions, paper fills or risk state. Reservations protect
+an on-time response during its durable write, without extending the deadline.
+
+`POLYEDGE_DATA_QUALITY_ONLY=true` selects the existing daily normalizer, audit and
+execution-quality commands without candidate evaluation. The native
+`check-primary-daily-quality` command shares the daily publisher's provenance,
+coverage and warning checks. Its receipt binds the normalized manifest and the
+two reports; a successful completion can be reused only with matching evidence.
+Primary local daily/replay jobs use the existing host research lock. Azure-backed
+qset leases remain independent.
+
+`research/verify_primary_oci_day.py` binds a closed local day to an exhaustive
+authenticated OCI listing, object ETags, SHA-256 checksums and recorder ranges.
+It reads remote manifests and metadata, not market payloads. This source proof
+must match the native quality receipt; neither receipt alone is promotion proof.
+
+`research/primary_normalized_snapshot.py` archives admitted normalized snapshots
+to content-addressed OCI objects. Cache payloads may be evicted only after full
+authenticated readback matches every byte hash. Local manifests, completion
+markers, reports and source receipts remain for daily continuity checks. Restore
+the required partition from the receipt before native research stages; check
+working-space capacity first. Raw source objects and failed evidence are retained.
+
+The installed `polyedge-primary-research-day` driver reads a fixed pilot date,
+future start date, immutable binary/revision and frozen wallet/candidate bindings
+from `/etc/polyedge/primary-research.json`. It uses the ordinary daily timer.
+Disable the standalone replay timer during this collection: replay/index creation
+belongs to corpus admission after the fixed selection window closes.
+Before the pilot closes it waits. After a successful pilot and source proof it
+runs `research/preregister_primary.py --publish`, which freezes and reads back
+create-only OCI contracts. Failed or incomplete preregistration blocks subsequent
+days. No automatic replacement experiment or date shift is allowed.
+
+The replacement uses one training day, 28 validation days, one settlement-only
+carry day, 28 sealed test days and one test carry day. The driver processes only
+the pilot and selection days. It refuses to skip an unverified previous selection
+day and never opens test payloads. Original failed contracts and raw evidence are
+retained as evidence; deprecated executable configuration is removed.
+
+After selection closes, use the existing native market/index, baseline, regimes,
+sample-size and sweep commands on the admitted content-addressed corpus. Verify
+the baseline twice, freeze identical market populations and wallet assumptions,
+then execute 20 profile replays plus at most 96 five-model sweep candidates
+(500 total). A single eligible validation winner may open the sealed test once.
+The carry audit, corpus admission, candidate selection, test opening and separate
+authenticated funded reconciliation remain evidence-dependent research stages;
+the daily collector does not claim or manufacture their completion.
+
+Focused checks:
+
+```sh
+cargo test -p polyedge-api runtime::execution_quality::tests --lib
+sh research/test_primary_daily_jobs.sh
+python3 -m unittest discover -s research -p test_verify_primary_oci_day.py
+python3 research/test_preregister_primary.py
+python3 ops/conduit/test/test-primary-research-day.py
+```
+
 `replay`, `baseline`, `regimes`, and `sweep` accept `--wallet-config` with an exact-byte-hashed JSON object containing `campaign_baseline`, `equity_floor`, `maximum_drawdown`, `maximum_order_notional`, and `maximum_unresolved_orders_or_positions` (currently exactly one). Positive decimal limits and a nonnegative floor below the baseline are required; unknown fields fail. The same parsed wallet is used across every candidate, fill model and fixed-winner holdout, and its hash is included in the pre-test receipt. An optional `simulated_initial_equity` and `current_equity_policy` must be supplied together. The policy requires `reserve_ratio`, `minimum_reserve`, `target_order_ratio`, `operating_buffer_ratio`, `minimum_order_notional`, `fee_rate` and integer `fee_exponent`. Replay then follows the funded current-equity reserve and sizing rules, including venue minimums, two-decimal shares, six-decimal money and fee reservation for maker orders. Venue minimums must be observed before each decision; preloaded final truth cannot supply them. Fee inputs are frozen counterfactual contract assumptions, not observed historical market evidence. Replay PnL starts at zero from the supplied initial equity; campaign PnL remains separately measured from its immutable baseline. Current-equity sizing does not apply the legacy trailing drawdown budget; drawdown remains reported for research risk assessment. Omitting both options preserves the historical static wallet.
 
 - Event ingestion skips missing or invalid top-level timestamps, counts them as malformed, and reports `invalid_timestamps`. It never substitutes wall-clock time.

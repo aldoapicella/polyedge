@@ -69,6 +69,9 @@ try_local_daily() {
 source_kind=local_daily
 if try_local_daily; then
   printf '{"event":"polyedge_replay_index_stage","stage":"reuse-local-daily","date":"%s","status":"completed"}\n' "$DATE"
+elif [ "${POLYEDGE_DATA_QUALITY_ONLY:-false}" = true ] && [ -n "${POLYEDGE_LOCAL_RAW_ROOT:-}" ]; then
+  echo 'data-quality-only replay requires a matching completed local daily run' >&2
+  exit 1
 else
   source_kind=normalized_snapshot
   if ! try_restore_snapshot; then

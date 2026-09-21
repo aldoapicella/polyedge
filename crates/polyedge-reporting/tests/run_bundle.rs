@@ -2,14 +2,15 @@
 
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 use polyedge_reporting::research::{
-    classify_warning, expire_funded_manifest, initialize_funded_manifest_after_canary,
-    inspect_daily_dependency, legacy_daily_fallback_allowed, parse_azure_artifact_uri,
-    publish_daily_directory, run_evaluate_profitability, run_validate_prospective,
-    stop_funded_manifest_from_stage_block, validate_protocol_v3_order_evidence,
-    write_funded_ladder_state, write_promotion_manifest, AtomicDailyRun, CandidateIdentity,
-    DailyDependency, DataQualityCoverageBreakdown, DataQualitySummary, ExecutionModelBinding,
-    ExpireFundedManifestOptions, FundedCheckpointEvidenceV1, FundedHoldoutEvaluationV1,
-    FundedLadderMetrics, FundedLadderStateV1, FundedStageBlockV1, FundedStageGrantV1, GateStatus,
+    check_primary_daily_quality, classify_warning, expire_funded_manifest,
+    initialize_funded_manifest_after_canary, inspect_daily_dependency,
+    legacy_daily_fallback_allowed, parse_azure_artifact_uri, publish_daily_directory,
+    run_evaluate_profitability, run_validate_prospective, stop_funded_manifest_from_stage_block,
+    validate_protocol_v3_order_evidence, write_funded_ladder_state, write_promotion_manifest,
+    AtomicDailyRun, CandidateIdentity, DailyDependency, DataQualityCoverageBreakdown,
+    DataQualitySummary, ExecutionModelBinding, ExpireFundedManifestOptions,
+    FundedCheckpointEvidenceV1, FundedHoldoutEvaluationV1, FundedLadderMetrics,
+    FundedLadderStateV1, FundedStageBlockV1, FundedStageGrantV1, GateStatus,
     ImmutableArtifactBindingV1, InitializeFundedManifestOptions, LatestRunPointer,
     ProfitabilityEvaluationOptions, ProfitabilityMetrics, PromotionEvaluation, PromotionManifestV1,
     PromotionPhase, ProspectiveValidationOptions, QueueModelTransitionV1,
@@ -49,6 +50,76 @@ fn stable_json_for_test(value: &serde_json::Value) -> String {
         }
         _ => serde_json::to_string(value).unwrap(),
     }
+}
+
+#[test]
+fn primary_daily_quality_rejects_wrong_report_identity() {
+    let root = std::env::temp_dir().join(format!(
+        "polyedge-primary-quality-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let normalized = root.join("normalized");
+    let other = root.join("other");
+    fs::create_dir_all(&normalized).unwrap();
+    fs::create_dir_all(&other).unwrap();
+    fs::write(normalized.join("events_manifest.json"), "{}").unwrap();
+    let audit = root.join("audit.json");
+    let execution = root.join("execution.json");
+    let sha = "a".repeat(40);
+    let report = |command: &str, git_sha: &str, input: &Path| serde_json::json!({"command":command,"git_sha":git_sha,"input_path":input});
+    fs::write(&execution, "{}").unwrap();
+
+    fs::write(
+        &audit,
+        serde_json::to_vec(&report("wrong", &sha, &normalized)).unwrap(),
+    )
+    .unwrap();
+    assert!(check_primary_daily_quality(
+        NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+        &sha,
+        &audit,
+        &execution,
+        &normalized
+    )
+    .is_err());
+
+    fs::write(
+        &audit,
+        serde_json::to_vec(&report(
+            "polyedge-rs research audit",
+            &"b".repeat(40),
+            &normalized,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(check_primary_daily_quality(
+        NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+        &sha,
+        &audit,
+        &execution,
+        &normalized
+    )
+    .is_err());
+
+    fs::write(
+        &audit,
+        serde_json::to_vec(&report("polyedge-rs research audit", &sha, &other)).unwrap(),
+    )
+    .unwrap();
+    assert!(check_primary_daily_quality(
+        NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+        &sha,
+        &audit,
+        &execution,
+        &normalized
+    )
+    .is_err());
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn protocol_v3_raw_book(token_id: &str, best_bid: &str, best_ask: &str) -> serde_json::Value {

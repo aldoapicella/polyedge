@@ -4,28 +4,28 @@ use clap::{Parser, Subcommand};
 use polyedge_api::{app_with_shutdown, benchmark_snapshot};
 use polyedge_config::{embedded_git_sha, RuntimeRole, RuntimeSettings};
 use polyedge_reporting::research::{
-    advance_funded_ladder, advance_funded_manifest, expire_funded_manifest,
-    initialize_funded_manifest_after_canary, load_default_exclusions, publish_daily_directory,
-    publish_normalized_snapshot, restore_normalized_snapshot, run_audit, run_azure_freshness,
-    run_backfill, run_baseline, run_begin_shadow_correction, run_build_cumulative_wallet_snapshot,
-    run_build_markets, run_build_replay_index, run_calibration, run_chart_backfill,
-    run_complete_shadow_correction, run_evaluate_profitability, run_execution_quality,
-    run_final_report, run_loss_diagnostics, run_loss_regime_oos,
-    run_materialize_projected_campaign, run_ml_calibrate, run_normalize, run_publish_projected_day,
-    run_queue_audit, run_regimes, run_replay, run_sample_size, run_sweep, run_validate_prospective,
-    stop_funded_manifest_from_stage_block, AdvanceFundedLadderOptions,
-    AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions, BackfillOptions,
-    BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions, CalibrationOptions,
-    ChartBackfillOptions, CompleteShadowCorrectionOptions, CumulativeWalletSnapshotOptions,
-    ExcludedTimeWindow, ExecutionQualityOptions, ExpireFundedManifestOptions, FillModel,
-    FinalReportOptions, InitializeFundedManifestOptions, LossDiagnosticsOptions,
-    LossRegimeOosOptions, MaterializeProjectedCampaignOptions, MlCalibrateOptions,
-    NormalizeOptions, ProfitabilityEvaluationOptions, ProspectiveValidationOptions,
-    PublishNormalizedSnapshotOptions, PublishProjectedDayOptions, QueueAuditOptions,
-    RegimesOptions, ReplayIndexOptions, ReplayOptions, RestoreNormalizedSnapshotOptions,
-    SampleSizeOptions, SettlementCarryOptions, StopFundedManifestFromStageBlockOptions,
-    SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE, DEFAULT_FROZEN_CANDIDATES_FILE,
-    DEFAULT_PROSPECTIVE_SINCE,
+    advance_funded_ladder, advance_funded_manifest, check_primary_daily_quality,
+    expire_funded_manifest, initialize_funded_manifest_after_canary, load_default_exclusions,
+    publish_daily_directory, publish_normalized_snapshot, restore_normalized_snapshot, run_audit,
+    run_azure_freshness, run_backfill, run_baseline, run_begin_shadow_correction,
+    run_build_cumulative_wallet_snapshot, run_build_markets, run_build_replay_index,
+    run_calibration, run_chart_backfill, run_complete_shadow_correction,
+    run_evaluate_profitability, run_execution_quality, run_final_report, run_loss_diagnostics,
+    run_loss_regime_oos, run_materialize_projected_campaign, run_ml_calibrate, run_normalize,
+    run_publish_projected_day, run_queue_audit, run_regimes, run_replay, run_sample_size,
+    run_sweep, run_validate_prospective, stop_funded_manifest_from_stage_block,
+    AdvanceFundedLadderOptions, AdvanceFundedManifestOptions, AuditOptions, AzureFreshnessOptions,
+    BackfillOptions, BaselineOptions, BeginShadowCorrectionOptions, BuildMarketsOptions,
+    CalibrationOptions, ChartBackfillOptions, CompleteShadowCorrectionOptions,
+    CumulativeWalletSnapshotOptions, ExcludedTimeWindow, ExecutionQualityOptions,
+    ExpireFundedManifestOptions, FillModel, FinalReportOptions, InitializeFundedManifestOptions,
+    LossDiagnosticsOptions, LossRegimeOosOptions, MaterializeProjectedCampaignOptions,
+    MlCalibrateOptions, NormalizeOptions, ProfitabilityEvaluationOptions,
+    ProspectiveValidationOptions, PublishNormalizedSnapshotOptions, PublishProjectedDayOptions,
+    QueueAuditOptions, RegimesOptions, ReplayIndexOptions, ReplayOptions,
+    RestoreNormalizedSnapshotOptions, SampleSizeOptions, SettlementCarryOptions,
+    StopFundedManifestFromStageBlockOptions, SweepOptions, WarningSeverity, DEFAULT_EXCLUSION_FILE,
+    DEFAULT_FROZEN_CANDIDATES_FILE, DEFAULT_PROSPECTIVE_SINCE,
 };
 use polyedge_reporting::{
     build_pnl_report, run_backtest, BacktestConfig, ReplayBacktester, REPLAY_BUFFER_BYTES,
@@ -552,6 +552,21 @@ enum ResearchCommand {
         exclude_file: PathBuf,
         #[arg(long = "exclude-window")]
         exclude_window: Vec<String>,
+    },
+    /// Evaluate a completed local primary UTC day without publishing a bundle.
+    CheckPrimaryDailyQuality {
+        #[arg(long)]
+        date: String,
+        #[arg(long)]
+        git_sha: String,
+        #[arg(long)]
+        audit: PathBuf,
+        #[arg(long)]
+        execution_quality: PathBuf,
+        #[arg(long)]
+        normalized: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Build diagnostic-only, one-row-per-lifecycle facts from an explicit
     /// immutable normalized Protocol-v3 snapshot.
@@ -1364,6 +1379,24 @@ fn run_research_command(command: ResearchCommand) -> Result<()> {
             markdown,
             exclude_windows: load_exclusions(exclude_file, exclude_window)?,
         })?,
+        ResearchCommand::CheckPrimaryDailyQuality {
+            date,
+            git_sha,
+            audit,
+            execution_quality,
+            normalized,
+            out,
+        } => {
+            let value = check_primary_daily_quality(
+                parse_date_arg(&date)?,
+                &git_sha,
+                &audit,
+                &execution_quality,
+                &normalized,
+            )?;
+            fs::write(&out, serde_json::to_vec_pretty(&value)?)?;
+            value
+        }
         ResearchCommand::LossDiagnostics {
             input,
             out,

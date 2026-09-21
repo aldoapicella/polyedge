@@ -75,11 +75,11 @@ case "$job" in
     ;;
   daily)
     cpus=1.5 memory=4g limit=46800
-    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_primary_daily.sh'
+    command='/bin/sh /app/research/run_primary_daily.sh'
     ;;
   replay)
     cpus=1.5 memory=4g limit=43200
-    command='polyedge-rs research with-azure-lease --account "$AZURE_STORAGE_ACCOUNT_NAME" --container "$AZURE_STORAGE_CONTAINER_NAME" --blob "data/research/normalized/v1/control/daily-replay.lock" --wait-seconds 28800 -- /bin/sh /app/research/run_replay_index.sh'
+    command='/bin/sh /app/research/run_replay_index.sh'
     ;;
   prospective)
     cpus=0.5 memory=1g limit=1800
@@ -149,7 +149,7 @@ printf '%s' "$POLYEDGE_RESEARCH_IMAGE" | grep -Eq '@sha256:[0-9a-f]{64}$' || {
   exit 64
 }
 
-if [ "$job" = daily ]; then
+if [ "$job" = daily ] && [ "${POLYEDGE_DATA_QUALITY_ONLY:-false}" != true ]; then
   daily_image=$POLYEDGE_RESEARCH_IMAGE
   parity_env=${POLYEDGE_PARITY_ENV_FILE:-/etc/polyedge/parity-hourly.env}
   [ ! -L "$parity_env" ] && [ -f "$parity_env" ] && [ "$(stat -c %h "$parity_env")" = 1 ] || {
@@ -354,6 +354,7 @@ case "$job" in
 esac
 if [ "$job" = daily ]; then
   "$@"
+  [ "${POLYEDGE_DATA_QUALITY_ONLY:-false}" = true ] && exit 0
   exec /usr/local/libexec/polyedge-parity-record-daily "$POLYEDGE_RESEARCH_DATE"
 fi
 exec "$@"
