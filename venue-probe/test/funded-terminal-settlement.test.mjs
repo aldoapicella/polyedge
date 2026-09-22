@@ -15,8 +15,8 @@ const env = {
   FUNDED_TERMINAL_SETTLEMENT_DECISION_ID: decisionId,
   FUNDED_TERMINAL_SETTLEMENT_RESERVATION_BLOB_NAME: blobName,
   FUNDED_TERMINAL_SETTLEMENT_OUTCOME: "Down",
-  VENUE_PROBE_FUNDED_CAMPAIGN_ID: "dynamic-quote-funded-2026-08-13-v10",
-  POLYMARKET_FUNDER_ADDRESS: "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8",
+  VENUE_PROBE_FUNDED_CAMPAIGN_ID: "dynamic-quote-funded-2026-09-16-v11",
+  POLYMARKET_FUNDER_ADDRESS: "0x3d701b05d7c36aFaB01a06Fd26eBe789c0B7baD8",
   AZURE_TENANT_ID: "9767f0dc-e83f-4cc1-94e1-0d5f9d287d32",
   AZURE_STORAGE_ACCOUNT_NAME: "stpolyedge6urdjr5nmwx7w",
   AZURE_STORAGE_CONTAINER_NAME: "polyedge-funded-evidence",
@@ -97,11 +97,15 @@ test("settlement-only module imports no canary, order client, wallet, or signing
     AZURE_STORAGE_ACCOUNT_NAME: "wrong",
     AZURE_STORAGE_CONTAINER_NAME: "wrong",
     AZURE_CLIENT_ID: "wrong",
-    VENUE_PROBE_FUNDED_CAMPAIGN_ID: "wrong",
-    POLYMARKET_FUNDER_ADDRESS: env.POLYMARKET_FUNDER_ADDRESS.toUpperCase()
+    VENUE_PROBE_FUNDED_CAMPAIGN_ID: "wrong"
   })) {
     assert.throws(() => terminalSettlementConfig({ ...env, [name]: value }), /exact terminal settlement binding/);
   }
+  assert.equal(terminalSettlementConfig(env).funderAddress, env.POLYMARKET_FUNDER_ADDRESS.toLowerCase());
+  assert.throws(() => terminalSettlementConfig({
+    ...env,
+    POLYMARKET_FUNDER_ADDRESS: `${env.POLYMARKET_FUNDER_ADDRESS.slice(0, -1)}9`
+  }), /exact terminal settlement binding/);
   assert.throws(() => terminalSettlementConfig({ ...env, AZURE_STORAGE_ACCOUNT_KEY: "forbidden" }), /exact terminal settlement binding/);
 });
 
@@ -153,6 +157,7 @@ test("reservation and Data API binding adversaries fail closed before settlement
     { asset: "456" },
     { proxyWallet: "0x0000000000000000000000000000000000000000" },
     { outcome: "Up" },
+    { currentValue: 1 },
     { currentValue: "" }
   ]) {
     let settled = false;
