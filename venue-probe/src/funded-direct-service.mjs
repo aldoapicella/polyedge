@@ -12,7 +12,7 @@ import { sanitize } from "./lib.mjs";
 const FUNDED_BTC_MARKET_INTERVAL_MS = 15 * 60 * 1_000;
 const FUNDED_BUSY_VALIDATION_LIMIT = 4;
 const FUNDED_OCI_QUEUE_BRIDGE_URL = "http://10.89.0.1:8182/v1/messages";
-const EXPIRED_MARKET_CACHE_ERRORS = new Set([
+const RECOVERABLE_MARKET_CACHE_ERRORS = new Set([
   "fail closed: intent market was not found at the venue",
   "No orderbook exists for the requested token id"
 ]);
@@ -67,20 +67,30 @@ export async function recoverExpiredWarmedMarket({
 }) {
   const status = executor.status();
   const warmed = status?.warmed_market;
-  if (status?.reconnect_reconciliation_required !== true ||
-      !EXPIRED_MARKET_CACHE_ERRORS.has(status?.safety_snapshot_cache_error) ||
-      Number(status?.safety_snapshot_cache_in_flight || 0) > 0 ||
-      !Number.isFinite(Date.parse(String(warmed?.market_end_ts || ""))) ||
-      Date.parse(warmed.market_end_ts) > nowMs) return null;
+  if (!fundedMarketRecoveryRequired(status) ||
+      Number(status?.safety_snapshot_cache_in_flight || 0) > 0) return null;
+  const priorMarketExpired = Date.parse(warmed.market_end_ts) <= nowMs;
   const market = await discoverMarket();
   const next = fundedMarketWarmup(market);
   if (market.active !== true || market.closed === true || market.acceptingOrders !== true ||
       Date.parse(next.market_end_ts) <= nowMs + 30_000 ||
-      next.market_id === String(warmed.market_id)) {
-    throw new Error("fail closed: expired market recovery did not discover a new active market");
+      (priorMarketExpired && next.market_id === String(warmed.market_id))) {
+    throw new Error("fail closed: market recovery did not discover an eligible active market");
   }
   await executor.warmMarket(next);
-  return { ...next, prior_market_id: String(warmed.market_id) };
+  return {
+    ...next,
+    prior_market_id: String(warmed.market_id),
+    recovery_mode: next.market_id === String(warmed.market_id)
+      ? "same_market_retry"
+      : "market_rollover"
+  };
+}
+
+export function fundedMarketRecoveryRequired(status) {
+  return status?.reconnect_reconciliation_required === true &&
+    RECOVERABLE_MARKET_CACHE_ERRORS.has(status?.safety_snapshot_cache_error) &&
+    Number.isFinite(Date.parse(String(status?.warmed_market?.market_end_ts || "")));
 }
 
 function createStreamingInbox(receiver, processError) {
@@ -712,9 +722,15 @@ export async function runPersistentFundedDirectService({
   };
   let nextExpiredMarketRecoveryAtMs = 0;
   const maybeRecoverExpiredMarket = async () => {
-    if (activeWorkflow || busyValidations.size > 0) return;
     const checkedAt = now();
-    if (checkedAt < nextExpiredMarketRecoveryAtMs) return;
+    if (checkedAt < nextExpiredMarketRecoveryAtMs) return false;
+    const status = executor.status();
+    if (!fundedMarketRecoveryRequired(status)) return false;
+    if (activeWorkflow || busyValidations.size > 0) return true;
+    if (Number(status.safety_snapshot_cache_in_flight || 0) > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return true;
+    }
     nextExpiredMarketRecoveryAtMs = checkedAt + config.restartDelayMs;
     try {
       const recovered = await recoverExpiredWarmedMarket({
@@ -732,6 +748,7 @@ export async function runPersistentFundedDirectService({
           prior_market_id: recovered.prior_market_id,
           market_id: recovered.market_id,
           market_end_ts: recovered.market_end_ts,
+          recovery_mode: recovered.recovery_mode,
           account_risk_pause: !cacheReady,
           safety_snapshot_cache_ready: cacheReady
         });
@@ -746,6 +763,7 @@ export async function runPersistentFundedDirectService({
         error_detail: safeErrorProjection(error)
       });
     }
+    return false;
   };
   const trackBusyValidation = (entry) => {
     const task = processIntent(entry, true);
@@ -774,11 +792,14 @@ export async function runPersistentFundedDirectService({
         if (inFlight.length) await Promise.race(inFlight);
         continue;
       }
+      if (await maybeRecoverExpiredMarket()) {
+        await Promise.allSettled([activeWorkflow, ...busyValidations].filter(Boolean));
+        continue;
+      }
       const incoming = streaming
         ? await streaming.receive(config.pollIntervalMs)
         : (await receiver.receiveMessages(1, { maxWaitTimeInMs: config.pollIntervalMs }))[0] || null;
       if (!incoming) {
-        await maybeRecoverExpiredMarket();
         await new Promise((resolve) => setImmediate(resolve));
         continue;
       }

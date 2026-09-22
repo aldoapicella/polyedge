@@ -930,6 +930,7 @@ export async function createPersistentCanaryExecutor({
           market_end_ts: executionEnv.STRATEGY_CANARY_MARKET_END_TS
         });
         await reconcilePersistentChannels(resources, warmedMarket);
+        startSafetySnapshotCache(resources, warmedMarket);
         lease = resources.lease;
         userChannel = resources.userChannel;
         marketChannel = resources.marketChannel;

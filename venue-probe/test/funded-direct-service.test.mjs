@@ -272,6 +272,77 @@ test("post-expiry maintenance cannot starve behind a nonempty funded intent queu
   assert.deepEqual(bus.completed, ["funded-intent-first", "funded-intent-second"]);
 });
 
+test("market recovery cannot starve behind a nonempty funded intent queue", async () => {
+  const now = Date.parse("2026-09-22T22:20:00Z");
+  const decisionTs = new Date(now - 500).toISOString();
+  const bus = fakeBus([["first", "a"], ["second", "b"]].map(([suffix, hex]) => ({
+    messageId: `funded-intent-${suffix}`,
+    deliveryCount: 1,
+    body: {
+      schema: "polyedge.funded_intent_handoff.v1",
+      decision_id: hex.repeat(64),
+      decision_ts: decisionTs
+    }
+  })));
+  let recoveryRequired = false;
+  let processCalls = 0;
+  const order = [];
+  await runPersistentFundedDirectService({
+    env: persistentEnv({ FUNDED_DIRECT_SERVICE_MAX_MESSAGES: "2" }),
+    now: () => now,
+    createBusClient: () => bus.client,
+    createExecutor: async () => ({
+      warmMarket: async () => {
+        order.push("recovery");
+        recoveryRequired = false;
+      },
+      execute: async () => {},
+      status: () => ({
+        reconnect_reconciliation_required: recoveryRequired,
+        safety_snapshot_cache_error: recoveryRequired
+          ? "fail closed: intent market was not found at the venue"
+          : null,
+        safety_snapshot_cache_in_flight: 0,
+        warmed_market: {
+          market_id: "active-market",
+          market_end_ts: "2026-09-22T22:30:00Z"
+        }
+      }),
+      close: async () => {}
+    }),
+    createProcessor: async () => ({
+      process: async () => {
+        processCalls += 1;
+        order.push(`intent-${processCalls}-start`);
+        if (processCalls === 1) {
+          recoveryRequired = true;
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        order.push(`intent-${processCalls}-done`);
+        return { status: "already_completed_idempotent" };
+      }
+    }),
+    discoverMarket: async () => ({
+      id: "active-market",
+      conditionId: "active-condition",
+      clobTokenIds: ["up-token", "down-token"],
+      endDate: "2026-09-22T22:30:00Z",
+      active: true,
+      closed: false,
+      acceptingOrders: true
+    }),
+    logger: () => {}
+  });
+  assert.deepEqual(order, [
+    "intent-1-start",
+    "intent-1-done",
+    "recovery",
+    "intent-2-start",
+    "intent-2-done"
+  ]);
+  assert.deepEqual(bus.received, ["funded-intent-first", "funded-intent-second"]);
+});
+
 function fakeBus(messages) {
   const completed = [];
   const deadLettered = [];
@@ -560,7 +631,7 @@ test("persistent service warms a new market after the active intent finishes", a
   assert.equal(logs.some((value) => value.status === "market_warmed"), true);
 });
 
-test("expired missing market recovery warms a newly discovered active market only", async () => {
+test("market recovery rolls expired markets and retries failed current markets", async () => {
   const now = Date.parse("2026-09-16T18:15:00Z");
   const status = {
     reconnect_reconciliation_required: true,
@@ -616,12 +687,16 @@ test("expired missing market recovery warms a newly discovered active market onl
   })).market_id, "active-market");
   assert.equal(discoveries, 2);
 
+  status.warmed_market.market_id = "active-market";
   status.warmed_market.market_end_ts = "2026-09-16T18:30:00Z";
-  assert.equal(await recoverExpiredWarmedMarket({ executor, discoverMarket, nowMs: now }), null);
+  const retried = await recoverExpiredWarmedMarket({ executor, discoverMarket, nowMs: now });
+  assert.equal(retried.market_id, "active-market");
+  assert.equal(retried.recovery_mode, "same_market_retry");
+  assert.equal(discoveries, 3);
   status.warmed_market.market_end_ts = "2026-09-16T18:00:00Z";
   status.safety_snapshot_cache_error = "temporary venue timeout";
   assert.equal(await recoverExpiredWarmedMarket({ executor, discoverMarket, nowMs: now }), null);
-  assert.equal(discoveries, 2);
+  assert.equal(discoveries, 3);
 });
 
 test("expired market discovery failure backs off on the idle service path", async () => {
