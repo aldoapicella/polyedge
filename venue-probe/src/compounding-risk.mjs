@@ -1011,7 +1011,19 @@ export async function migrateProtectedReserveState({
       });
     } else if (currentEquityTarget
         && !moneyEqual(checkpoint.last_reconciled_equity, accountEquity)) {
-      throw new Error("fail closed: unbounded rollover checkpoint requires a flat source account");
+      if (Number(positionCount) !== 0 || Number(unresolvedReservationCount) !== 0) {
+        throw new Error("fail closed: unbounded rollover checkpoint requires a flat source account");
+      }
+      if (money(accountEquity) >= money(checkpoint.last_reconciled_equity)) {
+        throw new Error("fail closed: unbounded rollover checkpoint cannot accept an unverified equity increase");
+      }
+      checkpoint = await reconcileProtectedCompoundingState({
+        container,
+        manifest,
+        accountEquity,
+        fullyReconciled: true,
+        now
+      });
     }
     const currentHighWater = Number(checkpoint.high_water_equity);
     const historicalHighWater = Number(checkpoint.historical_high_water_equity);

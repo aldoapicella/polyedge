@@ -597,6 +597,32 @@ test("v10-to-unbounded rollover carries the exact ledger into current-equity sta
   assert.equal(fixture.container.etags.get(
     fixture.targetManifest.capital_policy.state_blob_name
   ), targetEtag);
+
+  const lossRecovered = await migrateProtectedReserveState({
+    ...restartInput,
+    accountEquity: 47,
+    positionCount: 0,
+    unresolvedReservationCount: 0
+  });
+  assert.equal(lossRecovered.state.last_reconciled_equity, 47);
+  assert.equal(lossRecovered.state.protected_reserve, 4.7);
+  assert.equal(lossRecovered.state.high_water_equity, recovered.state.high_water_equity);
+  assert.equal(lossRecovered.state.authorized_equity_ceiling,
+    recovered.state.authorized_equity_ceiling);
+  assert.deepEqual(lossRecovered.state.verified_settlement_ids,
+    recovered.state.verified_settlement_ids);
+  const lossRecoveryEtag = fixture.container.etags.get(
+    fixture.targetManifest.capital_policy.state_blob_name
+  );
+  await assert.rejects(migrateProtectedReserveState({
+    ...restartInput,
+    accountEquity: 48,
+    positionCount: 0,
+    unresolvedReservationCount: 0
+  }), /cannot accept an unverified equity increase/);
+  assert.equal(fixture.container.etags.get(
+    fixture.targetManifest.capital_policy.state_blob_name
+  ), lossRecoveryEtag);
 });
 
 test("reserve migration makes no target writes when reconciliation or source floor fails", async () => {
