@@ -1791,6 +1791,21 @@ fn next_reader_with_earliest_event(readers: &[EventReaderState]) -> Option<usize
         .map(|(index, _)| index)
 }
 
+fn next_reader_with_earliest_pending_frontier(
+    readers: &[EventReaderState],
+    reorder_window: usize,
+) -> Option<usize> {
+    readers
+        .iter()
+        .enumerate()
+        .filter(|(_, reader)| !reader.exhausted && reader.pending.len() < reorder_window)
+        .filter_map(|(index, reader)| reader.pending.last_key_value().map(|(key, _)| (index, key)))
+        .min_by(|(left_index, left), (right_index, right)| {
+            left.cmp(right).then_with(|| left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
+}
+
 fn fill_pending_windows(
     readers: &mut [EventReaderState],
     exclude_windows: &[ExcludedTimeWindow],
@@ -1815,27 +1830,22 @@ fn fill_pending_windows(
         state.pending.insert(line.key.clone(), line);
     }
 
+    // Advance the reader whose buffered tail is earliest in event time so
+    // future-heavy rows cannot spend the shared byte budget ahead of current rows.
     while budget.has_capacity() {
-        let mut filled_any = false;
-        for (reader_index, state) in readers.iter_mut().enumerate() {
-            if state.pending.len() >= reorder_window || state.exhausted {
-                continue;
-            }
-            let Some(line) =
-                read_next_pending_event(reader_index, state, exclude_windows, stats, seen_hashes)?
-            else {
-                continue;
-            };
-            budget.insert(line.estimated_heap_bytes);
-            state.pending.insert(line.key.clone(), line);
-            filled_any = true;
-            if !budget.has_capacity() {
-                return Ok(());
-            }
-        }
-        if !filled_any {
+        let Some(reader_index) =
+            next_reader_with_earliest_pending_frontier(readers, reorder_window)
+        else {
             break;
-        }
+        };
+        let state = &mut readers[reader_index];
+        let Some(line) =
+            read_next_pending_event(reader_index, state, exclude_windows, stats, seen_hashes)?
+        else {
+            continue;
+        };
+        budget.insert(line.estimated_heap_bytes);
+        state.pending.insert(line.key.clone(), line);
     }
     Ok(())
 }
@@ -5509,9 +5519,112 @@ struct MarkoutObservation {
     net_executable_markout_pnl: Option<Decimal>,
     observation_delay_ms: Option<i64>,
     observed_ts: Option<DateTime<Utc>>,
+    recorded_ts: DateTime<Utc>,
+    unexecutable_evidence: Option<Value>,
 }
 
 impl MarkoutObservation {
+    fn is_observed_unexecutable(
+        &self,
+        snapshots: &BTreeMap<(String, DateTime<Utc>), Vec<EventLine>>,
+    ) -> bool {
+        let (Some(payload), Some(observed_ts), Some(delay)) = (
+            self.unexecutable_evidence.as_ref(),
+            self.observed_ts,
+            self.observation_delay_ms,
+        ) else {
+            return false;
+        };
+        let target = self.key.fill_ts + Duration::seconds(self.horizon);
+        let deadline = target + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
+        let Some(rows) = snapshots.get(&(self.key.token_id.clone(), observed_ts)) else {
+            return false;
+        };
+        let [snapshot] = rows.as_slice() else {
+            return false;
+        };
+        let source = &snapshot.payload;
+        let raw = &source["raw_payload"];
+        let (empty_side, reason) = match self.key.side.as_str() {
+            "buy" => ("bids", "no_executable_bid_observed"),
+            "sell" => ("asks", "no_executable_ask_observed"),
+            _ => return false,
+        };
+        if !self.missing
+            || payload["reason"] != reason
+            || payload["source"] != "polymarket_clob_rest"
+            || payload["research_only"] != true
+            || observed_ts < target
+            || observed_ts > deadline
+            || self.recorded_ts <= deadline
+            || parse_datetime(payload.get("observation_deadline")) != Some(deadline)
+            || delay != observed_ts.signed_duration_since(target).num_milliseconds()
+            || source["schema"] != "polyedge.paper_markout_rest_snapshot.v1"
+            || source["source"] != "polymarket_clob_rest"
+            || source["research_only"] != true
+            || source["strategy_book_updated"] != false
+            || source["paper_fill_updated"] != false
+            || source["feed_health_updated"] != false
+            || parse_datetime(source.get("received_ts")) != Some(observed_ts)
+            || !parse_datetime(source.get("request_ts")).is_some_and(|ts| ts <= observed_ts)
+            || snapshot.recorded_ts < observed_ts
+            || snapshot.recorded_ts > self.recorded_ts
+            || raw
+                .get("asset_id")
+                .or_else(|| raw.get("token_id"))
+                .and_then(Value::as_str)
+                != Some(self.key.token_id.as_str())
+            || !raw
+                .get(empty_side)
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            || payload.get("book_hash") != source.get("book_hash")
+            || [
+                "mark_price",
+                "executable_mark_price",
+                "markout_per_share",
+                "markout_pnl",
+                "net_markout_per_share",
+                "net_markout_pnl",
+                "executable_markout_per_share",
+                "executable_markout_pnl",
+                "net_executable_markout_per_share",
+                "net_executable_markout_pnl",
+            ]
+            .iter()
+            .any(|key| payload.get(*key).is_some())
+        {
+            return false;
+        }
+        for (levels_key, best_key, bid) in [("bids", "best_bid", true), ("asks", "best_ask", false)]
+        {
+            let Some(levels) = raw.get(levels_key).and_then(Value::as_array) else {
+                return false;
+            };
+            if !levels.iter().all(|level| {
+                decimal(level.get("price"))
+                    .is_some_and(|price| (Decimal::ZERO..=Decimal::ONE).contains(&price))
+                    && decimal(level.get("size")).is_some_and(|size| size > Decimal::ZERO)
+            }) {
+                return false;
+            }
+            let expected = best_level_price(raw.get(levels_key), bid);
+            for evidence in [payload, source] {
+                let Some(value) = evidence.get(best_key) else {
+                    return false;
+                };
+                if if expected.is_none() {
+                    !value.is_null()
+                } else {
+                    decimal(Some(value)) != expected
+                } {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn is_complete_and_timely(&self) -> bool {
         let (Some(delay), Some(observed_ts)) = (self.observation_delay_ms, self.observed_ts) else {
             return false;
@@ -5541,6 +5654,7 @@ impl MarkoutObservation {
             .signed_duration_since(target_ts)
             .num_milliseconds();
         !self.missing
+            && self.unexecutable_evidence.is_none()
             && fee >= Decimal::ZERO
             && fee == self.key.fee_per_share
             && net == gross - fee
@@ -5580,6 +5694,7 @@ struct ExecutionQualityAccumulator {
     lifecycle_conflicting_order_ids: BTreeSet<String>,
     malformed_fill_lifecycle_events: usize,
     markout_observations: Vec<MarkoutObservation>,
+    markout_rest_snapshots: BTreeMap<(String, DateTime<Utc>), Vec<EventLine>>,
     malformed_markout_rows: usize,
     settlement_journals: BTreeMap<String, SettlementJournalQualityBuffer>,
     settlement_journal_retry_duplicates: usize,
@@ -5742,8 +5857,21 @@ impl ExecutionQualityAccumulator {
                     self.cancel_latency_ms.push(value);
                 }
             }
-            "paper_fill_markout" => self.observe_markout(&event.payload, false),
-            "paper_fill_markout_missing" => self.observe_markout(&event.payload, true),
+            "paper_markout_rest_snapshot" => {
+                if let (Some(token), Some(observed)) = (
+                    optional_text(&event.payload, "requested_token_id"),
+                    parse_datetime(event.payload.get("observed_ts")),
+                ) {
+                    self.markout_rest_snapshots
+                        .entry((token, observed))
+                        .or_default()
+                        .push(event.clone());
+                }
+            }
+            "paper_fill_markout" => self.observe_markout(&event.payload, false, event.recorded_ts),
+            "paper_fill_markout_missing" => {
+                self.observe_markout(&event.payload, true, event.recorded_ts)
+            }
             _ => {}
         }
     }
@@ -6007,7 +6135,7 @@ impl ExecutionQualityAccumulator {
         }
     }
 
-    fn observe_markout(&mut self, payload: &Value, missing: bool) {
+    fn observe_markout(&mut self, payload: &Value, missing: bool, recorded_ts: DateTime<Utc>) {
         let Some(horizon) = payload
             .get("horizon_seconds")
             .and_then(Value::as_i64)
@@ -6072,6 +6200,9 @@ impl ExecutionQualityAccumulator {
             net_executable_markout_pnl: decimal(payload.get("net_executable_markout_pnl")),
             observation_delay_ms: payload.get("observation_delay_ms").and_then(Value::as_i64),
             observed_ts: parse_datetime(payload.get("observed_ts")),
+            recorded_ts,
+            unexecutable_evidence: (payload["observation_status"] == "observed_unexecutable")
+                .then(|| payload.clone()),
         });
     }
 
@@ -6422,6 +6553,7 @@ impl ExecutionQualityAccumulator {
         let mut duplicate_markout_slots = 0_usize;
         let mut invalid_markout_rows = 0_usize;
         let mut observed_by_horizon = BTreeMap::<i64, usize>::new();
+        let mut unexecutable_by_horizon = BTreeMap::<i64, usize>::new();
         let mut markouts = BTreeMap::<i64, Vec<Decimal>>::new();
         let mut executable_markouts = BTreeMap::<i64, Vec<Decimal>>::new();
         let mut markout_pnl = BTreeMap::<i64, Decimal>::new();
@@ -6434,6 +6566,10 @@ impl ExecutionQualityAccumulator {
                 continue;
             }
             let row = rows[0];
+            if row.is_observed_unexecutable(&self.markout_rest_snapshots) {
+                *unexecutable_by_horizon.entry(*horizon).or_default() += 1;
+                continue;
+            }
             if !row.is_complete_and_timely() {
                 invalid_markout_rows += 1;
                 continue;
@@ -6497,6 +6633,10 @@ impl ExecutionQualityAccumulator {
                     .unwrap_or(0)
                     .min(expected);
                 let missing = expected.saturating_sub(observed);
+                let unexecutable = unexecutable_by_horizon.get(&horizon).copied().unwrap_or(0);
+                if unexecutable > 0 {
+                    notices.push(json!(format!("{horizon}s observed illiquidity: {unexecutable} fills have no executable exit; excluded from priced statistics, retained in coverage denominator")));
+                }
                 let completion = ratio_f64(observed, expected);
                 if expected > 0 && completion.is_some_and(|value| value < 0.95) {
                     warnings.push(json!(format!(
@@ -6521,6 +6661,10 @@ impl ExecutionQualityAccumulator {
                         "expected": expected,
                         "observed": observed,
                         "missing": missing,
+                        "observed_unexecutable": unexecutable,
+                        "telemetry_observed": observed + unexecutable,
+                        "telemetry_completion_rate": ratio_f64(observed + unexecutable, expected),
+                        "priced_statistics_cover_full_population": observed == expected,
                         "completion_rate": completion,
                         "return_basis": "net_after_fee_per_share",
                         "midpoint": distribution_summary(&midpoint),
@@ -6607,6 +6751,7 @@ impl ExecutionQualityAccumulator {
             "duplicate_markout_rows": duplicate_markout_rows,
             "duplicate_markout_slots": duplicate_markout_slots,
             "invalid_markout_rows": invalid_markout_rows,
+            "observed_unexecutable_markout_rows": unexecutable_by_horizon.values().sum::<usize>(),
             "settlement_journal_verified": self.settlement_journal_verified,
             "settlement_journal_retry_duplicates": self.settlement_journal_retry_duplicates,
             "settlement_journal_conflicts": self.settlement_journal_conflicts,
@@ -14419,6 +14564,150 @@ mod tests {
     }
 
     #[test]
+    fn observed_illiquidity_requires_exact_timely_rest_evidence_and_keeps_coverage_denominator() {
+        let fill_ts = wallet_ts("2026-09-24T00:00:00Z");
+        for case in [
+            "valid",
+            "legacy",
+            "no_snapshot",
+            "late",
+            "wrong_token",
+            "priced",
+            "no_reason",
+            "early",
+            "executable",
+            "duplicate",
+            "below_95",
+        ] {
+            let mut quality = ExecutionQualityAccumulator::default();
+            let population = if case == "below_95" { 19 } else { 20 };
+            for index in 0..population {
+                let order = format!("order-{index}");
+                observe_quality(
+                    &mut quality,
+                    fill_ts,
+                    "paper_order_queue_registration",
+                    atomic_queue_registration_payload(&order, fill_ts),
+                );
+                observe_quality(
+                    &mut quality,
+                    fill_ts,
+                    "paper_queue_shadow_fill",
+                    queue_fill_payload(&order, fill_ts),
+                );
+                for horizon in MARKOUT_HORIZONS_SECONDS {
+                    let mut payload = complete_net_markout_payload(
+                        &format!("fill-{index}"),
+                        &order,
+                        fill_ts,
+                        horizon,
+                    );
+                    if index != 0 || horizon != 30 {
+                        observe_quality(
+                            &mut quality,
+                            fill_ts + Duration::seconds(horizon),
+                            "paper_fill_markout",
+                            payload,
+                        );
+                        continue;
+                    }
+                    let observed = fill_ts
+                        + Duration::milliseconds(if case == "late" { 32_001 } else { 30_500 });
+                    payload
+                        .as_object_mut()
+                        .unwrap()
+                        .retain(|key, _| !key.contains("markout") && !key.contains("mark_price"));
+                    payload["observation_status"] = json!("observed_unexecutable");
+                    payload["reason"] = json!("no_executable_bid_observed");
+                    payload["source"] = json!("polymarket_clob_rest");
+                    payload["research_only"] = json!(true);
+                    payload["observed_ts"] = json!(observed);
+                    payload["observation_delay_ms"] = json!(observed
+                        .signed_duration_since(fill_ts + Duration::seconds(30))
+                        .num_milliseconds());
+                    payload["observation_deadline"] = json!(fill_ts + Duration::seconds(32));
+                    payload["book_hash"] = json!("observed-book");
+                    payload["best_bid"] = Value::Null;
+                    payload["best_ask"] = json!("0.01");
+                    let mut snapshot = json!({
+                        "schema": "polyedge.paper_markout_rest_snapshot.v1", "source": "polymarket_clob_rest",
+                        "requested_token_id": "token-1", "request_ts": observed - Duration::milliseconds(500),
+                        "received_ts": observed, "observed_ts": observed, "book_hash": "observed-book",
+                        "best_bid": null, "best_ask": "0.01", "research_only": true,
+                        "strategy_book_updated": false, "paper_fill_updated": false, "feed_health_updated": false,
+                        "raw_payload": {"asset_id": "token-1", "bids": [], "asks": [{"price": "0.01", "size": "4"}]}
+                    });
+                    match case {
+                        "legacy" => {
+                            payload["observation_status"] = Value::Null;
+                            payload["reason"] = json!("markout_observation_deadline_exceeded");
+                        }
+                        "wrong_token" => snapshot["raw_payload"]["asset_id"] = json!("other"),
+                        "priced" => payload["net_executable_markout_per_share"] = json!("0"),
+                        "no_reason" => payload["reason"] = Value::Null,
+                        "executable" => {
+                            snapshot["raw_payload"]["bids"] =
+                                json!([{"price": "0.005", "size": "2"}])
+                        }
+                        _ => {}
+                    }
+                    if case != "no_snapshot" {
+                        observe_quality(
+                            &mut quality,
+                            observed,
+                            "paper_markout_rest_snapshot",
+                            snapshot,
+                        );
+                    }
+                    let recorded =
+                        fill_ts + Duration::seconds(if case == "early" { 31 } else { 33 });
+                    observe_quality(
+                        &mut quality,
+                        recorded,
+                        "paper_fill_markout_missing",
+                        payload.clone(),
+                    );
+                    if case == "duplicate" {
+                        observe_quality(
+                            &mut quality,
+                            recorded,
+                            "paper_fill_markout_missing",
+                            payload,
+                        );
+                    }
+                }
+            }
+            let result = quality.finish();
+            assert_eq!(result["markouts"]["30"]["expected"], population, "{case}");
+            assert_eq!(
+                result["markouts"]["30"]["observed"],
+                population - 1,
+                "{case}"
+            );
+            assert_eq!(result["markouts"]["30"]["missing"], 1, "{case}");
+            if case == "valid" || case == "below_95" {
+                assert_eq!(result["invalid_markout_rows"], 0, "{case}");
+                assert_eq!(result["markouts"]["30"]["observed_unexecutable"], 1);
+                assert_eq!(result["markouts"]["30"]["telemetry_completion_rate"], 1.0);
+                assert_eq!(
+                    result["markouts"]["30"]["executable"]["count"],
+                    population - 1
+                );
+                assert_eq!(
+                    result["evidence_gate"],
+                    if case == "valid" { "PASS" } else { "FAIL" }
+                );
+            } else {
+                assert_eq!(result["evidence_gate"], "FAIL", "{case}");
+                assert_eq!(
+                    result["markouts"]["30"]["observed_unexecutable"], 0,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn absent_markouts_are_missing_against_actual_fill_lifecycle() {
         let fill_ts = Utc::now();
         let mut quality = ExecutionQualityAccumulator::default();
@@ -16253,6 +16542,31 @@ mod tests {
     }
 
     #[test]
+    fn pending_merge_refills_the_earliest_event_time_frontier_before_large_future_rows() {
+        let mut readers = vec![
+            pending_test_reader_at("books", "2026-07-23T00:00:00Z", 5, 16),
+            pending_test_reader_at("other", "2026-07-23T01:00:00Z", 5, 2_048),
+        ];
+        let mut stats = StreamStats::default();
+        let mut seen_hashes = BTreeSet::new();
+        let mut budget = PendingBufferBudget::new(13_000);
+
+        fill_pending_windows(
+            &mut readers,
+            &[],
+            &mut stats,
+            &mut seen_hashes,
+            8_192,
+            &mut budget,
+        )
+        .unwrap();
+
+        assert_eq!(readers[0].pending.len(), 4);
+        assert_eq!(readers[1].pending.len(), 1);
+        assert!(budget.estimated_bytes > budget.limit);
+    }
+
+    #[test]
     fn pending_event_memory_estimate_is_conservative_and_saturating() {
         assert_eq!(
             estimated_pending_event_bytes(1_024),
@@ -16269,6 +16583,35 @@ mod tests {
                 "sequence": sequence,
                 "event_type": name,
                 "recorded_ts": format!("2026-07-23T00:00:{sequence:02}Z"),
+                "raw_payload": {
+                    "payload": payload
+                }
+            });
+            input.push_str(&serde_json::to_string(&row).unwrap());
+            input.push('\n');
+        }
+        EventReaderState {
+            source: name.to_owned(),
+            reader: Box::new(BufReader::new(std::io::Cursor::new(input.into_bytes()))),
+            line_index: 0,
+            pending: BTreeMap::new(),
+            exhausted: false,
+        }
+    }
+
+    fn pending_test_reader_at(
+        name: &str,
+        recorded_ts: &str,
+        events: usize,
+        payload_bytes: usize,
+    ) -> EventReaderState {
+        let payload = "x".repeat(payload_bytes);
+        let mut input = String::new();
+        for sequence in 0..events {
+            let row = json!({
+                "sequence": sequence,
+                "event_type": name,
+                "recorded_ts": recorded_ts,
                 "raw_payload": {
                     "payload": payload
                 }

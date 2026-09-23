@@ -7,8 +7,12 @@ Research runs remain separate from funded execution and qset promotion. The defa
 The primary paper collector retains recent actual book observations for delayed
 source-timestamp fills. It preserves the original fill and observation times;
 the 1/5/30-second horizons and inclusive two-second deadline remain unchanged.
-Absent executable observations remain explicit missing evidence. This cannot
-repair a previously failed frozen experiment.
+Absent executable observations remain explicit missing evidence. Future capture
+can distinguish `observed_unexecutable` only after the deadline when a timely,
+durably recorded REST snapshot proves the required exit side was empty. The
+reporter joins the exact token, receipt time and book evidence. Ordinary WebSocket
+observations alone cannot establish this category. Historical missing events and
+previously failed frozen experiments remain failed.
 
 Only primary paper capture also requests public REST books while a markout is
 pending. A request gets at most one second, capped by the remaining observation
@@ -17,6 +21,15 @@ Actual response receipt time remains the observation time. The raw
 response must be durably recorded before it can complete a markout; the snapshot
 does not feed strategy decisions, paper fills or risk state. Reservations protect
 an on-time response during its durable write, without extending the deadline.
+
+Observed illiquidity retains the fill in every applicable coverage denominator
+and contributes no invented mark price or PnL. Executable coverage must still be
+at least 95% at each horizon; priced and telemetry coverage are reported
+separately. Priced statistics explicitly describe only the executable subset.
+The daily markout profitability lower bound fails closed if its evidence window
+contains observed illiquidity, preventing an optimistic claim from omitting that
+tail. Loss-regime diagnostics retain their complete executable-evidence gates.
+The future prospective contract freezes these rules as observation policy v2.
 
 `POLYEDGE_DATA_QUALITY_ONLY=true` selects the existing daily normalizer, audit and
 execution-quality commands without candidate evaluation. The native

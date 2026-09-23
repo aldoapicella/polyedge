@@ -93,6 +93,10 @@ retaining the 8,192-event per-reader ceiling. One head row per nonempty shard is
 always required for a correct merge, so the byte cap is an estimate rather than
 a literal process-memory guarantee; unusually large individual rows must still
 fail closed through the job memory limit and alerting.
+Within those limits, refill the shard whose buffered timestamps are least
+advanced. Equal row-count allocation lets large, low-rate shards read far into
+the future and consume the lookahead needed by high-rate books. This scheduling
+change preserves timestamps and the residual-ordering admission gate.
 
 During a frozen shadow campaign, reporting changes must use
 `.github/workflows/deploy-polyedge-research-jobs.yml` instead of the active

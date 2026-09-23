@@ -74,6 +74,7 @@ struct PendingMarkout {
     fee_per_share: Decimal,
     fill_ts: DateTime<Utc>,
     horizon_seconds: i64,
+    observed_unexecutable: Option<ObservedMarkoutBook>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +83,8 @@ struct ObservedMarkoutBook {
     best_bid: Option<Decimal>,
     best_ask: Option<Decimal>,
     last_trade_price: Option<Decimal>,
+    durable_rest: bool,
+    book_hash: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -333,7 +336,10 @@ impl ExecutionQualityTracker {
         book: &BookState,
     ) -> Vec<QualityEvent> {
         self.markout_snapshot_reservations.remove(&book.token_id);
-        self.observe_markout_snapshot(book)
+        let mut observed = ObservedMarkoutBook::from(book);
+        observed.durable_rest = true;
+        self.remember_observed_markout_book(book, observed.clone());
+        self.observe_pending_markouts(&book.token_id, &observed)
     }
 
     pub(super) fn cancel_markout_snapshot_reservation(
@@ -355,10 +361,7 @@ impl ExecutionQualityTracker {
                 + Duration::seconds(markout.horizon_seconds)
                 + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
             if now > deadline && reservations.get(&markout.token_id) != Some(&deadline) {
-                due.push(missing_markout_event(
-                    markout,
-                    "markout_observation_deadline_exceeded",
-                ));
+                due.push(expired_markout_event(markout, deadline));
             } else {
                 pending.push(markout);
             }
@@ -404,7 +407,7 @@ impl ExecutionQualityTracker {
         let reservations = self.markout_snapshot_reservations.clone();
         let mut due = Vec::new();
         let mut pending = Vec::with_capacity(self.pending_markouts.len());
-        for markout in self.pending_markouts.drain(..) {
+        for mut markout in self.pending_markouts.drain(..) {
             let horizon_ts = markout.fill_ts + Duration::seconds(markout.horizon_seconds);
             if &markout.token_id != token_id || observed_ts < horizon_ts {
                 pending.push(markout);
@@ -416,14 +419,14 @@ impl ExecutionQualityTracker {
                 if reservations.get(&markout.token_id) == Some(&deadline) {
                     pending.push(markout);
                 } else {
-                    due.push(missing_markout_event(
-                        markout,
-                        "markout_observation_deadline_exceeded",
-                    ));
+                    due.push(expired_markout_event(markout, deadline));
                 }
             } else if let Some(event) = completed_markout_event(markout.clone(), book) {
                 due.push(event);
             } else {
+                if book.durable_rest && lacks_executable_side(&markout, book) {
+                    markout.observed_unexecutable = Some(book.clone());
+                }
                 pending.push(markout);
             }
         }
@@ -747,6 +750,7 @@ impl ExecutionQualityTracker {
                         fee_per_share,
                         fill_ts,
                         horizon_seconds,
+                        observed_unexecutable: None,
                     }),
             );
         self.resolve_markouts_from_history()
@@ -754,6 +758,10 @@ impl ExecutionQualityTracker {
 
     fn remember_markout_book(&mut self, book: &BookState) {
         let observed = ObservedMarkoutBook::from(book);
+        self.remember_observed_markout_book(book, observed);
+    }
+
+    fn remember_observed_markout_book(&mut self, book: &BookState, observed: ObservedMarkoutBook) {
         self.prune_markout_histories(observed.observed_ts);
         self.markout_books.retain(|_, history| !history.is_empty());
         if !self.markout_books.contains_key(&book.token_id)
@@ -853,36 +861,48 @@ impl ExecutionQualityTracker {
     }
 
     fn resolve_markouts_from_history(&mut self) -> Vec<QualityEvent> {
+        let reservations = self.markout_snapshot_reservations.clone();
         let mut due = Vec::new();
         let mut pending = Vec::with_capacity(self.pending_markouts.len());
-        for markout in self.pending_markouts.drain(..) {
+        for mut markout in self.pending_markouts.drain(..) {
             let horizon_ts = markout.fill_ts + Duration::seconds(markout.horizon_seconds);
             let deadline = horizon_ts + Duration::milliseconds(MAX_MARKOUT_OBSERVATION_DELAY_MS);
             let history = self.markout_books.get(&markout.token_id);
-            let event = history.and_then(|books| {
+            let (event, unexecutable) = history.map_or((None, None), |books| {
                 let index = books
                     .binary_search_by_key(&horizon_ts, |book| book.observed_ts)
                     .unwrap_or_else(|index| index);
-                books.iter().skip(index).find_map(|book| {
-                    (book.observed_ts <= deadline)
-                        .then(|| completed_markout_event(markout.clone(), book))
-                        .flatten()
-                })
+                let admissible = books
+                    .iter()
+                    .skip(index)
+                    .take_while(|book| book.observed_ts <= deadline);
+                let mut unexecutable = None;
+                for book in admissible {
+                    if let Some(event) = completed_markout_event(markout.clone(), book) {
+                        return (Some(event), None);
+                    }
+                    if book.durable_rest && lacks_executable_side(&markout, book) {
+                        unexecutable = Some(book.clone());
+                    }
+                }
+                (None, unexecutable)
             });
             if let Some(event) = event {
                 due.push(event);
             } else if history
                 .and_then(|books| books.back())
-                .is_some_and(|book| book.observed_ts >= deadline)
+                .is_some_and(|book| book.observed_ts > deadline)
+                && reservations.get(&markout.token_id) != Some(&deadline)
             {
                 // All admissible observations are already retained and the
                 // same token has advanced through the deadline. A later book
                 // cannot repair this frozen window.
-                due.push(missing_markout_event(
-                    markout,
-                    "markout_observation_deadline_exceeded",
-                ));
+                markout.observed_unexecutable =
+                    unexecutable.or(markout.observed_unexecutable.take());
+                due.push(expired_markout_event(markout, deadline));
             } else {
+                markout.observed_unexecutable =
+                    unexecutable.or(markout.observed_unexecutable.take());
                 pending.push(markout);
             }
         }
@@ -898,6 +918,8 @@ impl From<&BookState> for ObservedMarkoutBook {
             best_bid: book.best_bid().map(|level| level.price),
             best_ask: book.best_ask().map(|level| level.price),
             last_trade_price: book.last_trade_price,
+            durable_rest: false,
+            book_hash: book.book_hash.clone(),
         }
     }
 }
@@ -921,6 +943,59 @@ fn missing_markout_event(markout: PendingMarkout, reason: &'static str) -> Quali
             "research_only": true
         }),
     }
+}
+
+fn expired_markout_event(markout: PendingMarkout, deadline: DateTime<Utc>) -> QualityEvent {
+    match markout.observed_unexecutable.clone() {
+        Some(book) => observed_unexecutable_markout_event(markout, &book, deadline),
+        None => missing_markout_event(markout, "markout_observation_deadline_exceeded"),
+    }
+}
+
+fn lacks_executable_side(markout: &PendingMarkout, book: &ObservedMarkoutBook) -> bool {
+    match markout.side {
+        Side::Buy => book.best_bid.is_none(),
+        Side::Sell => book.best_ask.is_none(),
+    }
+}
+
+fn observed_unexecutable_markout_event(
+    markout: PendingMarkout,
+    book: &ObservedMarkoutBook,
+    deadline: DateTime<Utc>,
+) -> QualityEvent {
+    let reason = match markout.side {
+        Side::Buy => "no_executable_bid_observed",
+        Side::Sell => "no_executable_ask_observed",
+    };
+    let delay = book
+        .observed_ts
+        .signed_duration_since(markout.fill_ts + Duration::seconds(markout.horizon_seconds))
+        .num_milliseconds()
+        .max(0);
+    let mut event = missing_markout_event(markout, reason);
+    let payload = event
+        .payload
+        .as_object_mut()
+        .expect("missing markout payload is an object");
+    payload.insert(
+        "observation_status".to_owned(),
+        json!("observed_unexecutable"),
+    );
+    payload.insert("source".to_owned(), json!("polymarket_clob_rest"));
+    payload.insert("observed_ts".to_owned(), json!(book.observed_ts));
+    payload.insert("observation_delay_ms".to_owned(), json!(delay));
+    payload.insert(
+        "best_bid".to_owned(),
+        json!(book.best_bid.map(|value| value.to_string())),
+    );
+    payload.insert(
+        "best_ask".to_owned(),
+        json!(book.best_ask.map(|value| value.to_string())),
+    );
+    payload.insert("book_hash".to_owned(), json!(book.book_hash));
+    payload.insert("observation_deadline".to_owned(), json!(deadline));
+    event
 }
 
 fn completed_markout_event(
@@ -1319,7 +1394,9 @@ fn probe_trade(
 mod tests {
     use super::*;
     use polyedge_domain::{BookLevel, OrderKind};
+    use polyedge_reporting::research::{run_execution_quality, ExecutionQualityOptions};
     use std::collections::BTreeMap;
+    use std::fs;
 
     #[test]
     fn captures_size_ahead_partial_fills_trade_through_and_markouts() {
@@ -1563,6 +1640,203 @@ mod tests {
     }
 
     #[test]
+    fn durable_rest_illiquidity_is_emitted_only_after_deadline_for_buy_and_sell() {
+        let mut buy = ExecutionQualityTracker::default();
+        buy.observe_execution_report(&report("paper_filled", dec("5"), Some(dec("0.50")), ts(0)));
+        let mut no_bid = book("0.51", "4", "0.52", "4", ts(1));
+        no_bid.bids.clear();
+        assert!(buy.finish_markout_snapshot_reservation(&no_bid).is_empty());
+        assert!(buy.expire_markouts(ts(3)).is_empty());
+        let events = buy.expire_markouts(ts(4));
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.payload["observation_status"], "observed_unexecutable");
+        assert_eq!(event.payload["reason"], "no_executable_bid_observed");
+        assert_eq!(event.payload["source"], "polymarket_clob_rest");
+        assert!(event.payload["best_bid"].is_null());
+        assert_eq!(event.payload["best_ask"], "0.52");
+        assert_eq!(event.payload["book_hash"], "hash");
+        assert_eq!(event.payload["fill_price"], "0.50");
+        assert_eq!(event.payload["fill_size"], "5");
+        assert_eq!(event.payload["fee_per_share"], "0");
+        assert!(event.payload.as_object().unwrap().keys().all(
+            |key| key == "fill_price" || (!key.contains("mark_price") && !key.contains("pnl"))
+        ));
+
+        let mut sell = ExecutionQualityTracker::default();
+        let mut sell_decision = decision();
+        sell_decision.side = Some(Side::Sell);
+        sell.register_order(
+            &sell_decision,
+            &report("paper_resting", Decimal::ZERO, None, ts(0)),
+            None,
+            0,
+        );
+        sell.observe_execution_report(&report("paper_filled", dec("5"), Some(dec("0.50")), ts(0)));
+        let mut no_ask = book("0.51", "4", "0.52", "4", ts(1));
+        no_ask.asks.clear();
+        sell.finish_markout_snapshot_reservation(&no_ask);
+        let events = sell.expire_markouts(ts(4));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["reason"], "no_executable_ask_observed");
+        assert_eq!(events[0].payload["side"], "sell");
+        assert!(events[0].payload["best_ask"].is_null());
+    }
+
+    #[test]
+    fn durable_illiquidity_waits_for_executable_recovery_at_deadline() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        let mut no_bid = book("0.51", "4", "0.52", "4", ts(1));
+        no_bid.bids.clear();
+        tracker.finish_markout_snapshot_reservation(&no_bid);
+        let recovered = tracker.observe_book(&book("0.51", "4", "0.52", "4", ts(3)));
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].event_type, "paper_fill_markout");
+        assert_eq!(recovered[0].payload["horizon_seconds"], 1);
+    }
+
+    #[test]
+    fn ws_late_and_wrong_token_books_do_not_prove_observed_illiquidity() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        let mut ws_no_bid = book("0.51", "4", "0.52", "4", ts(1));
+        ws_no_bid.bids.clear();
+        tracker.observe_markout_snapshot(&ws_no_bid);
+        let mut wrong = ws_no_bid.clone();
+        wrong.token_id = TokenId::new("other-token");
+        assert!(tracker
+            .finish_markout_snapshot_reservation(&wrong)
+            .is_empty());
+        let mut late = ws_no_bid.clone();
+        late.local_ts = ts(4);
+        let events = tracker.finish_markout_snapshot_reservation(&late);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["reason"],
+            "markout_observation_deadline_exceeded"
+        );
+        assert!(events[0].payload.get("observation_status").is_none());
+    }
+
+    #[test]
+    fn delayed_fill_uses_retained_durable_rest_illiquidity_after_history_pruning() {
+        let mut tracker = ExecutionQualityTracker::default();
+        let mut no_bid = book("0.51", "4", "0.52", "4", ts(1));
+        no_bid.bids.clear();
+        tracker.finish_markout_snapshot_reservation(&no_bid);
+        let mut post_deadline = no_bid.clone();
+        post_deadline.local_ts = ts(4);
+        tracker.observe_markout_snapshot(&post_deadline);
+        let events = tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["observation_status"],
+            "observed_unexecutable"
+        );
+
+        let mut pending = ExecutionQualityTracker::default();
+        pending.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        pending.finish_markout_snapshot_reservation(&no_bid);
+        pending.prune_markout_histories(ts(34));
+        // A later fill drains and re-evaluates all pending rows; it must not
+        // erase the durable observation retained on the earlier fill.
+        pending.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(34),
+        ));
+        let events = pending.expire_markouts(ts(4));
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].payload["observation_status"],
+            "observed_unexecutable"
+        );
+    }
+
+    #[test]
+    fn emitted_durable_rest_illiquidity_is_accepted_by_execution_quality_report() {
+        let mut tracker = ExecutionQualityTracker::default();
+        let fill = report("paper_filled", dec("5"), Some(dec("0.50")), ts(0));
+        tracker.observe_execution_report(&fill);
+        let mut no_bid = book("0.51", "4", "0.52", "4", ts(1));
+        no_bid.bids.clear();
+        tracker.finish_markout_snapshot_reservation(&no_bid);
+        let missing = tracker.expire_markouts(ts(4)).remove(0);
+        let root = std::env::temp_dir().join(format!(
+            "polyedge-execution-quality-rest-{}-{}",
+            std::process::id(),
+            ts(4).timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let snapshot = json!({
+            "schema": "polyedge.paper_markout_rest_snapshot.v1",
+            "source": "polymarket_clob_rest",
+            "requested_token_id": "token",
+            "request_ts": ts(1) - Duration::milliseconds(50),
+            "received_ts": ts(1), "observed_ts": ts(1),
+            "best_bid": null, "best_ask": "0.52", "book_hash": "hash",
+            "raw_payload": {"asset_id": "token", "bids": [], "asks": [{"price": "0.52", "size": "4"}]},
+            "research_only": true, "strategy_book_updated": false,
+            "feed_health_updated": false, "paper_fill_updated": false
+        });
+        fs::write(
+            root.join("other.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({"event_type":"paper_markout_rest_snapshot","recorded_ts":ts(1),"payload":snapshot}),
+                json!({"event_type":missing.event_type,"recorded_ts":ts(4),"payload":missing.payload})
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("execution_reports.jsonl"),
+            format!(
+                "{}\n",
+                json!({"event_type":"execution_report","recorded_ts":ts(0),"payload":{
+                    "order_id":"paper-1", "market_id":"market", "token_id":"token", "side":"buy",
+                    "filled_size":"5", "avg_price":"0.50", "fee":"0", "local_ts":ts(0)
+                }})
+            ),
+        )
+        .unwrap();
+        let result = run_execution_quality(ExecutionQualityOptions {
+            input: root.clone(),
+            out: root.join("quality.json"),
+            markdown: root.join("quality.md"),
+            exclude_windows: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            result["result"]["markouts"]["1"]["observed_unexecutable"], 1,
+            "{result}"
+        );
+        assert_eq!(result["result"]["invalid_markout_rows"], 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn markout_accepts_executable_side_at_deadline_and_ignores_other_tokens() {
         let mut tracker = ExecutionQualityTracker::default();
         tracker.observe_execution_report(&report(
@@ -1761,6 +2035,41 @@ mod tests {
             tracker.finish_markout_snapshot_reservation(&book("0.51", "4", "0.52", "4", ts(2)));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "paper_fill_markout");
+        assert_eq!(
+            events[0].payload["observed_ts"].as_str().and_then(parse_ts),
+            Some(ts(2))
+        );
+    }
+
+    #[test]
+    fn reservation_prevents_history_replay_from_expiring_another_fill() {
+        let mut tracker = ExecutionQualityTracker::default();
+        tracker.observe_execution_report(&report(
+            "paper_filled",
+            dec("5"),
+            Some(dec("0.50")),
+            ts(0),
+        ));
+        let request = tracker
+            .pending_markout_observation_requests(ts(1))
+            .into_iter()
+            .next()
+            .unwrap();
+        assert!(tracker.begin_markout_snapshot_reservation(&request, ts(1)));
+        assert!(tracker
+            .observe_book(&book("0.51", "4", "0.52", "4", ts(4)))
+            .is_empty());
+
+        // Scheduling a later fill replays the retained WS history. It must
+        // leave the older reserved window pending for its durable REST flush.
+        assert!(tracker
+            .observe_execution_report(&report("paper_filled", dec("5"), Some(dec("0.50")), ts(4),))
+            .is_empty());
+        let events =
+            tracker.finish_markout_snapshot_reservation(&book("0.51", "4", "0.52", "4", ts(2)));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "paper_fill_markout");
+        assert_eq!(events[0].payload["horizon_seconds"], 1);
         assert_eq!(
             events[0].payload["observed_ts"].as_str().and_then(parse_ts),
             Some(ts(2))

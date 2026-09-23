@@ -13,6 +13,18 @@ from pathlib import Path
 
 from verify_primary_oci_day import BUCKET, NAMESPACE, PREFIX, REGION
 
+MARKOUT_OBSERVATION_POLICY = dict(
+    schema='polyedge.markout_observation_policy.v2',
+    horizons_seconds=[1, 5, 30], maximum_observation_delay_ms=2000,
+    executable_completion_minimum=0.95,
+    denominator='all eligible fill lifecycles, including observed illiquidity',
+    observed_unexecutable='only after the inclusive deadline; exact same-token timely durable REST '
+        'snapshot with the required exit side empty, no price or PnL imputation',
+    missing_late_malformed_or_unjoined='blocking; historical missing events stay unchanged',
+    statistics='priced rows only, explicitly incomplete; no positive markout profitability bound '
+        'when the evidence window includes observed illiquidity',
+    application='future capture only; never readmit a failed pilot')
+
 
 def digest(path):
     with Path(path).open('rb') as stream:
@@ -74,6 +86,9 @@ def verify_frozen(out, expected_start, client=None):
         require(path.is_file() and not path.is_symlink() and digest(path) == expected,
                 'frozen artifact changed: ' + name)
     protocol = json.loads((out / 'protocol.json').read_text())
+    require(protocol.get('schema') == 'polyedge.primary_prospective.v2'
+            and protocol.get('markout_observation_policy') == MARKOUT_OBSERVATION_POLICY,
+            'frozen observation policy differs from the evaluator')
     require(protocol['id'] == identity and protocol['training']['start_inclusive'][:10] == expected_start,
             'frozen experiment identity differs')
     return protocol
@@ -131,7 +146,7 @@ def prepare(args, now):
                 binary_sha256=digest(args.binary).removeprefix('sha256:'),
                 selection_period=selection, protocol='protocol.json',
                 predecessor_candidate_plan=dict(sha256=digest(args.candidate_plan)))
-    protocol = dict(schema='polyedge.primary_prospective.v1', id=experiment, frozen_at=frozen,
+    protocol = dict(schema='polyedge.primary_prospective.v2', id=experiment, frozen_at=frozen,
                     status='preregistered_waiting_for_future_data', training=dict(
                         start_inclusive=stamp(0), end_exclusive=stamp(1), models_fitted=False),
                     validation=dict(start_inclusive=stamp(1), end_exclusive=stamp(29)),
@@ -140,9 +155,10 @@ def prepare(args, now):
                     market_population='marketstart >= partition start and marketend < partition end',
                     carry_admission='settlement only for included lifecycles; no new decisions, '
                         'opportunities or bootstrap days; all exposure must close by carry end',
-                    daily_admission='unchanged native primary audit and execution-quality gates, '
+                    daily_admission='source-pinned native primary audit and execution-quality gates, '
                         'authenticated exhaustive source bindings, one runtime identity, '
                         'recorder continuity and no blocking or unclassified warnings',
+                    markout_observation_policy=copy.deepcopy(MARKOUT_OBSERVATION_POLICY),
                     failure_policy='terminal blocker; never shift, extend or automatically replace this window',
                     predecessor_disposition='failed experiments and original evidence remain immutable',
                     candidate_evaluations=0, winner=None, holdout_opened=False,

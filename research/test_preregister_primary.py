@@ -50,6 +50,9 @@ with tempfile.TemporaryDirectory() as directory:
     assert holdout['end_exclusive'] == '2026-11-21T00:00:00Z'
     assert protocol['final_closure_not_before'] == '2026-11-22T00:00:00Z'
     assert plan['maximum_total_selection_replays'] == 500
+    assert protocol['schema'] == 'polyedge.primary_prospective.v2'
+    assert protocol['markout_observation_policy']['executable_completion_minimum'] == 0.95
+    assert protocol['markout_observation_policy']['application'] == 'future capture only; never readmit a failed pilot'
     for document, field, bad in ((gate, 'status', 'failed'),
                                  (proof, 'exhaustive_listing', False),
                                  (proof, 'schema', 'unknown'),
@@ -103,6 +106,28 @@ with tempfile.TemporaryDirectory() as directory:
     assert remote['anchor']['name'] == 'research-contracts/primary-20260924/manifest.json'
     write('remote-preregistration.json', remote)
     assert verify_frozen(root, args.start, client)['id'] == protocol['id']
+    # Even a correctly anchored contract must carry this evaluator's exact method.
+    original_manifest = (root / 'manifest.json').read_bytes()
+    for field, bad in [('schema', 'polyedge.primary_prospective.v1'),
+                       ('markout_observation_policy', {})]:
+        changed = copy.deepcopy(protocol)
+        changed[field] = bad
+        write('protocol.json', changed)
+        write('manifest.json', {'files': {name: digest(root / name) for name in files}})
+        client.objects[remote['anchor']['name']] = (root / 'manifest.json').read_bytes()
+        receipt = copy.deepcopy(remote)
+        receipt['anchor']['sha256'] = digest(root / 'manifest.json')
+        write('remote-preregistration.json', receipt)
+        try:
+            verify_frozen(root, args.start, client)
+        except ValueError as error:
+            assert 'observation policy' in str(error)
+        else:
+            raise AssertionError('different frozen method accepted')
+    write('protocol.json', protocol)
+    (root / 'manifest.json').write_bytes(original_manifest)
+    client.objects[remote['anchor']['name']] = original_manifest
+    write('remote-preregistration.json', remote)
     # Updating both a contract and its local manifest cannot replace the OCI anchor.
     write('candidate-plan.json', {'changed': True})
     write('manifest.json', {'files': {name: digest(root / name) for name in files}})

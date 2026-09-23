@@ -2163,6 +2163,10 @@ fn json_row(
         "markout_30s_mean": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/mean")).cloned(),
         "markout_30s_sample_std": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/sample_std")).cloned(),
         "markout_30s_sample_size": execution_quality.and_then(|report| report.pointer("/result/markouts/30/executable/count")).cloned(),
+        "markout_30s_observed_unexecutable": execution_quality
+            .and_then(|report| report.pointer("/result/markouts/30/observed_unexecutable"))
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
         "execution_quality_gate": execution_quality_gate,
         "queue_snapshot_coverage": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_coverage")).cloned(),
         "queue_snapshot_applicable": execution_quality.and_then(|report| report.pointer("/result/queue_snapshot_applicable")).cloned(),
@@ -2865,6 +2869,12 @@ fn trailing_positive_complete_weekly_blocks(daily_pnl: &[Decimal]) -> (u32, usiz
 }
 
 fn block_bootstrap_daily_markout_lower_95(rows: &[Value]) -> Option<Decimal> {
+    if rows.iter().any(|row| {
+        row.get("markout_30s_observed_unexecutable")
+            .is_some_and(|count| count.as_u64() != Some(0))
+    }) {
+        return None;
+    }
     let daily_means = rows
         .iter()
         .filter(|row| row["markout_30s_sample_size"].as_u64().unwrap_or_default() > 0)
@@ -3728,6 +3738,10 @@ mod wallet_metric_tests {
             block_bootstrap_daily_markout_lower_95(&enough),
             Some(Decimal::new(2, 2))
         );
+
+        let mut illiquid_tail = enough;
+        illiquid_tail[27]["markout_30s_observed_unexecutable"] = json!(1);
+        assert!(block_bootstrap_daily_markout_lower_95(&illiquid_tail).is_none());
     }
 
     #[test]

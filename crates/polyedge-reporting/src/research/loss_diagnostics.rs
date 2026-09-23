@@ -2341,6 +2341,9 @@ fn parse_markout(
         net_executable_markout_pnl: decimal(payload.get("net_executable_markout_pnl")),
         observation_delay_ms: payload["observation_delay_ms"].as_i64(),
         observed_ts: parse_datetime(payload.get("observed_ts")),
+        recorded_ts,
+        unexecutable_evidence: (payload["observation_status"] == "observed_unexecutable")
+            .then(|| payload.clone()),
     };
     (observation.key.fill_size > Decimal::ZERO && observation.key.fee_per_share >= Decimal::ZERO)
         .then(|| ParsedMarkout {
