@@ -8,6 +8,7 @@ import {
   observeCancellationFailedEvictedNoFill,
   observeEvictedAcknowledgedNoFill,
   runAcknowledgedNoFillReconciliation,
+  runAutomaticAcknowledgedNoFillReconciliation,
   runAmbiguousNoOrderReconciliation,
   validateAcknowledgedNoFillBinding,
   validateAcknowledgedNoFillSnapshot,
@@ -323,7 +324,7 @@ function acknowledgedFixture(environment = acknowledgedEnv()) {
       value: reservation
     },
     completionDocument: {
-      blobName: acknowledgedCompletionBlob,
+      blobName: config.completionBlobName,
       sha256: config.completionSha256,
       value: completion
     },
@@ -987,12 +988,95 @@ test("cancellation-failed recovery requires settled-market and zero-activity pro
   assert.equal(evidence.observation_ms, 10_000);
 });
 
-test("evicted-order recovery binds the summary and preserves the known order through CAS", async () => {
-  const value = evictedAcknowledgedFixture();
+function resolvedEvictedEnv() {
+  const environment = evictedAcknowledgedEnv();
+  environment.FUNDED_DIRECT_RECONCILIATION_REASON = "acknowledged_evicted_resolved_no_fill";
+  environment.VENUE_PROBE_FUNDED_CAMPAIGN_ID = "dynamic-quote-funded-2026-09-16-v11";
+  environment.FUNDED_DIRECT_RECONCILE_COMPLETION_BLOB_NAME = acknowledgedCompletionBlob
+    .replace("dynamic-quote-funded-2026-08-13-v10", environment.VENUE_PROBE_FUNDED_CAMPAIGN_ID);
+  return environment;
+}
+
+test("successful cancellation can use the stronger six-hour resolved-market proof without changing the legacy floor", () => {
+  const value = evictedAcknowledgedFixture(resolvedEvictedEnv());
+  value.nowMs = Date.parse("2026-08-22T02:02:00Z");
+  value.completionDocument.blobName = value.config.completionBlobName;
+  assert.equal(validateEvictedAcknowledgedNoFillBinding(value).etag, '"etag-known-1"');
+  const base = cancellationFailedEvictedSnapshot(value);
+  assert.equal(validateEvictedAcknowledgedNoFillSnapshot(base).terminal_order_status,
+    "NOT_RETAINED_AFTER_DURABLE_CANCEL_AND_RESOLUTION");
+  const legacy = evictedAcknowledgedFixture();
+  legacy.nowMs = value.nowMs;
+  assert.throws(() => validateEvictedAcknowledgedNoFillBinding(legacy), /completion binding/);
+  for (const mutate of [
+    row => { row.observedAtMs -= 3 * 60 * 1000; },
+    row => { row.gammaMarket.umaEndDate = "2026-08-22T02:00:00Z"; },
+    row => { row.gammaMarket.automaticallyResolved = false; },
+    row => { row.gammaMarket.clobTokenIds = '["wrong", "other"]'; },
+    row => { row.clobMarket.accepting_orders = true; },
+    row => { row.settlementActivity.push({ type: "REDEEM" }); },
+    row => { row.authenticatedTrades.push({ id: "fill" }); },
+    row => { row.openOrders.push({ id: "order" }); },
+    row => { row.positions.push({ conditionId: row.reservation.condition_id,
+      asset: row.reservation.token_id, size: 1, currentValue: 0, redeemable: true }); }
+  ]) {
+    const bad = structuredClone(base);
+    mutate(bad);
+    assert.throws(() => validateEvictedAcknowledgedNoFillSnapshot(bad), /fail closed/);
+  }
+});
+
+test("automatic no-fill maintenance binds the exact indexed record and never treats ineligible state as recovery", async () => {
+  const environment = resolvedEvictedEnv();
+  const value = evictedAcknowledgedFixture(environment);
+  value.completionDocument.blobName = value.config.completionBlobName;
+  let leaseChecks = 0, called = 0;
+  const options = {
+    env: environment,
+    inheritedLease: { assertHealthy: () => { leaseChecks += 1; } },
+    now: () => value.nowMs,
+    containerFactory: () => ({}),
+    loadRecords: async () => [value.record],
+    loadDocument: async (_container, name) => name === value.config.completionBlobName
+      ? value.completionDocument : value.summaryDocument,
+    reconcile: async args => {
+      called += 1;
+      const config = acknowledgedNoFillConfig(args.env, { reason: args.reason });
+      assert.equal(config.reservationSha256, value.record.reservation_sha256);
+      assert.equal(config.completionSha256, value.completionDocument.sha256);
+      assert.equal(config.summarySha256, value.summaryDocument.sha256);
+      assert.equal(config.orderId, value.record.reservation.order_id);
+      args.assertHealthy();
+      return { status: "finalized_no_fill" };
+    }
+  };
+  assert.equal((await runAutomaticAcknowledgedNoFillReconciliation(options)).status, "finalized_no_fill");
+  assert.equal(called, 1);
+  assert.equal(leaseChecks, 2);
+  for (const patch of [
+    { loadRecords: async () => [] },
+    { loadRecords: async () => [value.record, value.record] },
+    { loadRecords: async () => [{ ...value.record, reservation: { ...value.record.reservation, matched_notional: 1 } }] },
+    { loadRecords: async () => [{ ...value.record, reservation: { ...value.record.reservation, zero_open_orders_confirmed: false } }] },
+    { now: () => Date.parse(value.completionDocument.value.completed_at) + 6 * 3600000 - 1 }
+  ]) {
+    assert.equal(await runAutomaticAcknowledgedNoFillReconciliation({ ...options, ...patch }), null);
+  }
+  assert.equal(called, 1);
+  await assert.rejects(runAutomaticAcknowledgedNoFillReconciliation({ ...options, inheritedLease: null }), /exclusive campaign lease/);
+  await assert.rejects(runAutomaticAcknowledgedNoFillReconciliation({ ...options,
+    inheritedLease: { assertHealthy() { throw new Error("lease lost"); } } }), /lease lost/);
+});
+
+for (const environment of [evictedAcknowledgedEnv(), resolvedEvictedEnv()]) {
+test(`evicted-order recovery binds the summary and preserves the known order through CAS (${environment.FUNDED_DIRECT_RECONCILIATION_REASON})`, async () => {
+  const value = evictedAcknowledgedFixture(environment);
+  const snapshot = environment.FUNDED_DIRECT_RECONCILIATION_REASON === "acknowledged_evicted_resolved_no_fill"
+    ? cancellationFailedEvictedSnapshot(value) : evictedAcknowledgedSnapshot(value);
   const observations = {
-    first: validateEvictedAcknowledgedNoFillSnapshot(evictedAcknowledgedSnapshot(value)),
+    first: validateEvictedAcknowledgedNoFillSnapshot(snapshot),
     second: validateEvictedAcknowledgedNoFillSnapshot({
-      ...evictedAcknowledgedSnapshot(value),
+      ...snapshot,
       observedAtMs: Date.parse("2026-08-22T20:00:10Z")
     }),
     observation_ms: 10_000
@@ -1002,13 +1086,13 @@ test("evicted-order recovery binds the summary and preserves the known order thr
   let terminal = null;
   let finalized = null;
   const result = await runAcknowledgedNoFillReconciliation({
-    env: evictedAcknowledgedEnv(),
-    reason: "acknowledged_evicted_order_no_fill",
+    env: environment,
+    reason: environment.FUNDED_DIRECT_RECONCILIATION_REASON,
     now: () => value.nowMs,
     containerFactory: () => ({}),
     loadRecords: async () => recordLoads++ < 2 ? [value.record] : [],
     loadDocument: async (_container, name) => {
-      if (name === acknowledgedCompletionBlob) return value.completionDocument;
+      if (name === value.config.completionBlobName) return value.completionDocument;
       if (name === acknowledgedSummaryBlob) {
         summaryLoads += 1;
         return value.summaryDocument;
@@ -1030,7 +1114,7 @@ test("evicted-order recovery binds the summary and preserves the known order thr
     logger: () => {}
   });
   assert.equal(result.order_id, acknowledgedOrderId);
-  assert.equal(result.reconciliation_reason, "acknowledged_evicted_order_no_fill");
+  assert.equal(result.reconciliation_reason, environment.FUNDED_DIRECT_RECONCILIATION_REASON);
   assert.equal(finalized.settlement.order_id, acknowledgedOrderId);
   assert.equal(finalized.options.ifMatch, '"etag-known-1"');
   assert.equal(
@@ -1044,6 +1128,7 @@ test("evicted-order recovery binds the summary and preserves the known order thr
   assert.equal(summaryLoads, 2);
   assert.equal(recordLoads, 3);
 });
+}
 
 test("evicted-order recovery fails if the immutable summary changes during observation", async () => {
   for (const mode of ["hash", "value"]) {

@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import {
+  cancelOrderWithMetrics,
   connectLifecycleChannel,
   fillRacedCancellation,
   hasExactEligibleHorizons,
@@ -799,6 +800,20 @@ test("an old PONG cannot satisfy a later heartbeat and missing freshness reconne
   assert.equal(scheduler.pendingCount(), 0);
 });
 
+test("targeted cancellation is attempted even when the open-order list omitted the acknowledged order", async () => {
+  let cancelCalls = 0;
+  const cancellation = await cancelOrderWithMetrics({
+    async cancelOrder() {
+      cancelCalls += 1;
+      return { canceled: ["order-1"] };
+    },
+    async getOpenOrders() { return []; }
+  }, "order-1");
+
+  assert.equal(cancelCalls, 1);
+  assert.equal(cancellation.failedAttempts, 0);
+});
+
 test("terminal no-fill reconciliation waits for the full stable-finality window", async () => {
   let now = 0;
   let snapshots = 0;
@@ -845,6 +860,37 @@ test("terminal no-fill reconciliation waits for the full stable-finality window"
     tradeIdSourceAgreement: true,
     reconciliationComplete: true
   });
+});
+
+test("post-cancel reconciliation survives transient REST order-list disagreement before terminal stability", async () => {
+  let now = 0;
+  let orderCalls = 0;
+  const result = await waitForStablePostCancelReconciliation({
+    client: {
+      async getOrder() {
+        orderCalls += 1;
+        return now < 30_000 ? { status: "LIVE", size_matched: "0" } : {
+          status: "CANCELED", size_matched: "0"
+        };
+      },
+      async getTrades() { return []; },
+      async getOpenOrders() {
+        return now < 30_000 && orderCalls % 2 === 0 ? [{ id: "order-1" }] : [];
+      }
+    },
+    conditionId: "condition-1",
+    orderId: "order-1",
+    userChannel: { messages: [], ensureOpen: async () => true },
+    options: {
+      nowMs: () => now,
+      sleep: async (ms) => { now += ms; },
+      pollMs: 500
+    }
+  });
+
+  assert.equal(result.stableFinality, true);
+  assert.ok(result.observationMs >= 35_000);
+  assert.equal(reconciledOrderRisk(result, "order-1").reconciliationComplete, true);
 });
 
 test("non-terminal status containing MATCHED is never accepted as terminal", async () => {
@@ -911,5 +957,38 @@ test("missing terminal order still preserves authenticated fills for fail-closed
   assert.equal(result.stableFinality, false);
   assert.equal(result.finalOrder, null);
   assert.equal(result.relatedTrades.length, 1);
+  assert.equal(reconciledOrderRisk(result, "order-1").reconciliationComplete, false);
+});
+
+test("a user-channel cancellation does not replace REST terminal proof", async () => {
+  let now = 0;
+  const result = await waitForStablePostCancelReconciliation({
+    client: {
+      async getOrder() { return null; },
+      async getTrades() { return []; },
+      async getOpenOrders() { return []; }
+    },
+    conditionId: "condition-1",
+    orderId: "order-1",
+    userChannel: {
+      messages: [{
+        type: "CANCELLATION",
+        status: "CANCELED",
+        order_id: "order-1",
+        size_matched: "0"
+      }],
+      ensureOpen: async () => true
+    },
+    options: {
+      nowMs: () => now,
+      sleep: async (ms) => { now += ms; },
+      minimumObservationMs: 100,
+      requiredStableMs: 50,
+      timeoutMs: 200,
+      pollMs: 25
+    }
+  });
+
+  assert.equal(result.terminalConfirmed, false);
   assert.equal(reconciledOrderRisk(result, "order-1").reconciliationComplete, false);
 });

@@ -1988,16 +1988,7 @@ async function executeLifecycle(client, { intent, documents, runtime, reservatio
       Math.max(0, Date.parse(intent.valid_until) - Date.now())
     );
     await sleep(plannedRestMs);
-    const openBeforeCancel = (await getOpenOrdersStrict(client)).some((row) => String(row.id) === orderId);
-    const cancellation = openBeforeCancel
-      ? await cancelOrderWithMetrics(client, orderId, ledger)
-      : {
-          cancelSendWallMs: null,
-          cancelResponseWallMs: Date.now(),
-          cancelRoundTripMs: null,
-          cancelResponse: { already_terminal: true },
-          failedAttempts: 0
-        };
+    const cancellation = await cancelOrderWithMetrics(client, orderId, ledger);
     ledger.record("venue_cancel_http_response", {
       probe_id: reservation.probe_id,
       order_id: orderId,

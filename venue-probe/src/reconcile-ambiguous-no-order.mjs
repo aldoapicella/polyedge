@@ -22,11 +22,15 @@ const STORAGE_ACCOUNT = "stpolyedge6urdjr5nmwx7w";
 const STORAGE_CONTAINER = "polyedge-funded-evidence";
 const FUNDED_UAMI_CLIENT_ID = "d9ce9154-66a6-4bdb-839f-0da7b02b38da";
 const CAMPAIGN_ID = "dynamic-quote-funded-2026-08-13-v10";
+const CURRENT_CAMPAIGN_ID = "dynamic-quote-funded-2026-09-16-v11";
 const FUNDER_ADDRESS = "0x3d701b05d7c36afab01a06fd26ebe789c0b7bad8";
 const AMBIGUOUS_REASON = "ambiguous_submission_no_fill";
 const ACKNOWLEDGED_REASON = "acknowledged_terminal_no_fill";
 const EVICTED_ACKNOWLEDGED_REASON = "acknowledged_evicted_order_no_fill";
 const CANCELLATION_FAILED_EVICTED_REASON = "cancellation_failed_evicted_order_no_fill";
+const RESOLVED_EVICTED_REASON = "acknowledged_evicted_resolved_no_fill";
+const EVICTED_REASONS = [EVICTED_ACKNOWLEDGED_REASON,
+  CANCELLATION_FAILED_EVICTED_REASON, RESOLVED_EVICTED_REASON];
 const FAILED_POST_ACK_ERROR =
   "canary lifecycle did not reconcile across REST and authenticated user channel";
 const MINIMUM_COMPLETION_AGE_MS = 24 * 60 * 60 * 1_000;
@@ -49,8 +53,7 @@ export function acknowledgedNoFillConfig(
   env = process.env,
   { requireFederatedToken = false, reason = ACKNOWLEDGED_REASON } = {}
 ) {
-  if (![ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON,
-    CANCELLATION_FAILED_EVICTED_REASON].includes(reason)) {
+  if (![ACKNOWLEDGED_REASON, ...EVICTED_REASONS].includes(reason)) {
     failAcknowledged("reconciliation reason is not exact");
   }
   const config = recoveryConfig(env, reason, failAcknowledged);
@@ -75,6 +78,7 @@ export function acknowledgedNoFillConfig(
 }
 
 function recoveryConfig(env, reason, failClosed) {
+  const campaignId = env.VENUE_PROBE_FUNDED_CAMPAIGN_ID;
   const decisionId = String(env.FUNDED_DIRECT_RECONCILE_DECISION_ID || "").trim();
   const runId = String(env.FUNDED_DIRECT_RECONCILE_RUN_ID || "").trim();
   const reservationBlobName =
@@ -87,7 +91,7 @@ function recoveryConfig(env, reason, failClosed) {
     String(env.FUNDED_DIRECT_RECONCILE_COMPLETION_SHA256 || "").trim();
   if (env.FUNDED_DIRECT_RECONCILIATION_ENABLED !== "true" ||
       env.FUNDED_DIRECT_RECONCILIATION_REASON !== reason ||
-      env.VENUE_PROBE_FUNDED_CAMPAIGN_ID !== CAMPAIGN_ID ||
+      ![CAMPAIGN_ID, CURRENT_CAMPAIGN_ID].includes(campaignId) ||
       String(env.POLYMARKET_FUNDER_ADDRESS || "").toLowerCase() !== FUNDER_ADDRESS ||
       env.AZURE_TENANT_ID !== TENANT_ID ||
       env.AZURE_STORAGE_ACCOUNT_NAME !== STORAGE_ACCOUNT ||
@@ -106,7 +110,7 @@ function recoveryConfig(env, reason, failClosed) {
   }
   const probeId = "funded-direct-" + decisionId;
   const completionPath =
-    "reports/funded/dynamic-quote/sessions/" + CAMPAIGN_ID + "/completed/" +
+    "reports/funded/dynamic-quote/sessions/" + campaignId + "/completed/" +
     decisionId + ".json";
   if (!new RegExp(
     "^reports/research/venue-probe/risk-reservations/\\d{4}-\\d{2}-\\d{2}/" +
@@ -115,7 +119,7 @@ function recoveryConfig(env, reason, failClosed) {
     failClosed("blob namespace is not exact");
   }
   return {
-    campaignId: CAMPAIGN_ID,
+    campaignId,
     decisionId,
     runId,
     probeId,
@@ -294,7 +298,7 @@ export function validateAcknowledgedNoFillBinding({
       ) ||
       !Number.isFinite(completedMs) || completedMs < updatedMs ||
       !Number.isFinite(nowMs) || nowMs < completedMs ||
-      nowMs - completedMs < (cancellationFailed
+      nowMs - completedMs < (cancellationFailed || config.reconciliationReason === RESOLVED_EVICTED_REASON
         ? MINIMUM_CANCELLATION_FAILED_AGE_MS
         : MINIMUM_COMPLETION_AGE_MS)) {
     failAcknowledged("completion binding is invalid");
@@ -452,12 +456,11 @@ export function validateEvictedAcknowledgedNoFillSnapshot({
       !Array.isArray(authenticatedTrades) || authenticatedTrades.length !== 0 ||
       unresolvedPositions.length !== 0 || exactPositions.length !== 0 ||
       !Number.isFinite(observedAtMs) ||
-      ![EVICTED_ACKNOWLEDGED_REASON, CANCELLATION_FAILED_EVICTED_REASON]
-        .includes(config.reconciliationReason)) {
+      !EVICTED_REASONS.includes(config.reconciliationReason)) {
     failAcknowledged("venue snapshot did not prove an evicted order with zero exposure");
   }
   let resolvedMarketEvidence = {};
-  if (cancellationFailed) {
+  if (cancellationFailed || config.reconciliationReason === RESOLVED_EVICTED_REASON) {
     const prices = jsonArray(gammaMarket?.outcomePrices).map(Number);
     const gammaTokens = jsonArray(gammaMarket?.clobTokenIds).map(String);
     const endMs = Date.parse(gammaMarket?.endDate);
@@ -496,7 +499,9 @@ export function validateEvictedAcknowledgedNoFillSnapshot({
     observed_at: new Date(observedAtMs).toISOString(),
     terminal_order_status: cancellationFailed
       ? "NOT_RETAINED_AFTER_FAILED_CANCEL_AND_RESOLUTION"
-      : "NOT_RETAINED_AFTER_DURABLE_CANCEL",
+      : config.reconciliationReason === RESOLVED_EVICTED_REASON
+        ? "NOT_RETAINED_AFTER_DURABLE_CANCEL_AND_RESOLUTION"
+        : "NOT_RETAINED_AFTER_DURABLE_CANCEL",
     rest_order_matched_size: 0,
     authenticated_open_order_count: 0,
     authenticated_trade_count: 0,
@@ -611,16 +616,17 @@ export async function runAcknowledgedNoFillReconciliation({
   fetchImpl = fetch,
   finalize = finalizeProbeRisk,
   logger = (value) => console.log(JSON.stringify(value)),
+  assertHealthy = () => {},
   reason = ACKNOWLEDGED_REASON
 } = {}) {
+  assertHealthy();
   const config = acknowledgedNoFillConfig(env, {
     requireFederatedToken: containerFactory === storageContainer,
     reason
   });
-  const evicted = [EVICTED_ACKNOWLEDGED_REASON, CANCELLATION_FAILED_EVICTED_REASON]
-    .includes(reason);
+  const evicted = EVICTED_REASONS.includes(reason);
   const observeBound = observe || (evicted
-    ? reason === CANCELLATION_FAILED_EVICTED_REASON
+    ? [CANCELLATION_FAILED_EVICTED_REASON, RESOLVED_EVICTED_REASON].includes(reason)
       ? observeCancellationFailedEvictedNoFill
       : observeEvictedAcknowledgedNoFill
     : observeAcknowledgedNoFill);
@@ -682,6 +688,7 @@ export async function runAcknowledgedNoFillReconciliation({
       JSON.stringify(refreshed.summary) !== JSON.stringify(binding.summary)) {
     failAcknowledged("durable evidence changed during venue observation");
   }
+  assertHealthy();
   const finalized = await finalize(config, binding.reservation, {
     state: "finalized_no_fill",
     order_submitted: true,
@@ -712,6 +719,7 @@ export async function runAcknowledgedNoFillReconciliation({
   if (remaining.length !== 0) {
     failAcknowledged("reservation remained unresolved after CAS finalization");
   }
+  assertHealthy();
   const result = sanitize({
     schema: "polyedge.acknowledged_no_fill_reconciliation.v1",
     status: "finalized_no_fill",
@@ -732,14 +740,75 @@ export async function runAcknowledgedNoFillReconciliation({
   return result;
 }
 
+export async function runAutomaticAcknowledgedNoFillReconciliation({
+  env = process.env,
+  inheritedLease,
+  now = Date.now,
+  containerFactory = storageContainer,
+  loadRecords = loadCampaignUnresolvedRiskReservationRecords,
+  loadDocument = downloadBlobDocument,
+  reconcile = runAcknowledgedNoFillReconciliation,
+  logger = (value) => console.log(JSON.stringify(value))
+} = {}) {
+  if (env.VENUE_PROBE_FUNDED_CAMPAIGN_ID !== CURRENT_CAMPAIGN_ID) return null;
+  if (typeof inheritedLease?.assertHealthy !== "function") {
+    failAcknowledged("automatic recovery requires the exclusive campaign lease");
+  }
+  inheritedLease.assertHealthy();
+  const base = {
+    campaignId: CURRENT_CAMPAIGN_ID,
+    storageAccount: env.AZURE_STORAGE_ACCOUNT_NAME,
+    storageContainer: env.AZURE_STORAGE_CONTAINER_NAME,
+    azureClientId: env.AZURE_CLIENT_ID,
+    operatorDirect: true,
+    dryRun: false
+  };
+  const container = containerFactory(base);
+  const records = await loadRecords(base, { container });
+  if (records.length !== 1) return null;
+  const record = records[0], reservation = record.reservation;
+  const decisionId = /^funded-direct-([0-9a-f]{64})$/.exec(reservation?.probe_id || "")?.[1];
+  const runDate = /^funded-direct-(\d{4})(\d{2})(\d{2})\d{9}-[0-9a-f]{8}$/.exec(reservation?.run_id || "");
+  if (!decisionId || !runDate || reservation.state !== "unresolved_reconciliation" ||
+      reservation.order_submitted !== true || !exactZero(reservation.matched_notional) ||
+      reservation.reconciliation_complete !== false || reservation.zero_open_orders_confirmed !== true) return null;
+  const completionBlobName = `reports/funded/dynamic-quote/sessions/${CURRENT_CAMPAIGN_ID}/completed/${decisionId}.json`;
+  const completion = await loadDocument(container, completionBlobName);
+  const completedMs = Date.parse(completion.value?.completed_at);
+  if (!Number.isFinite(completedMs) || !Number.isFinite(now()) || now() - completedMs < MINIMUM_CANCELLATION_FAILED_AGE_MS) return null;
+  const summaryBlobName = `reports/research/venue-probe/runs/${runDate[1]}-${runDate[2]}-${runDate[3]}/${reservation.run_id}/summary.json`;
+  const summary = await loadDocument(container, summaryBlobName);
+  // Reuse the resolved-market proof: six-hour finality, no settlement activity,
+  // two stable authenticated snapshots, immutable bindings and an ETag CAS.
+  return reconcile({
+    env: {
+      ...env,
+      FUNDED_DIRECT_RECONCILIATION_ENABLED: "true",
+      FUNDED_DIRECT_RECONCILIATION_REASON: RESOLVED_EVICTED_REASON,
+      FUNDED_DIRECT_RECONCILE_DECISION_ID: decisionId,
+      FUNDED_DIRECT_RECONCILE_RUN_ID: reservation.run_id,
+      FUNDED_DIRECT_RECONCILE_ORDER_ID: reservation.order_id,
+      FUNDED_DIRECT_RECONCILE_RESERVATION_BLOB_NAME: record.blob_name,
+      FUNDED_DIRECT_RECONCILE_RESERVATION_SHA256: record.reservation_sha256,
+      FUNDED_DIRECT_RECONCILE_COMPLETION_BLOB_NAME: completionBlobName,
+      FUNDED_DIRECT_RECONCILE_COMPLETION_SHA256: completion.sha256,
+      FUNDED_DIRECT_RECONCILE_SUMMARY_BLOB_NAME: summaryBlobName,
+      FUNDED_DIRECT_RECONCILE_SUMMARY_SHA256: summary.sha256
+    },
+    reason: RESOLVED_EVICTED_REASON,
+    now,
+    assertHealthy: () => inheritedLease.assertHealthy(),
+    logger
+  });
+}
+
 function validateAcknowledgedTerminalReadback(config, document, finalized) {
   const value = document?.value;
   const source = value?.reconciliation_evidence;
   const expectedSha = "sha256:" + createHash("sha256")
     .update(Buffer.from(JSON.stringify(finalized, null, 2)))
     .digest("hex");
-  const summaryBindingValid = [EVICTED_ACKNOWLEDGED_REASON,
-    CANCELLATION_FAILED_EVICTED_REASON].includes(config.reconciliationReason)
+  const summaryBindingValid = EVICTED_REASONS.includes(config.reconciliationReason)
     ? source?.failed_summary_blob_name === config.summaryBlobName &&
       source?.failed_summary_sha256 === config.summarySha256
     : source?.failed_summary_blob_name === undefined &&
@@ -869,8 +938,7 @@ function jsonArray(value) {
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   const recoveryReason = process.env.FUNDED_DIRECT_RECONCILIATION_REASON;
-  const acknowledged = [ACKNOWLEDGED_REASON, EVICTED_ACKNOWLEDGED_REASON,
-    CANCELLATION_FAILED_EVICTED_REASON]
+  const acknowledged = [ACKNOWLEDGED_REASON, ...EVICTED_REASONS]
     .includes(recoveryReason);
   const run = acknowledged
     ? runAcknowledgedNoFillReconciliation

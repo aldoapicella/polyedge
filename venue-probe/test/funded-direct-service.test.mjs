@@ -1156,6 +1156,7 @@ test("persistent service runs redemption under the inherited lease after market 
   let warmedMarket = null;
   let maintenanceRuns = 0;
   let redemptionRuns = 0;
+  let recoveryRuns = 0;
   const logs = [];
   const result = await runPersistentFundedDirectService({
     env: automaticRedemptionEnv({
@@ -1175,7 +1176,12 @@ test("persistent service runs redemption under the inherited lease after market 
       close: async () => {}
     }),
     createProcessor: async () => ({ process: async () => ({}) }),
+    runNoFillRecovery: async ({ inheritedLease }) => {
+      assert.equal(inheritedLease, lease);
+      recoveryRuns += 1;
+    },
     runRedemption: async ({ env: redemptionEnv, inheritedLease }) => {
+      assert.equal(recoveryRuns, 1);
       redemptionRuns += 1;
       assert.equal(redemptionEnv.EXECUTION_MODE, "venue_redemption");
       assert.equal(redemptionEnv.VENUE_REDEMPTION_DRY_RUN, "false");
@@ -1189,6 +1195,7 @@ test("persistent service runs redemption under the inherited lease after market 
   assert.equal(result.redemption_results, 1);
   assert.equal(maintenanceRuns, 1);
   assert.equal(redemptionRuns, 1);
+  assert.equal(recoveryRuns, 1);
   const completion = logs.find((value) => value.status === "automatic_redemption_cycle_completed");
   assert.equal(completion?.market_end_ts, "2026-07-30T12:15:00.000Z");
   assert.equal(completion?.clock_source, "btc_15m_utc_boundary");

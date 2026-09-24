@@ -563,7 +563,7 @@ export async function waitForStablePostCancelReconciliation({
   const sleep = options.sleep || defaultSleep;
   const minimumObservationMs = options.minimumObservationMs ?? 10_000;
   const requiredStableMs = options.requiredStableMs ?? 5_000;
-  const timeoutMs = options.timeoutMs ?? 30_000;
+  const timeoutMs = options.timeoutMs ?? 120_000;
   const pollMs = options.pollMs ?? 500;
   const started = nowMs();
   const deadline = started + timeoutMs;

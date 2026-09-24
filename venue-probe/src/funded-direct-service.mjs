@@ -3,6 +3,7 @@ import { ServiceBusClient } from "@azure/service-bus";
 import { pathToFileURL } from "node:url";
 import { createPersistentCanaryExecutor } from "./canary.mjs";
 import { runVenueRedemption } from "./redeem.mjs";
+import { runAutomaticAcknowledgedNoFillReconciliation } from "./reconcile-ambiguous-no-order.mjs";
 import {
   createFundedDirectProcessor,
   runFundedDirectWorker
@@ -337,6 +338,7 @@ export async function runPersistentFundedDirectService({
   createExecutor = createPersistentCanaryExecutor,
   createProcessor = createFundedDirectProcessor,
   runRedemption = runVenueRedemption,
+  runNoFillRecovery = runAutomaticAcknowledgedNoFillReconciliation,
   discoverMarket = activeBtcFifteenMinuteMarket,
   now = Date.now,
   sleep = delay,
@@ -427,8 +429,19 @@ export async function runPersistentFundedDirectService({
   });
   const runAutomaticRedemption = async (window) => {
     try {
-      const result = await executor.runMaintenance(({ lease: inheritedLease }) =>
-        runRedemption({
+      const result = await executor.runMaintenance(async ({ lease: inheritedLease }) => {
+        try {
+          await runNoFillRecovery({ env, inheritedLease, now, logger });
+        } catch (error) {
+          logger({
+            schema: "polyedge.funded_direct_alert.v1",
+            status: "automatic_no_fill_recovery_failed_closed",
+            account_risk_pause: true,
+            error: error.message
+          });
+        }
+        inheritedLease.assertHealthy();
+        return runRedemption({
           env: fundedRedemptionEnv(env),
           inheritedLease,
           logger: (value) => logger({
@@ -436,8 +449,8 @@ export async function runPersistentFundedDirectService({
             status: "redemption_worker_summary",
             redemption: value
           })
-        })
-      );
+        });
+      });
       redemptionResults += 1;
       lastRedemptionStatus = result?.status || "unknown";
       if (result?.status === "nothing_to_redeem" &&
