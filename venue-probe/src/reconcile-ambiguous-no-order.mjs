@@ -5,6 +5,7 @@ import {
   EVIDENCE_PROTOCOL_VERSION,
   finalizeProbeRisk,
   loadCampaignUnresolvedRiskReservationRecords,
+  rebuildCampaignRiskReservationIndex,
   sanitize,
   storageContainer
 } from "./lib.mjs";
@@ -77,6 +78,18 @@ export function acknowledgedNoFillConfig(
   return { ...config, orderId, summaryBlobName, summarySha256 };
 }
 
+function recoveryAccountIsExact(env) {
+  return [CAMPAIGN_ID, CURRENT_CAMPAIGN_ID].includes(env.VENUE_PROBE_FUNDED_CAMPAIGN_ID) &&
+    String(env.POLYMARKET_FUNDER_ADDRESS || "").toLowerCase() === FUNDER_ADDRESS &&
+    env.AZURE_TENANT_ID === TENANT_ID &&
+    env.AZURE_STORAGE_ACCOUNT_NAME === STORAGE_ACCOUNT &&
+    env.AZURE_STORAGE_CONTAINER_NAME === STORAGE_CONTAINER &&
+    env.AZURE_CLIENT_ID === FUNDED_UAMI_CLIENT_ID &&
+    env.AZURE_TOKEN_CREDENTIALS === "WorkloadIdentityCredential" &&
+    (env.POLYMARKET_CLOB_URL === undefined || env.POLYMARKET_CLOB_URL === "https://clob.polymarket.com") &&
+    env.POLYMARKET_SIGNATURE_TYPE === "3" && !Object.hasOwn(env, "AZURE_STORAGE_ACCOUNT_KEY");
+}
+
 function recoveryConfig(env, reason, failClosed) {
   const campaignId = env.VENUE_PROBE_FUNDED_CAMPAIGN_ID;
   const decisionId = String(env.FUNDED_DIRECT_RECONCILE_DECISION_ID || "").trim();
@@ -91,17 +104,7 @@ function recoveryConfig(env, reason, failClosed) {
     String(env.FUNDED_DIRECT_RECONCILE_COMPLETION_SHA256 || "").trim();
   if (env.FUNDED_DIRECT_RECONCILIATION_ENABLED !== "true" ||
       env.FUNDED_DIRECT_RECONCILIATION_REASON !== reason ||
-      ![CAMPAIGN_ID, CURRENT_CAMPAIGN_ID].includes(campaignId) ||
-      String(env.POLYMARKET_FUNDER_ADDRESS || "").toLowerCase() !== FUNDER_ADDRESS ||
-      env.AZURE_TENANT_ID !== TENANT_ID ||
-      env.AZURE_STORAGE_ACCOUNT_NAME !== STORAGE_ACCOUNT ||
-      env.AZURE_STORAGE_CONTAINER_NAME !== STORAGE_CONTAINER ||
-      env.AZURE_CLIENT_ID !== FUNDED_UAMI_CLIENT_ID ||
-      env.AZURE_TOKEN_CREDENTIALS !== "WorkloadIdentityCredential" ||
-      (env.POLYMARKET_CLOB_URL !== undefined &&
-        env.POLYMARKET_CLOB_URL !== "https://clob.polymarket.com") ||
-      env.POLYMARKET_SIGNATURE_TYPE !== "3" ||
-      Object.hasOwn(env, "AZURE_STORAGE_ACCOUNT_KEY") ||
+      !recoveryAccountIsExact(env) ||
       !/^[0-9a-f]{64}$/.test(decisionId) ||
       !/^funded-direct-[0-9]{17}-[0-9a-f]{8}$/.test(runId) ||
       !SHA256.test(reservationSha256) ||
@@ -461,7 +464,8 @@ export function validateEvictedAcknowledgedNoFillSnapshot({
   }
   let resolvedMarketEvidence = {};
   if (cancellationFailed || config.reconciliationReason === RESOLVED_EVICTED_REASON) {
-    const prices = jsonArray(gammaMarket?.outcomePrices).map(Number);
+    const rawPrices = jsonArray(gammaMarket?.outcomePrices);
+    const prices = rawPrices.map(Number);
     const gammaTokens = jsonArray(gammaMarket?.clobTokenIds).map(String);
     const endMs = Date.parse(gammaMarket?.endDate);
     const closedMs = Date.parse(gammaMarket?.closedTime);
@@ -480,7 +484,8 @@ export function validateEvictedAcknowledgedNoFillSnapshot({
         gammaMarket?.automaticallyResolved !== true ||
         gammaMarket?.umaResolutionStatus !== "resolved" ||
         gammaTokens.length !== 2 || !gammaTokens.includes(String(reservation?.token_id || "")) ||
-        prices.length !== 2 || !prices.every((price) => [0, 1].includes(price)) ||
+        prices.length !== 2 || !rawPrices.every(finiteNumeric) ||
+        !prices.every((price) => [0, 1].includes(price)) ||
         prices[0] === prices[1] || !Number.isFinite(endMs) ||
         !Number.isFinite(closedMs) || !Number.isFinite(resolvedMs) ||
         closedMs !== resolvedMs || resolvedMs < endMs ||
@@ -746,11 +751,13 @@ export async function runAutomaticAcknowledgedNoFillReconciliation({
   now = Date.now,
   containerFactory = storageContainer,
   loadRecords = loadCampaignUnresolvedRiskReservationRecords,
+  rebuildIndex = rebuildCampaignRiskReservationIndex,
   loadDocument = downloadBlobDocument,
   reconcile = runAcknowledgedNoFillReconciliation,
   logger = (value) => console.log(JSON.stringify(value))
 } = {}) {
   if (env.VENUE_PROBE_FUNDED_CAMPAIGN_ID !== CURRENT_CAMPAIGN_ID) return null;
+  if (!recoveryAccountIsExact(env)) failAcknowledged("automatic recovery account binding is invalid");
   if (typeof inheritedLease?.assertHealthy !== "function") {
     failAcknowledged("automatic recovery requires the exclusive campaign lease");
   }
@@ -764,7 +771,18 @@ export async function runAutomaticAcknowledgedNoFillReconciliation({
     dryRun: false
   };
   const container = containerFactory(base);
-  const records = await loadRecords(base, { container });
+  let records;
+  try {
+    records = await loadRecords(base, { container });
+  } catch (error) {
+    if (error.message !== "fail closed: funded unresolved risk reservation index disagrees with durable reservation state") throw error;
+    inheritedLease.assertHealthy();
+    await rebuildIndex(base, { container });
+    inheritedLease.assertHealthy();
+    records = await loadRecords(base, { container });
+    logger({ schema: "polyedge.acknowledged_no_fill_reconciliation.v1",
+      status: "risk_reservation_index_rebuilt", unresolved_count: records.length });
+  }
   if (records.length !== 1) return null;
   const record = records[0], reservation = record.reservation;
   const decisionId = /^funded-direct-([0-9a-f]{64})$/.exec(reservation?.probe_id || "")?.[1];

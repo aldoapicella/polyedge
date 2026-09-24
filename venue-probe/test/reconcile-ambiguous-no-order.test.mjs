@@ -1012,6 +1012,9 @@ test("successful cancellation can use the stronger six-hour resolved-market proo
     row => { row.observedAtMs -= 3 * 60 * 1000; },
     row => { row.gammaMarket.umaEndDate = "2026-08-22T02:00:00Z"; },
     row => { row.gammaMarket.automaticallyResolved = false; },
+    ...[null, "", " ", false, true].map(price => row => {
+      row.gammaMarket.outcomePrices = JSON.stringify([price, 1]);
+    }),
     row => { row.gammaMarket.clobTokenIds = '["wrong", "other"]'; },
     row => { row.clobMarket.accepting_orders = true; },
     row => { row.settlementActivity.push({ type: "REDEEM" }); },
@@ -1066,6 +1069,32 @@ test("automatic no-fill maintenance binds the exact indexed record and never tre
   await assert.rejects(runAutomaticAcknowledgedNoFillReconciliation({ ...options, inheritedLease: null }), /exclusive campaign lease/);
   await assert.rejects(runAutomaticAcknowledgedNoFillReconciliation({ ...options,
     inheritedLease: { assertHealthy() { throw new Error("lease lost"); } } }), /lease lost/);
+});
+
+test("automatic maintenance repairs only a stale blob-first reservation index under the lease", async () => {
+  let stale = true, rebuilds = 0;
+  const events = [];
+  const options = {
+    env: resolvedEvictedEnv(),
+    inheritedLease: { assertHealthy: () => events.push("lease") },
+    containerFactory: () => ({}),
+    loadRecords: async () => {
+      events.push("load");
+      if (stale) throw new Error("fail closed: funded unresolved risk reservation index disagrees with durable reservation state");
+      return [];
+    },
+    rebuildIndex: async () => { rebuilds += 1; events.push("rebuild"); stale = false; },
+    logger: () => {}
+  };
+  assert.equal(await runAutomaticAcknowledgedNoFillReconciliation(options), null);
+  assert.deepEqual(events, ["lease", "load", "lease", "rebuild", "lease", "load"]);
+  assert.equal(await runAutomaticAcknowledgedNoFillReconciliation(options), null);
+  assert.equal(rebuilds, 1);
+  await assert.rejects(runAutomaticAcknowledgedNoFillReconciliation({ ...options,
+    loadRecords: async () => { throw new Error("network failed"); } }), /network failed/);
+  await assert.rejects(runAutomaticAcknowledgedNoFillReconciliation({ ...options,
+    env: { ...options.env, AZURE_STORAGE_CONTAINER_NAME: "wrong" } }), /account binding/);
+  assert.equal(rebuilds, 1);
 });
 
 for (const environment of [evictedAcknowledgedEnv(), resolvedEvictedEnv()]) {
